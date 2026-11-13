@@ -5,8 +5,9 @@
 
 export const SUPABASE_URL = 'https://iiyqkdjwxlnfqvlidbqr.supabase.co';
 
-/** Paste anon/publishable key here. Never use service_role. */
-export const SUPABASE_ANON_KEY = '';
+/** Anon/publishable key only — never service_role. */
+export const SUPABASE_ANON_KEY =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpeXFrZGp3eGxuZnF2bGlkYnFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ1ODE5NjEsImV4cCI6MjExMDE1Nzk2MX0.ZYLoih1BegKKx-UN-aaz4qMuriJ_vr05QRW4hUR_zm8';
 
 export const RELAY_SYNC_FN = `${SUPABASE_URL}/functions/v1/relay-sync`;
 export const RELAY_TELEGRAM_FN = `${SUPABASE_URL}/functions/v1/relay-telegram`;
