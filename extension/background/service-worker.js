@@ -2,6 +2,7 @@ import {
   RELAY_SYNC_FN,
   RELAY_TELEGRAM_FN,
   SUPABASE_ANON_KEY,
+  SUPABASE_URL,
   SECTIONS,
   TAB_SCAN_ALARM,
   SYNC_ALARM,
@@ -55,6 +56,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const state = await getState();
       if (!state.loggedIn) {
         sendResponse({ ok: false, error: 'Login required' });
+        return;
+      }
+      if (!SUPABASE_ANON_KEY) {
+        sendResponse({
+          ok: false,
+          error: `Set SUPABASE_ANON_KEY in extension/shared/config.js for ${SUPABASE_URL}`,
+        });
         return;
       }
       if (!state.extensionApiKey) {

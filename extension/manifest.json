@@ -7,7 +7,7 @@
   "host_permissions": [
     "https://relay.amazon.com/*",
     "https://*.relay.amazon.com/*",
-    "https://abymkczeobyfnplqwbrk.supabase.co/*"
+    "https://iiyqkdjwxlnfqvlidbqr.supabase.co/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",

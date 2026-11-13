@@ -1,8 +1,12 @@
-/** Shared extension config — no service-role keys, no Relay credentials. */
+/** Shared extension config — no service-role keys, no Relay credentials.
+ *  Target: Internal system Supabase project iiyqkdjwxlnfqvlidbqr
+ *  SUPABASE_ANON_KEY is filled after my-server MCP is bound to that project.
+ */
 
-export const SUPABASE_URL = 'https://abymkczeobyfnplqwbrk.supabase.co';
-export const SUPABASE_ANON_KEY =
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFieW1rY3plb2J5Zm5wbHF3YnJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1NTI2NDcsImV4cCI6MjA5MzEyODY0N30.nxgZVxC4eQkpehIJTfG45a3523cbz_LUFkwv2jtFu24';
+export const SUPABASE_URL = 'https://iiyqkdjwxlnfqvlidbqr.supabase.co';
+
+/** Paste the project's anon/publishable key (Settings → API). Not the service-role key. */
+export const SUPABASE_ANON_KEY = '';
 
 export const RELAY_SYNC_FN = `${SUPABASE_URL}/functions/v1/relay-sync`;
 export const RELAY_TELEGRAM_FN = `${SUPABASE_URL}/functions/v1/relay-telegram`;

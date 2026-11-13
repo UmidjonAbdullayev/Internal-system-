@@ -1,12 +1,11 @@
 -- Internal Sys — Fleet Operations CRM
--- Applied remotely under Postgres schema `internal_sys` on the shared Supabase project
--- (avoids colliding with CDL Score public.drivers). Source of truth for CRM models.
+-- Target project: https://iiyqkdjwxlnfqvlidbqr.supabase.co (empty Internal system DB)
+-- Applied in public schema (no CDL Score collision on this project).
 
-create schema if not exists internal_sys;
 create extension if not exists "pgcrypto";
 
 -- users
-create table if not exists internal_sys.users (
+create table if not exists public.users (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   email text unique not null,
@@ -16,7 +15,7 @@ create table if not exists internal_sys.users (
 );
 
 -- drivers
-create table if not exists internal_sys.drivers (
+create table if not exists public.drivers (
   id uuid primary key default gen_random_uuid(),
   driver_id text unique not null,
   first_name text not null,
@@ -44,11 +43,11 @@ create table if not exists internal_sys.drivers (
 );
 
 -- loads
-create table if not exists internal_sys.loads (
+create table if not exists public.loads (
   id uuid primary key default gen_random_uuid(),
   load_id text unique not null,
   amazon_ref_id text,
-  driver_id uuid references internal_sys.drivers(id) on delete set null,
+  driver_id uuid references public.drivers(id) on delete set null,
   driver_name_raw text,
   load_status text not null,
   payment_status text not null,
@@ -74,16 +73,16 @@ create table if not exists internal_sys.loads (
   updated_at timestamptz not null default now()
 );
 
-create index if not exists loads_driver_id_idx on internal_sys.loads(driver_id);
-create index if not exists loads_delivery_date_idx on internal_sys.loads(delivery_date);
-create index if not exists loads_load_status_idx on internal_sys.loads(load_status);
-create index if not exists loads_amazon_ref_idx on internal_sys.loads(amazon_ref_id);
-create index if not exists loads_last_observed_idx on internal_sys.loads(last_observed);
+create index if not exists loads_driver_id_idx on public.loads(driver_id);
+create index if not exists loads_delivery_date_idx on public.loads(delivery_date);
+create index if not exists loads_load_status_idx on public.loads(load_status);
+create index if not exists loads_amazon_ref_idx on public.loads(amazon_ref_id);
+create index if not exists loads_last_observed_idx on public.loads(last_observed);
 
 -- driver_fees
-create table if not exists internal_sys.driver_fees (
+create table if not exists public.driver_fees (
   id uuid primary key default gen_random_uuid(),
-  driver_id uuid not null references internal_sys.drivers(id) on delete cascade,
+  driver_id uuid not null references public.drivers(id) on delete cascade,
   fee_name text not null,
   category text not null,
   calculation_type text not null check (calculation_type in ('Fixed', 'Percentage')),
@@ -97,12 +96,12 @@ create table if not exists internal_sys.driver_fees (
   updated_at timestamptz not null default now()
 );
 
-create index if not exists driver_fees_driver_id_idx on internal_sys.driver_fees(driver_id);
+create index if not exists driver_fees_driver_id_idx on public.driver_fees(driver_id);
 
 -- one_time_charges
-create table if not exists internal_sys.one_time_charges (
+create table if not exists public.one_time_charges (
   id uuid primary key default gen_random_uuid(),
-  driver_id uuid not null references internal_sys.drivers(id) on delete cascade,
+  driver_id uuid not null references public.drivers(id) on delete cascade,
   description text not null,
   amount numeric(12,2) not null,
   charge_date date not null,
@@ -112,12 +111,12 @@ create table if not exists internal_sys.one_time_charges (
   created_at timestamptz not null default now()
 );
 
-create index if not exists otc_driver_week_idx on internal_sys.one_time_charges(driver_id, settlement_week_start);
+create index if not exists otc_driver_week_idx on public.one_time_charges(driver_id, settlement_week_start);
 
 -- settlements
-create table if not exists internal_sys.settlements (
+create table if not exists public.settlements (
   id uuid primary key default gen_random_uuid(),
-  driver_id uuid not null references internal_sys.drivers(id) on delete cascade,
+  driver_id uuid not null references public.drivers(id) on delete cascade,
   week_start date not null,
   week_end date not null,
   weekly_gross numeric(12,2) not null default 0,
@@ -137,20 +136,20 @@ create table if not exists internal_sys.settlements (
   unique (driver_id, week_start)
 );
 
-create index if not exists settlements_week_idx on internal_sys.settlements(week_start);
+create index if not exists settlements_week_idx on public.settlements(week_start);
 
 -- settlement_loads
-create table if not exists internal_sys.settlement_loads (
+create table if not exists public.settlement_loads (
   id uuid primary key default gen_random_uuid(),
-  settlement_id uuid not null references internal_sys.settlements(id) on delete cascade,
-  load_id uuid not null references internal_sys.loads(id) on delete restrict,
+  settlement_id uuid not null references public.settlements(id) on delete cascade,
+  load_id uuid not null references public.loads(id) on delete restrict,
   unique (settlement_id, load_id)
 );
 
 -- settlement_charges
-create table if not exists internal_sys.settlement_charges (
+create table if not exists public.settlement_charges (
   id uuid primary key default gen_random_uuid(),
-  settlement_id uuid not null references internal_sys.settlements(id) on delete cascade,
+  settlement_id uuid not null references public.settlements(id) on delete cascade,
   charge_name text not null,
   category text not null,
   calculation_type text not null,
@@ -161,11 +160,11 @@ create table if not exists internal_sys.settlement_charges (
   source_id text
 );
 
--- payments
-create table if not exists internal_sys.payments (
+-- payments (settlement_id nullable so Relay rows can land before CRM settlement linkage)
+create table if not exists public.payments (
   id uuid primary key default gen_random_uuid(),
-  settlement_id uuid references internal_sys.settlements(id) on delete cascade,
-  load_id uuid references internal_sys.loads(id) on delete set null,
+  settlement_id uuid references public.settlements(id) on delete cascade,
+  load_id uuid references public.loads(id) on delete set null,
   payment_date date not null,
   method text not null,
   reference_id text,
@@ -181,11 +180,11 @@ create table if not exists internal_sys.payments (
 );
 
 create unique index if not exists payments_relay_ref_uidx
-  on internal_sys.payments (reference_id)
+  on public.payments (reference_id)
   where reference_id is not null;
 
 -- activity_logs
-create table if not exists internal_sys.activity_logs (
+create table if not exists public.activity_logs (
   id uuid primary key default gen_random_uuid(),
   type text not null,
   action text not null,
@@ -195,10 +194,10 @@ create table if not exists internal_sys.activity_logs (
   created_at timestamptz not null default now()
 );
 
-create index if not exists activity_logs_created_idx on internal_sys.activity_logs(created_at desc);
+create index if not exists activity_logs_created_idx on public.activity_logs(created_at desc);
 
 -- Relay extension bookkeeping
-create table if not exists internal_sys.relay_sync_runs (
+create table if not exists public.relay_sync_runs (
   id uuid primary key default gen_random_uuid(),
   started_at timestamptz not null default now(),
   finished_at timestamptz,
@@ -212,7 +211,7 @@ create table if not exists internal_sys.relay_sync_runs (
   client_id text
 );
 
-create table if not exists internal_sys.relay_notification_dedupe (
+create table if not exists public.relay_notification_dedupe (
   id uuid primary key default gen_random_uuid(),
   dedupe_key text not null unique,
   event_type text not null,
@@ -221,4 +220,40 @@ create table if not exists internal_sys.relay_notification_dedupe (
 );
 
 create index if not exists relay_notif_dedupe_created_idx
-  on internal_sys.relay_notification_dedupe(created_at desc);
+  on public.relay_notification_dedupe(created_at desc);
+
+-- RLS: extension writes via Edge Functions (service role); authenticated CRM can read
+alter table public.users enable row level security;
+alter table public.drivers enable row level security;
+alter table public.loads enable row level security;
+alter table public.driver_fees enable row level security;
+alter table public.one_time_charges enable row level security;
+alter table public.settlements enable row level security;
+alter table public.settlement_loads enable row level security;
+alter table public.settlement_charges enable row level security;
+alter table public.payments enable row level security;
+alter table public.activity_logs enable row level security;
+alter table public.relay_sync_runs enable row level security;
+alter table public.relay_notification_dedupe enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='loads' and policyname='authenticated_read_loads') then
+    create policy authenticated_read_loads on public.loads for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='drivers' and policyname='authenticated_read_drivers') then
+    create policy authenticated_read_drivers on public.drivers for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='payments' and policyname='authenticated_read_payments') then
+    create policy authenticated_read_payments on public.payments for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='settlements' and policyname='authenticated_read_settlements') then
+    create policy authenticated_read_settlements on public.settlements for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='activity_logs' and policyname='authenticated_read_activity') then
+    create policy authenticated_read_activity on public.activity_logs for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='relay_sync_runs' and policyname='authenticated_read_sync_runs') then
+    create policy authenticated_read_sync_runs on public.relay_sync_runs for select to authenticated using (true);
+  end if;
+end$$;
