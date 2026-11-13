@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Relay Sync</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="brand">Internal Sys</div>
+      <div class="sub">Amazon Relay → CRM</div>
+    </header>
+
+    <section id="login-view" class="panel hidden">
+      <h1>Extension login</h1>
+      <p class="hint">Local gate only. Never enter Amazon Relay passwords here.</p>
+      <label>Username<input id="username" type="text" autocomplete="username" /></label>
+      <label>Password<input id="password" type="password" autocomplete="current-password" /></label>
+      <label>Extension API key
+        <input id="api-key" type="password" autocomplete="off" placeholder="RELAY_EXTENSION_API_KEY" />
+      </label>
+      <p id="login-error" class="error"></p>
+      <button id="login-btn" class="primary">Sign in</button>
+    </section>
+
+    <section id="main-view" class="panel hidden">
+      <div class="row actions">
+        <button id="live-btn" class="primary">GO LIVE</button>
+        <button id="stop-btn" class="danger">STOP</button>
+        <button id="scan-btn" class="ghost">Scan now</button>
+        <button id="logout-btn" class="ghost">Logout</button>
+      </div>
+
+      <div class="status-grid">
+        <div><span class="k">Monitoring</span><span id="live-status" class="v">Stopped</span></div>
+        <div><span class="k">Last sync</span><span id="last-sync" class="v">—</span></div>
+        <div><span class="k">Collected</span><span id="collected" class="v">0</span></div>
+        <div><span class="k">Updated</span><span id="updated" class="v">0</span></div>
+        <div><span class="k">Inserted</span><span id="inserted" class="v">0</span></div>
+        <div><span class="k">Errors</span><span id="errors" class="v">0</span></div>
+      </div>
+
+      <h2>Relay sections</h2>
+      <ul id="sections" class="sections"></ul>
+
+      <div id="prompts" class="prompts"></div>
+      <div id="tabs" class="tabs"></div>
+      <div id="error-list" class="error-list"></div>
+    </section>
+  </div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
