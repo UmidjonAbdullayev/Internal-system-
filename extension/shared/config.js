@@ -1,11 +1,11 @@
 /** Shared extension config — no service-role keys, no Relay credentials.
  *  Target: Internal system Supabase project iiyqkdjwxlnfqvlidbqr
- *  SUPABASE_ANON_KEY is filled after my-server MCP is bound to that project.
+ *  Paste SUPABASE_ANON_KEY from Dashboard → Project Settings → API (anon/publishable).
  */
 
 export const SUPABASE_URL = 'https://iiyqkdjwxlnfqvlidbqr.supabase.co';
 
-/** Paste the project's anon/publishable key (Settings → API). Not the service-role key. */
+/** Paste anon/publishable key here. Never use service_role. */
 export const SUPABASE_ANON_KEY = '';
 
 export const RELAY_SYNC_FN = `${SUPABASE_URL}/functions/v1/relay-sync`;

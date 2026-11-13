@@ -6,6 +6,8 @@ Syncs **CRM-required** Amazon Relay fields into the Internal Sys fleet schema (`
 
 `https://iiyqkdjwxlnfqvlidbqr.supabase.co` (Internal system). Not the CDL Score project.
 
+Full Dashboard setup (SQL → secrets → deploy → GO LIVE): see project store `docs/relay-extension.md`.
+
 Set `SUPABASE_ANON_KEY` in `shared/config.js` from that project's Settings → API (anon/publishable key only).
 
 ## Load in Chrome
