@@ -1,11 +1,12 @@
 -- Internal Sys — Fleet Operations CRM
--- Supabase / Postgres schema prepared for future backend connection.
--- Relationships and unique IDs mirror the in-app TypeScript models.
+-- Applied remotely under Postgres schema `internal_sys` on the shared Supabase project
+-- (avoids colliding with CDL Score public.drivers). Source of truth for CRM models.
 
+create schema if not exists internal_sys;
 create extension if not exists "pgcrypto";
 
 -- users
-create table if not exists users (
+create table if not exists internal_sys.users (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   email text unique not null,
@@ -15,7 +16,7 @@ create table if not exists users (
 );
 
 -- drivers
-create table if not exists drivers (
+create table if not exists internal_sys.drivers (
   id uuid primary key default gen_random_uuid(),
   driver_id text unique not null,
   first_name text not null,
@@ -33,16 +34,22 @@ create table if not exists drivers (
   zip text,
   license_number text,
   license_expiry date,
+  last_observed timestamptz,
+  last_changed timestamptz,
+  last_synchronized timestamptz,
+  content_hash text,
+  source text not null default 'manual',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
 -- loads
-create table if not exists loads (
+create table if not exists internal_sys.loads (
   id uuid primary key default gen_random_uuid(),
   load_id text unique not null,
   amazon_ref_id text,
-  driver_id uuid references drivers(id) on delete set null,
+  driver_id uuid references internal_sys.drivers(id) on delete set null,
+  driver_name_raw text,
   load_status text not null,
   payment_status text not null,
   pickup_location text not null,
@@ -57,18 +64,26 @@ create table if not exists loads (
   payment_date date,
   notes text,
   status_history jsonb not null default '[]'::jsonb,
+  last_observed timestamptz,
+  last_changed timestamptz,
+  last_synchronized timestamptz,
+  content_hash text,
+  source text not null default 'amazon_relay',
+  is_stale boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
-create index if not exists loads_driver_id_idx on loads(driver_id);
-create index if not exists loads_delivery_date_idx on loads(delivery_date);
-create index if not exists loads_load_status_idx on loads(load_status);
+create index if not exists loads_driver_id_idx on internal_sys.loads(driver_id);
+create index if not exists loads_delivery_date_idx on internal_sys.loads(delivery_date);
+create index if not exists loads_load_status_idx on internal_sys.loads(load_status);
+create index if not exists loads_amazon_ref_idx on internal_sys.loads(amazon_ref_id);
+create index if not exists loads_last_observed_idx on internal_sys.loads(last_observed);
 
--- driver_fees (recurring fee configurations per driver)
-create table if not exists driver_fees (
+-- driver_fees
+create table if not exists internal_sys.driver_fees (
   id uuid primary key default gen_random_uuid(),
-  driver_id uuid not null references drivers(id) on delete cascade,
+  driver_id uuid not null references internal_sys.drivers(id) on delete cascade,
   fee_name text not null,
   category text not null,
   calculation_type text not null check (calculation_type in ('Fixed', 'Percentage')),
@@ -82,12 +97,12 @@ create table if not exists driver_fees (
   updated_at timestamptz not null default now()
 );
 
-create index if not exists driver_fees_driver_id_idx on driver_fees(driver_id);
+create index if not exists driver_fees_driver_id_idx on internal_sys.driver_fees(driver_id);
 
 -- one_time_charges
-create table if not exists one_time_charges (
+create table if not exists internal_sys.one_time_charges (
   id uuid primary key default gen_random_uuid(),
-  driver_id uuid not null references drivers(id) on delete cascade,
+  driver_id uuid not null references internal_sys.drivers(id) on delete cascade,
   description text not null,
   amount numeric(12,2) not null,
   charge_date date not null,
@@ -97,12 +112,12 @@ create table if not exists one_time_charges (
   created_at timestamptz not null default now()
 );
 
-create index if not exists otc_driver_week_idx on one_time_charges(driver_id, settlement_week_start);
+create index if not exists otc_driver_week_idx on internal_sys.one_time_charges(driver_id, settlement_week_start);
 
--- settlements (weekly paychecks with fee snapshots)
-create table if not exists settlements (
+-- settlements
+create table if not exists internal_sys.settlements (
   id uuid primary key default gen_random_uuid(),
-  driver_id uuid not null references drivers(id) on delete cascade,
+  driver_id uuid not null references internal_sys.drivers(id) on delete cascade,
   week_start date not null,
   week_end date not null,
   weekly_gross numeric(12,2) not null default 0,
@@ -112,25 +127,30 @@ create table if not exists settlements (
   status text not null,
   payment_date date,
   finalized boolean not null default false,
+  last_observed timestamptz,
+  last_changed timestamptz,
+  last_synchronized timestamptz,
+  content_hash text,
+  source text not null default 'manual',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (driver_id, week_start)
 );
 
-create index if not exists settlements_week_idx on settlements(week_start);
+create index if not exists settlements_week_idx on internal_sys.settlements(week_start);
 
--- settlement_loads (which loads were included in a settlement)
-create table if not exists settlement_loads (
+-- settlement_loads
+create table if not exists internal_sys.settlement_loads (
   id uuid primary key default gen_random_uuid(),
-  settlement_id uuid not null references settlements(id) on delete cascade,
-  load_id uuid not null references loads(id) on delete restrict,
+  settlement_id uuid not null references internal_sys.settlements(id) on delete cascade,
+  load_id uuid not null references internal_sys.loads(id) on delete restrict,
   unique (settlement_id, load_id)
 );
 
--- settlement_charges (frozen fee snapshots at calculation time)
-create table if not exists settlement_charges (
+-- settlement_charges
+create table if not exists internal_sys.settlement_charges (
   id uuid primary key default gen_random_uuid(),
-  settlement_id uuid not null references settlements(id) on delete cascade,
+  settlement_id uuid not null references internal_sys.settlements(id) on delete cascade,
   charge_name text not null,
   category text not null,
   calculation_type text not null,
@@ -141,20 +161,31 @@ create table if not exists settlement_charges (
   source_id text
 );
 
--- payments (partial/full payments against a settlement)
-create table if not exists payments (
+-- payments
+create table if not exists internal_sys.payments (
   id uuid primary key default gen_random_uuid(),
-  settlement_id uuid not null references settlements(id) on delete cascade,
+  settlement_id uuid references internal_sys.settlements(id) on delete cascade,
+  load_id uuid references internal_sys.loads(id) on delete set null,
   payment_date date not null,
   method text not null,
   reference_id text,
   amount numeric(12,2) not null,
   notes text,
+  amazon_ref_id text,
+  last_observed timestamptz,
+  last_changed timestamptz,
+  last_synchronized timestamptz,
+  content_hash text,
+  source text not null default 'amazon_relay',
   created_at timestamptz not null default now()
 );
 
+create unique index if not exists payments_relay_ref_uidx
+  on internal_sys.payments (reference_id)
+  where reference_id is not null;
+
 -- activity_logs
-create table if not exists activity_logs (
+create table if not exists internal_sys.activity_logs (
   id uuid primary key default gen_random_uuid(),
   type text not null,
   action text not null,
@@ -164,4 +195,30 @@ create table if not exists activity_logs (
   created_at timestamptz not null default now()
 );
 
-create index if not exists activity_logs_created_idx on activity_logs(created_at desc);
+create index if not exists activity_logs_created_idx on internal_sys.activity_logs(created_at desc);
+
+-- Relay extension bookkeeping
+create table if not exists internal_sys.relay_sync_runs (
+  id uuid primary key default gen_random_uuid(),
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  status text not null default 'running',
+  records_collected int not null default 0,
+  records_updated int not null default 0,
+  records_inserted int not null default 0,
+  error_count int not null default 0,
+  errors jsonb not null default '[]'::jsonb,
+  section_states jsonb not null default '{}'::jsonb,
+  client_id text
+);
+
+create table if not exists internal_sys.relay_notification_dedupe (
+  id uuid primary key default gen_random_uuid(),
+  dedupe_key text not null unique,
+  event_type text not null,
+  payload_summary text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists relay_notif_dedupe_created_idx
+  on internal_sys.relay_notification_dedupe(created_at desc);
