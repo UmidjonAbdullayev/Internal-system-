@@ -41,7 +41,11 @@ npm run build
 
 Sample data includes 16 drivers, 110+ loads across 4 weeks, varied fee profiles, one-time charges, and multi-status settlements. All financial totals are derived from underlying records via `src/lib/calculations.ts`.
 
-Supabase-ready schema: `supabase/schema.sql`.
+Supabase schema (Postgres schema `internal_sys`): `supabase/schema.sql`.
+
+## Amazon Relay extension
+
+MV3 Chrome extension in `extension/` syncs CRM-required Relay fields through Edge Functions `relay-sync` and `relay-telegram`. See `extension/README.md` and the project doc `docs/relay-extension.md`.
 
 ## Design
 

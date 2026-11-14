@@ -110,9 +110,13 @@ export function DriversPage() {
 
   const openCreate = () => {
     setEditing(null);
+    const maxNum = drivers.reduce((max, d) => {
+      const m = /^DRV-(\d+)$/i.exec(d.driverId);
+      return m ? Math.max(max, Number(m[1])) : max;
+    }, 1000);
     setForm({
       ...emptyForm,
-      driverId: `DRV-${1040 + drivers.length}`,
+      driverId: `DRV-${maxNum + 1}`,
     });
     setFormOpen(true);
   };

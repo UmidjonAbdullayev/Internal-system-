@@ -120,8 +120,8 @@ export function SettingsPage() {
             </CardHeader>
             <CardContent className="text-sm text-text-secondary space-y-2">
               <p>
-                Currently running on in-memory mock data with a separated data context.
-                Ready to connect to Supabase — see <code className="text-xs bg-bg px-1 rounded">supabase/schema.sql</code>.
+                Live data from Supabase project <code className="text-xs bg-bg px-1 rounded">iiyqkdjwxlnfqvlidbqr</code>
+                (empty until Relay sync / you add drivers). Telegram: <code className="text-xs bg-bg px-1 rounded">/link DRV-xxxx</code>.
               </p>
               <p>
                 Financial totals are always derived from underlying load, fee, and charge records —
