@@ -205,10 +205,143 @@
     return (m ? m[0] : s).slice(0, 40);
   }
 
-  function parseTripBlock(block, section) {
+  function detectTripBucket() {
+    const selected = document.querySelector(
+      '[aria-selected="true"], [role="tab"][aria-current="page"], button[aria-pressed="true"]',
+    );
+    const selectedText = (selected?.innerText || selected?.textContent || '').trim();
+    if (/in\s*transit/i.test(selectedText)) return 'in_transit';
+    if (/history/i.test(selectedText)) return 'history';
+    if (/upcoming/i.test(selectedText)) return 'upcoming';
+
+    const tabs = [...document.querySelectorAll('button, [role="tab"], a')];
+    for (const el of tabs) {
+      const t = (el.innerText || '').trim();
+      const active =
+        el.getAttribute('aria-selected') === 'true' ||
+        /selected|active|current/i.test(el.className || '') ||
+        el.getAttribute('aria-current') === 'page';
+      if (!active) continue;
+      if (/in\s*transit/i.test(t)) return 'in_transit';
+      if (/^history$/i.test(t)) return 'history';
+      if (/^upcoming$/i.test(t)) return 'upcoming';
+    }
+    return null;
+  }
+
+  function findTripTabButtons() {
+    const wanted = [
+      { bucket: 'upcoming', re: /^upcoming$/i },
+      { bucket: 'in_transit', re: /^in\s*transit$/i },
+      { bucket: 'history', re: /^history$/i },
+    ];
+    const found = [];
+    const candidates = [...document.querySelectorAll('button, [role="tab"], a')];
+    for (const w of wanted) {
+      const el = candidates.find((c) => w.re.test((c.innerText || '').trim()));
+      if (el) found.push({ bucket: w.bucket, el });
+    }
+    return found;
+  }
+
+  function rgbChannels(color) {
+    if (!color) return null;
+    const m = String(color).match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (!m) return null;
+    return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) };
+  }
+
+  function classifyStatusFill(bg, border) {
+    const c = rgbChannels(bg) || rgbChannels(border);
+    if (!c) return null;
+    const { r, g, b } = c;
+    const isWhite = r > 245 && g > 245 && b > 245;
+    const isLightBlue = b > 180 && b > r + 20 && g > 160 && r > 120 && !isWhite;
+    const isSolidDark = b > 100 && b > r && b > g && r < 120 && g < 160;
+    const isRed = r > 180 && g < 100 && b < 100;
+    if (isRed) return 'cancelled';
+    if (isSolidDark) return 'arrived';
+    if (isLightBlue) return 'loaded_enroute';
+    if (isWhite || (r > 230 && g > 230 && b > 230)) return 'pending';
+    return null;
+  }
+
+  /**
+   * Status bar: solid teal circle = arrived facility; light-blue fill = loaded & en route.
+   * Reads computed styles on circles near the trip card — works for collapsed rows.
+   */
+  function scrapeStatusBar(root) {
+    const scope = root || document.body;
+    const nodes = [
+      ...scope.querySelectorAll(
+        'circle, [class*="status"], [class*="progress"], [class*="stop"], [data-testid*="status"], span, div',
+      ),
+    ].slice(0, 120);
+    let best = { state: null, stopIndex: null };
+    let index = 0;
+    for (const el of nodes) {
+      const tag = el.tagName.toLowerCase();
+      let bg = '';
+      let border = '';
+      if (tag === 'circle') {
+        bg = el.getAttribute('fill') || '';
+        border = el.getAttribute('stroke') || '';
+        try {
+          const cs = getComputedStyle(el);
+          if (!bg || bg === 'none') bg = cs.fill || cs.backgroundColor;
+          if (!border) border = cs.stroke || cs.borderColor;
+        } catch {
+          /* ignore */
+        }
+      } else {
+        const rect = el.getBoundingClientRect?.();
+        if (!rect || rect.width < 8 || rect.width > 36 || rect.height < 8 || rect.height > 36) {
+          continue;
+        }
+        try {
+          const cs = getComputedStyle(el);
+          bg = cs.backgroundColor;
+          border = cs.borderColor;
+          const radius = cs.borderRadius || '';
+          if (!/%|px/.test(radius) && !/round|circle|pill/i.test(el.className || '')) continue;
+        } catch {
+          continue;
+        }
+      }
+      const state = classifyStatusFill(bg, border);
+      if (!state || state === 'pending') {
+        if (state === 'pending') index += 1;
+        continue;
+      }
+      index += 1;
+      // Prefer earliest non-pending "current" stop
+      if (!best.state || state === 'arrived' || state === 'loaded_enroute') {
+        best = { state, stopIndex: index };
+        if (state === 'arrived' || state === 'loaded_enroute') break;
+      }
+    }
+
+    // Text fallback from aria / titles near status
+    if (!best.state) {
+      const text = (scope.innerText || '').slice(0, 1500);
+      if (/arrived\s*(at)?\s*(facility|stop|yard)?/i.test(text)) {
+        best = { state: 'arrived', stopIndex: 1 };
+      } else if (/loaded|en[\s-]?route|on[\s-]?the[\s-]?way|in[\s-]?transit/i.test(text)) {
+        best = { state: 'loaded_enroute', stopIndex: 1 };
+      }
+    }
+    return best;
+  }
+
+  function parseTripBlock(block, section, extras = {}) {
     const tripMatch = block.match(/\b(T-[A-Z0-9]{5,})\b/i);
     const loadMatch = block.match(/\b([0-9]{2,3}[A-Z0-9]{5,})\b/);
-    const loadId = tripMatch?.[1] || loadMatch?.[1];
+    // Prefer leg/load id when nested under a trip; keep parent_trip_id
+    const parentTripId = tripMatch?.[1] ? String(tripMatch[1]).toUpperCase() : null;
+    const loadId =
+      (loadMatch && tripMatch && loadMatch[1] !== tripMatch[1] ? loadMatch[1] : null) ||
+      tripMatch?.[1] ||
+      loadMatch?.[1];
     if (!loadId) return null;
 
     // Route: APC2 … → SBD3 …   or  APC2 → MARS...
@@ -232,11 +365,18 @@
       extractLabeledValue(block, ['Trailer ID', 'Trailer']) ||
       (block.match(/Trailer(?:\s*ID)?\s*[:\s]*([A-Z]{0,4}\s*[A-Z]?\d{4,})\b/i) || [])[1] ||
       null;
+    const tractorRaw =
+      extractLabeledValue(block, ['Tractor ID', 'Tractor', 'Power unit', 'Truck']) ||
+      (block.match(/Tractor(?:\s*ID)?\s*[:\s]*([A-Z0-9][A-Z0-9\s-]{2,20})/i) || [])[1] ||
+      null;
 
     const equipment =
       extractLabeledValue(block, ['Equipment', 'Trailer type']) ||
       (block.match(/\b(\d{2}'\s*Trailer(?:\s*\([A-Z]\))?)/i) || [])[1] ||
       null;
+    const jobType =
+      extractLabeledValue(block, ['Work type', 'Job type', 'Program']) ||
+      (/\bSpot\b/i.test(block) ? 'Spot' : null);
 
     // Dates near route / schedule lines
     const dateHits = [...block.matchAll(
@@ -261,11 +401,23 @@
       ? cleanLoc(arrow[2])
       : extractLabeledValue(block, ['Delivery', 'Destination', 'To', 'Drop']);
 
-    const status = inferStatusFromText(block);
+    const tripBucket = extras.trip_bucket || detectTripBucket();
+    let status = inferStatusFromText(block);
+    if (tripBucket === 'upcoming' && status === 'In Transit') status = 'Booked';
+    if (tripBucket === 'history' && (status === 'Booked' || status === 'In Transit')) {
+      status = 'Completed';
+    }
+    if (tripBucket === 'in_transit') status = status === 'Booked' ? 'In Transit' : status;
+
+    const statusBar = extras.status_bar || { state: null, stopIndex: null };
 
     return {
       load_id: String(loadId).trim(),
-      amazon_ref_id: tripMatch && loadMatch && loadMatch[1] !== tripMatch[1] ? loadMatch[1] : tripMatch?.[1] || loadMatch?.[1] || null,
+      amazon_ref_id:
+        tripMatch && loadMatch && loadMatch[1] !== tripMatch[1]
+          ? loadMatch[1]
+          : tripMatch?.[1] || loadMatch?.[1] || null,
+      parent_trip_id: parentTripId && String(loadId).toUpperCase() !== parentTripId ? parentTripId : parentTripId,
       load_status: status,
       payment_status: null,
       pickup_location: pickupLoc,
@@ -275,7 +427,12 @@
         dates[1] || dates[0] || extractLabeledValue(block, ['Delivery date', 'End date', 'Departure']),
       ),
       trailer_id: normalizeTrailer(trailerRaw),
+      tractor_id: tractorRaw ? String(tractorRaw).replace(/\s+/g, ' ').trim().slice(0, 40) : null,
       trailer_type: equipment,
+      job_type: jobType,
+      trip_bucket: tripBucket,
+      status_bar_state: statusBar.state,
+      status_stop_index: statusBar.stopIndex,
       distance_miles: miles,
       rate_gross: payout,
       additional_charges: null,
@@ -287,9 +444,10 @@
     };
   }
 
-  function collectTripsFromCards() {
+  function collectTripsFromCards(forcedBucket = null) {
     const loads = [];
     const seen = new Set();
+    const tripBucket = forcedBucket || detectTripBucket();
 
     // Prefer anchors / buttons that look like trip ids
     const anchors = [...document.querySelectorAll('a, button, [role="link"], span, div')].filter(
@@ -302,16 +460,25 @@
     for (const el of anchors) {
       let node = el;
       let block = '';
+      let cardRoot = el;
       for (let i = 0; i < 8 && node; i++) {
         const text = (node.innerText || '').trim();
         if (text.length > 80 && /mi\b|\$|→|->|driver|payout|spot|trailer|equipment/i.test(text)) {
           block = text;
+          cardRoot = node;
           break;
         }
         node = node.parentElement;
       }
-      if (!block) block = (el.closest('[class], section, article, li, tr') || el).innerText || '';
-      const parsed = parseTripBlock(block.slice(0, 4000), 'tours');
+      if (!block) {
+        cardRoot = el.closest('[class], section, article, li, tr') || el;
+        block = cardRoot.innerText || '';
+      }
+      const statusBar = scrapeStatusBar(cardRoot);
+      const parsed = parseTripBlock(block.slice(0, 4000), 'tours', {
+        trip_bucket: tripBucket,
+        status_bar: statusBar,
+      });
       if (!parsed || seen.has(parsed.load_id)) continue;
       seen.add(parsed.load_id);
       loads.push(parsed);
@@ -323,7 +490,10 @@
       const parts = body.split(/(?=T-[A-Z0-9]{5,}\b)/i);
       for (const part of parts) {
         if (!/^T-/i.test(part.trim())) continue;
-        const parsed = parseTripBlock(part.slice(0, 3500), 'tours');
+        const parsed = parseTripBlock(part.slice(0, 3500), 'tours', {
+          trip_bucket: tripBucket,
+          status_bar: scrapeStatusBar(document.body),
+        });
         if (!parsed || seen.has(parsed.load_id)) continue;
         seen.add(parsed.load_id);
         loads.push(parsed);
@@ -522,6 +692,82 @@
     return [...map.values()];
   }
 
+  function collectVisibleTrips(forcedBucket = null) {
+    const cardLoads = collectTripsFromCards(forcedBucket);
+    const tableLoads = collectLoadsFromTables().map((l) => ({
+      ...l,
+      trip_bucket: forcedBucket || l.trip_bucket || detectTripBucket(),
+    }));
+    const detailLoads = collectExpandedDetail().map((l) => ({
+      ...l,
+      trip_bucket: forcedBucket || l.trip_bucket || detectTripBucket(),
+      tractor_id:
+        l.tractor_id ||
+        normalizeTrailer(extractLabeledValue(document.body?.innerText || '', ['Tractor ID', 'Tractor'])),
+      status_bar_state: l.status_bar_state || scrapeStatusBar(document.body).state,
+      status_stop_index: l.status_stop_index || scrapeStatusBar(document.body).stopIndex,
+    }));
+    return mergeLoads(mergeLoads(cardLoads, tableLoads), detailLoads);
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Prefer one Chrome tab: click Upcoming / In Transit / History in-page if Relay
+   * loads list data on tab click. Falls back to current tab only when tabs missing.
+   */
+  async function collectAllTripBuckets() {
+    const tabs = findTripTabButtons();
+    if (tabs.length < 2) {
+      const loads = collectVisibleTrips();
+      return {
+        loads,
+        trip_buckets_scanned: [detectTripBucket()].filter(Boolean),
+        auto_tab_switch: false,
+      };
+    }
+
+    const activeBefore = detectTripBucket();
+    const activeEl =
+      tabs.find((t) => t.bucket === activeBefore)?.el ||
+      tabs.find((t) => t.el.getAttribute('aria-selected') === 'true')?.el ||
+      null;
+
+    let merged = [];
+    const scanned = [];
+    for (const tab of tabs) {
+      try {
+        tab.el.click();
+        await sleep(900);
+      } catch {
+        /* continue with whatever is visible */
+      }
+      const loads = collectVisibleTrips(tab.bucket).map((l) => ({
+        ...l,
+        trip_bucket: tab.bucket,
+      }));
+      scanned.push(tab.bucket);
+      merged = mergeLoads(merged, loads);
+    }
+
+    if (activeEl) {
+      try {
+        activeEl.click();
+        await sleep(400);
+      } catch {
+        /* ignore restore errors */
+      }
+    }
+
+    return {
+      loads: merged,
+      trip_buckets_scanned: scanned,
+      auto_tab_switch: true,
+    };
+  }
+
   function collect() {
     const section = detectSection();
     if (!section) {
@@ -537,23 +783,20 @@
       };
     }
 
-    // Trips/tours board: scrape cards + tables; expanded row also fills detail
+    // Sync path: current visible Trips tab only (fast scan)
     if (section === 'tours') {
-      const cardLoads = collectTripsFromCards();
-      const tableLoads = collectLoadsFromTables();
-      const detailLoads = collectExpandedDetail();
-      const loads = mergeLoads(mergeLoads(cardLoads, tableLoads), detailLoads);
+      const loads = collectVisibleTrips();
       return {
         section: 'tours',
         loads,
-        detail_detected: detailLoads.some((l) => l.trailer_id),
+        trip_bucket: detectTripBucket(),
+        detail_detected: loads.some((l) => l.trailer_id || l.tractor_id),
         payments: [],
         pageTitle: document.title,
         url: location.href,
       };
     }
 
-    // Dedicated detail URL or heuristic detail
     const detail = collectLoadDetail();
     return {
       section: 'load_detail',
@@ -567,15 +810,41 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === 'RELAY_COLLECT') {
-      try {
-        sendResponse({ ok: true, data: collect() });
-      } catch (err) {
-        sendResponse({ ok: false, error: String(err) });
-      }
+      (async () => {
+        try {
+          const section = detectSection();
+          if (section === 'tours' && msg?.allTripTabs !== false) {
+            const multi = await collectAllTripBuckets();
+            sendResponse({
+              ok: true,
+              data: {
+                section: 'tours',
+                loads: multi.loads,
+                trip_bucket: detectTripBucket(),
+                trip_buckets_scanned: multi.trip_buckets_scanned,
+                auto_tab_switch: multi.auto_tab_switch,
+                detail_detected: multi.loads.some((l) => l.trailer_id || l.tractor_id),
+                payments: [],
+                pageTitle: document.title,
+                url: location.href,
+              },
+            });
+            return;
+          }
+          sendResponse({ ok: true, data: collect() });
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err) });
+        }
+      })();
       return true;
     }
     if (msg?.type === 'RELAY_PING') {
-      sendResponse({ ok: true, section: detectSection(), url: location.href });
+      sendResponse({
+        ok: true,
+        section: detectSection(),
+        trip_bucket: detectTripBucket(),
+        url: location.href,
+      });
       return true;
     }
     return false;

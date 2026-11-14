@@ -19,6 +19,12 @@ type LoadIn = {
   delivery_date: string;
   trailer_id?: string | null;
   trailer_type?: string | null;
+  tractor_id?: string | null;
+  parent_trip_id?: string | null;
+  trip_bucket?: string | null;
+  status_bar_state?: string | null;
+  status_stop_index?: number | null;
+  job_type?: string | null;
   distance_miles?: number | null;
   rate_gross?: number | null;
   additional_charges?: number | null;
@@ -68,6 +74,126 @@ function isCompleteLoad(load: LoadIn) {
       load?.pickup_date &&
       load?.delivery_date,
   );
+}
+
+type DriverRow = {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  notes: string | null;
+  driver_id?: string | null;
+};
+
+function normName(s: string): string {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Match Relay display names ("U. Aminov", "Umed Aminov", "AMINOV UMED")
+ * to CRM drivers (case-insensitive; initial+surname; swapped order; notes partners).
+ */
+function matchDriverId(rawName: string, drivers: DriverRow[]): string | null {
+  const raw = String(rawName || "").trim().replace(/\s+/g, " ");
+  if (!raw || !drivers.length) return null;
+  const parts = raw.split(/\s+/).filter(Boolean);
+  if (!parts.length) return null;
+
+  const n = normName(raw);
+  const tokens = n.split(" ").filter(Boolean);
+
+  // Exact full-name forms: "umed aminov" / "aminov umed"
+  for (const d of drivers) {
+    const fn = normName(d.first_name || "");
+    const ln = normName(d.last_name || "");
+    if (!fn || !ln) continue;
+    if (n === `${fn} ${ln}` || n === `${ln} ${fn}`) return d.id;
+  }
+
+  const looksInitial = (t: string) => /^[a-z]$/.test(t.replace(/\./g, ""));
+
+  // "U. Aminov" / "U Aminov" → last=Aminov, first initial U
+  if (parts.length >= 2) {
+    const firstTok = normName(parts[0]);
+    const lastTok = normName(parts[parts.length - 1]);
+    const mid = parts.length > 2 ? normName(parts.slice(1, -1).join(" ")) : "";
+
+    // Prefer surname = last token (Western Relay order)
+    let candidates = drivers.filter((d) => normName(d.last_name || "") === lastTok);
+    if (!candidates.length) {
+      // Surname-first Relay rare: first token is surname
+      candidates = drivers.filter((d) => normName(d.last_name || "") === firstTok);
+    }
+    // Also try first_name holding surname (bad seed) or notes
+    if (!candidates.length) {
+      candidates = drivers.filter((d) => {
+        const hay = `${normName(d.first_name || "")} ${normName(d.last_name || "")} ${normName(d.notes || "")}`;
+        return hay.includes(lastTok) || hay.includes(firstTok);
+      });
+    }
+
+    if (looksInitial(firstTok) || /^[a-z]\.?$/.test(parts[0].toLowerCase())) {
+      const initial = firstTok.charAt(0);
+      const hit = candidates.find((d) => {
+        const fn = normName(d.first_name || "");
+        const ln = normName(d.last_name || "");
+        // Umed Aminov: first starts with U, last Aminov
+        if (ln === lastTok && fn.startsWith(initial)) return true;
+        if (fn === lastTok && ln.startsWith(initial)) return true; // swapped storage
+        // notes partner "Umed Aminov"
+        const notes = normName(d.notes || "");
+        if (notes.includes(lastTok) && new RegExp(`\\b${initial}[a-z]*\\b`).test(notes)) {
+          return true;
+        }
+        return false;
+      });
+      if (hit) return hit.id;
+    }
+
+    // Full first + last
+    const hitFull = candidates.find((d) => {
+      const fn = normName(d.first_name || "");
+      const ln = normName(d.last_name || "");
+      if (ln === lastTok && (fn === firstTok || fn.startsWith(firstTok) || firstTok.startsWith(fn))) {
+        return true;
+      }
+      if (fn === lastTok && (ln === firstTok || ln.startsWith(firstTok))) return true;
+      if (mid && (fn.includes(mid) || normName(d.notes || "").includes(mid))) return true;
+      return false;
+    });
+    if (hitFull) return hitFull.id;
+
+    // Unique surname match
+    if (candidates.length === 1) return candidates[0].id;
+  }
+
+  // Single token: unique first or last or notes
+  if (tokens.length === 1) {
+    const t = tokens[0];
+    const byLast = drivers.filter((d) => normName(d.last_name || "") === t);
+    if (byLast.length === 1) return byLast[0].id;
+    const byFirst = drivers.filter((d) => normName(d.first_name || "") === t);
+    if (byFirst.length === 1) return byFirst[0].id;
+    const byNotes = drivers.filter((d) => normName(d.notes || "").includes(t));
+    if (byNotes.length === 1) return byNotes[0].id;
+  }
+
+  // Fuzzy: all raw tokens appear across first/last/notes
+  const scored = drivers
+    .map((d) => {
+      const hay = `${normName(d.first_name || "")} ${normName(d.last_name || "")} ${normName(d.notes || "")}`;
+      const hits = tokens.filter((t) => t.length > 1 && hay.includes(t)).length;
+      return { d, hits };
+    })
+    .filter((x) => x.hits >= Math.min(2, tokens.length))
+    .sort((a, b) => b.hits - a.hits);
+  if (scored.length && scored[0].hits > 0) {
+    if (scored.length === 1 || scored[0].hits > scored[1].hits) return scored[0].d.id;
+  }
+  return null;
 }
 
 Deno.serve(async (req: Request) => {
@@ -121,6 +247,11 @@ Deno.serve(async (req: Request) => {
       load_id?: string | null;
     }> = [];
 
+    const { data: driverRows } = await sb
+      .from("drivers")
+      .select("id, first_name, last_name, notes, driver_id");
+    const driversCache: DriverRow[] = (driverRows || []) as DriverRow[];
+
     for (const load of loads) {
       if (!isCompleteLoad(load)) {
         errors.push(`Incomplete load skipped: ${load?.load_id || "(missing id)"}`);
@@ -129,7 +260,9 @@ Deno.serve(async (req: Request) => {
 
       const { data: existing, error: findErr } = await sb
         .from("loads")
-        .select("id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, driver_id")
+        .select(
+          "id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, tractor_id, driver_id, status_bar_state, status_stop_index, trip_bucket, parent_trip_id, driver_name_raw, pickup_location, delivery_location, rate_gross",
+        )
         .eq("load_id", load.load_id)
         .maybeSingle();
       if (findErr) {
@@ -137,19 +270,9 @@ Deno.serve(async (req: Request) => {
         continue;
       }
 
-      let driverId: string | null = null;
-      if (load.driver_name_raw) {
-        const parts = String(load.driver_name_raw).trim().split(/\s+/);
-        if (parts.length >= 2) {
-          const { data: driver } = await sb
-            .from("drivers")
-            .select("id")
-            .ilike("first_name", parts[0])
-            .ilike("last_name", parts.slice(1).join(" "))
-            .maybeSingle();
-          driverId = driver?.id ?? null;
-        }
-      }
+      const driverId = load.driver_name_raw
+        ? matchDriverId(String(load.driver_name_raw), driversCache)
+        : null;
 
       const statusHistory = Array.isArray(existing?.status_history)
         ? [...existing.status_history]
@@ -188,6 +311,42 @@ Deno.serve(async (req: Request) => {
         });
       }
 
+      const nextBar = load.status_bar_state || null;
+      const prevBar = existing?.status_bar_state || null;
+      if (nextBar && nextBar !== prevBar) {
+        const stop = load.status_stop_index ?? existing?.status_stop_index ?? 1;
+        const trip = load.parent_trip_id || existing?.parent_trip_id || load.load_id;
+        const driverLabel = load.driver_name_raw || existing?.driver_name_raw || "driver";
+        if (nextBar === "arrived") {
+          notifications.push({
+            event_type: "facility_arrived",
+            dedupe_key: `arrived:${load.load_id}:stop:${stop}`,
+            message:
+              `Arrived facility (stop ${stop})\n` +
+              `Trip ${trip} · Load ${load.load_id}\n` +
+              `Driver: ${driverLabel}\n` +
+              `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}\n` +
+              `Pay: $${load.rate_gross ?? existing?.rate_gross ?? 0}`,
+            driver_id: driverId || existing?.driver_id,
+            trailer_id: load.trailer_id ?? existing?.trailer_id,
+            load_id: load.load_id,
+          });
+        } else if (nextBar === "loaded_enroute") {
+          notifications.push({
+            event_type: "loaded_enroute",
+            dedupe_key: `enroute:${load.load_id}:stop:${stop}`,
+            message:
+              `Loaded & on the way (stop ${stop})\n` +
+              `Trip ${trip} · Load ${load.load_id}\n` +
+              `Driver: ${driverLabel}\n` +
+              `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}`,
+            driver_id: driverId || existing?.driver_id,
+            trailer_id: load.trailer_id ?? existing?.trailer_id,
+            load_id: load.load_id,
+          });
+        }
+      }
+
       const row = {
         load_id: load.load_id,
         amazon_ref_id: load.amazon_ref_id ?? null,
@@ -201,6 +360,12 @@ Deno.serve(async (req: Request) => {
         delivery_date: load.delivery_date,
         trailer_id: load.trailer_id ?? null,
         trailer_type: load.trailer_type ?? null,
+        tractor_id: load.tractor_id ?? null,
+        parent_trip_id: load.parent_trip_id ?? null,
+        trip_bucket: load.trip_bucket ?? null,
+        status_bar_state: load.status_bar_state ?? null,
+        status_stop_index: load.status_stop_index ?? null,
+        job_type: load.job_type ?? null,
         distance_miles: load.distance_miles ?? 0,
         rate_gross: load.rate_gross ?? 0,
         additional_charges: load.additional_charges ?? 0,

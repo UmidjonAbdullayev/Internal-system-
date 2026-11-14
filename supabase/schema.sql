@@ -57,6 +57,12 @@ create table if not exists public.loads (
   delivery_date date not null,
   trailer_id text,
   trailer_type text,
+  tractor_id text,
+  parent_trip_id text,
+  trip_bucket text check (trip_bucket is null or trip_bucket in ('upcoming','in_transit','history')),
+  status_bar_state text,
+  status_stop_index integer,
+  job_type text,
   distance_miles numeric(10,1) default 0,
   rate_gross numeric(12,2) not null default 0,
   additional_charges numeric(12,2) not null default 0,
@@ -78,6 +84,9 @@ create index if not exists loads_delivery_date_idx on public.loads(delivery_date
 create index if not exists loads_load_status_idx on public.loads(load_status);
 create index if not exists loads_amazon_ref_idx on public.loads(amazon_ref_id);
 create index if not exists loads_last_observed_idx on public.loads(last_observed);
+create index if not exists loads_trip_bucket_idx on public.loads(trip_bucket);
+create index if not exists loads_parent_trip_idx on public.loads(parent_trip_id);
+create index if not exists loads_tractor_idx on public.loads(tractor_id);
 
 -- driver_fees
 create table if not exists public.driver_fees (

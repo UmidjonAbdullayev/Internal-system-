@@ -125,7 +125,7 @@ async function scanTabsAndCollect() {
     });
     try {
       if (hinted) await updateSection(hinted, { state: 'Waiting for page' });
-      const result = await collectFromTab(tab.id);
+      const result = await collectFromTab(tab.id, { allTripTabs: true });
       if (!result?.ok) {
         if (hinted) {
           await updateSection(hinted, {
@@ -151,16 +151,17 @@ async function scanTabsAndCollect() {
   await promptMissingSections(seenSections);
 }
 
-async function collectFromTab(tabId) {
+async function collectFromTab(tabId, opts = {}) {
+  const payload = { type: 'RELAY_COLLECT', allTripTabs: opts.allTripTabs !== false };
   try {
-    return await chrome.tabs.sendMessage(tabId, { type: 'RELAY_COLLECT' });
+    return await chrome.tabs.sendMessage(tabId, payload);
   } catch {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
         files: ['content/relay-collector.js'],
       });
-      return await chrome.tabs.sendMessage(tabId, { type: 'RELAY_COLLECT' });
+      return await chrome.tabs.sendMessage(tabId, payload);
     } catch (err) {
       return { ok: false, error: String(err) };
     }
@@ -228,7 +229,7 @@ async function ingestCollection(data) {
         ? completeCount === 0
           ? 'Rows found but required CRM fields incomplete'
           : null
-        : 'No load rows detected on page (open Trips/Tours and expand a load)',
+        : 'No load rows detected — open Trips (Upcoming / In Transit / History). Collapsed rows are scraped when IDs/rates are visible; expand for tractor/trailer detail.',
       lastCollectedAt: hasRows ? new Date().toISOString() : null,
     });
 

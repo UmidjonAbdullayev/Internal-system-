@@ -69,11 +69,22 @@ export interface Driver {
   updatedAt: string;
 }
 
+export type TripBucket = 'upcoming' | 'in_transit' | 'history';
+
+export type StatusBarState =
+  | 'pending'
+  | 'arrived'
+  | 'loaded_enroute'
+  | 'completed'
+  | 'cancelled'
+  | string;
+
 export interface Load {
   id: string;
   loadId: string;
   amazonRefId: string;
   driverId: string | null;
+  driverNameRaw?: string;
   loadStatus: LoadStatus;
   paymentStatus: PaymentStatus;
   pickupLocation: string;
@@ -82,6 +93,12 @@ export interface Load {
   deliveryDate: string;
   trailerId: string;
   trailerType: TrailerType;
+  tractorId?: string;
+  parentTripId?: string | null;
+  tripBucket?: TripBucket | null;
+  statusBarState?: StatusBarState | null;
+  statusStopIndex?: number | null;
+  jobType?: string | null;
   distanceMiles: number;
   rateGross: number;
   additionalCharges: number;

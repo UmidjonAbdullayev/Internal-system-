@@ -1,6 +1,6 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState, useEffect, useRef } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { Plus, Pencil, Trash2 } from 'lucide-react';
+import { Plus, Pencil, Trash2, Upload } from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
@@ -15,22 +15,44 @@ import {
   getWeekRange,
   getDriverFullName,
 } from '@/lib/utils';
-import type { ChargeCategory } from '@/types';
+import { csvToObjects, mapChargeCsvRow, mapFeeCsvRow } from '@/lib/csvImport';
+import { toast } from 'sonner';
+import type { ChargeCategory, FeeFrequency } from '@/types';
 import { format, subWeeks, parseISO } from 'date-fns';
 
 const CATEGORIES: ChargeCategory[] = ['Fuel', 'Dispatch', 'Insurance', 'Equipment', 'ELD', 'Trailer', 'Damage', 'Other'];
+
+function resolveDriverId(
+  drivers: { id: string; driverId: string; firstName: string; lastName: string }[],
+  key: string,
+): string | null {
+  const q = key.trim().toLowerCase();
+  if (!q) return null;
+  const byCode = drivers.find((d) => d.driverId.toLowerCase() === q);
+  if (byCode) return byCode.id;
+  const byName = drivers.find(
+    (d) => getDriverFullName(d.firstName, d.lastName).toLowerCase() === q,
+  );
+  if (byName) return byName.id;
+  const byLast = drivers.find((d) => d.lastName.toLowerCase() === q);
+  return byLast?.id ?? null;
+}
 
 export function SettlementsChargesPage() {
   const {
     drivers,
     oneTimeCharges,
+    driverFees,
     settlements,
     addOneTimeCharge,
     updateOneTimeCharge,
     deleteOneTimeCharge,
+    addFee,
   } = useData();
   const [params, setParams] = useSearchParams();
-  const [tab, setTab] = useState<'charges' | 'settlements'>('charges');
+  const feesImportRef = useRef<HTMLInputElement>(null);
+  const chargesImportRef = useRef<HTMLInputElement>(null);
+  const [tab, setTab] = useState<'charges' | 'settlements' | 'fees'>('charges');
   const [search, setSearch] = useState('');
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -39,8 +61,8 @@ export function SettlementsChargesPage() {
     driverId: drivers[0]?.id ?? '',
     description: '',
     amount: '',
-    date: '2026-11-10',
-    settlementWeekStart: getWeekRange(new Date('2026-11-10')).start,
+    date: new Date().toISOString().slice(0, 10),
+    settlementWeekStart: getWeekRange(new Date()).start,
     category: 'Other' as ChargeCategory,
     notes: '',
   });
@@ -55,7 +77,7 @@ export function SettlementsChargesPage() {
   }, [params, setParams]);
 
   const weekOptions = useMemo(() => {
-    const ref = new Date('2026-11-10');
+    const ref = new Date();
     return [0, 1, 2, 3].map((i) => {
       const w = getWeekRange(subWeeks(ref, i));
       return {
@@ -86,12 +108,79 @@ export function SettlementsChargesPage() {
       driverId: drivers[0]?.id ?? '',
       description: '',
       amount: '',
-      date: '2026-11-10',
-      settlementWeekStart: getWeekRange(new Date('2026-11-10')).start,
+      date: new Date().toISOString().slice(0, 10),
+      settlementWeekStart: getWeekRange(new Date()).start,
       category: 'Other',
       notes: '',
     });
     setFormOpen(true);
+  };
+
+  const importFeesCsv = async (file: File) => {
+    const rows = csvToObjects(await file.text());
+    let added = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      const mapped = mapFeeCsvRow(row);
+      if (!mapped) {
+        skipped += 1;
+        continue;
+      }
+      const driverId = resolveDriverId(drivers, mapped.driverKey);
+      if (!driverId) {
+        skipped += 1;
+        continue;
+      }
+      addFee({
+        driverId,
+        feeName: mapped.feeName,
+        category: (CATEGORIES.includes(mapped.category as ChargeCategory)
+          ? mapped.category
+          : 'Dispatch') as ChargeCategory,
+        calculationType: mapped.calculationType,
+        amount: mapped.amount,
+        frequency: (['Per Load', 'Daily', 'Weekly', 'Monthly'].includes(mapped.frequency)
+          ? mapped.frequency
+          : 'Weekly') as FeeFrequency,
+        active: mapped.active,
+        startDate: mapped.startDate,
+        endDate: mapped.endDate,
+        description: mapped.description,
+      });
+      added += 1;
+    }
+    toast.success(`Imported ${added} fee rows${skipped ? ` · skipped ${skipped}` : ''}`);
+  };
+
+  const importChargesCsv = async (file: File) => {
+    const rows = csvToObjects(await file.text());
+    let added = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      const mapped = mapChargeCsvRow(row);
+      if (!mapped) {
+        skipped += 1;
+        continue;
+      }
+      const driverId = resolveDriverId(drivers, mapped.driverKey);
+      if (!driverId) {
+        skipped += 1;
+        continue;
+      }
+      addOneTimeCharge({
+        driverId,
+        description: mapped.description,
+        amount: mapped.amount,
+        date: mapped.date,
+        settlementWeekStart: mapped.settlementWeekStart,
+        category: (CATEGORIES.includes(mapped.category as ChargeCategory)
+          ? mapped.category
+          : 'Other') as ChargeCategory,
+        notes: mapped.notes,
+      });
+      added += 1;
+    }
+    toast.success(`Imported ${added} weekly charges${skipped ? ` · skipped ${skipped}` : ''}`);
   };
 
   const openEdit = (id: string) => {
@@ -138,17 +227,48 @@ export function SettlementsChargesPage() {
     <div>
       <PageHeader
         title="Settlements & Charges"
-        subtitle="One-time charges and settlement overview"
+        subtitle="Import driver percentages + weekly charges for salary calc · settlement overview"
         actions={
-          <Button size="sm" onClick={openCreate}>
-            <Plus className="h-4 w-4" /> Add One-Time Charge
-          </Button>
+          <>
+            <input
+              ref={feesImportRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void importFeesCsv(f);
+                e.target.value = '';
+              }}
+            />
+            <input
+              ref={chargesImportRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void importChargesCsv(f);
+                e.target.value = '';
+              }}
+            />
+            <Button variant="outline" size="sm" onClick={() => feesImportRef.current?.click()}>
+              <Upload className="h-4 w-4" /> Import % fees
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => chargesImportRef.current?.click()}>
+              <Upload className="h-4 w-4" /> Import weekly charges
+            </Button>
+            <Button size="sm" onClick={openCreate}>
+              <Plus className="h-4 w-4" /> Add One-Time Charge
+            </Button>
+          </>
         }
       />
 
       <div className="mb-4 flex gap-1 border-b border-border">
         {[
           { key: 'charges' as const, label: 'One-Time Charges' },
+          { key: 'fees' as const, label: `Percentages / Fees (${driverFees.length})` },
           { key: 'settlements' as const, label: 'All Settlements' },
         ].map((t) => (
           <button
@@ -223,6 +343,49 @@ export function SettlementsChargesPage() {
             </table>
           </Card>
         </>
+      )}
+
+      {tab === 'fees' && (
+        <Card className="overflow-hidden">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border bg-bg/80">
+                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Driver</th>
+                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Fee</th>
+                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Type</th>
+                <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Amount</th>
+                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Frequency</th>
+                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Active</th>
+              </tr>
+            </thead>
+            <tbody>
+              {driverFees.map((f) => {
+                const d = driverMap[f.driverId];
+                return (
+                  <tr key={f.id} className="border-b border-border/60 table-row-hover">
+                    <td className="px-3 py-2.5 font-medium">
+                      {d ? getDriverFullName(d.firstName, d.lastName) : f.driverId}
+                    </td>
+                    <td className="px-3 py-2.5">{f.feeName}</td>
+                    <td className="px-3 py-2.5 text-xs">{f.calculationType}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">
+                      {f.calculationType === 'Percentage' ? `${f.amount}%` : formatCurrency(f.amount)}
+                    </td>
+                    <td className="px-3 py-2.5 text-xs">{f.frequency}</td>
+                    <td className="px-3 py-2.5">{f.active ? 'Yes' : 'No'}</td>
+                  </tr>
+                );
+              })}
+              {driverFees.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-3 py-8 text-center text-text-secondary">
+                    No fees yet — use Import % fees (CSV: driver_id, percent, fee_name, frequency).
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </Card>
       )}
 
       {tab === 'settlements' && (
