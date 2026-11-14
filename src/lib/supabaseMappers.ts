@@ -7,6 +7,7 @@ import type {
   LoadStatus,
   OneTimeCharge,
   PaymentStatus,
+  RelayPayment,
   Settlement,
   SettlementStatus,
   TrailerType,
@@ -139,5 +140,22 @@ export function mapActivity(row: Record<string, unknown>): ActivityLog {
     entityId: row.entity_id ? str(row.entity_id) : undefined,
     timestamp: str(row.created_at),
     user: str(row.user_name, 'System'),
+  };
+}
+
+export function mapRelayPayment(row: Record<string, unknown>): RelayPayment {
+  return {
+    id: str(row.id),
+    settlementId: row.settlement_id ? str(row.settlement_id) : null,
+    loadId: row.load_id ? str(row.load_id) : null,
+    paymentDate: str(row.payment_date),
+    method: str(row.method),
+    referenceId: str(row.reference_id),
+    amount: num(row.amount),
+    notes: str(row.notes),
+    amazonRefId: str(row.amazon_ref_id),
+    source: str(row.source, 'amazon_relay'),
+    createdAt: str(row.created_at),
+    lastSynchronized: row.last_synchronized ? str(row.last_synchronized) : null,
   };
 }

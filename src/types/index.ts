@@ -147,6 +147,22 @@ export interface SettlementPayment {
   notes: string;
 }
 
+/** Row from public.payments (Amazon Relay sync + settlement payments). */
+export interface RelayPayment {
+  id: string;
+  settlementId: string | null;
+  loadId: string | null;
+  paymentDate: string;
+  method: string;
+  referenceId: string;
+  amount: number;
+  notes: string;
+  amazonRefId: string;
+  source: string;
+  createdAt: string;
+  lastSynchronized: string | null;
+}
+
 export interface SettlementAdjustment {
   id: string;
   description: string;

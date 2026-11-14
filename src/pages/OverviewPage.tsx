@@ -51,11 +51,16 @@ import type { DatePreset, DateRange } from '@/types';
 const PIE_COLORS = ['#174A8B', '#2878D0', '#4A94E0', '#22C55E', '#F59E0B', '#EF4444', '#94A3B8', '#64748B'];
 
 export function OverviewPage() {
-  const { loads, drivers, settlements, activityLogs } = useData();
+  const { loads, drivers, settlements, payments, activityLogs } = useData();
   const [preset, setPreset] = useState<DatePreset>('this_week');
-  const [customRange, setCustomRange] = useState<DateRange>({
-    start: '2026-11-01',
-    end: '2026-11-10',
+  const [customRange, setCustomRange] = useState<DateRange>(() => {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - 30);
+    return {
+      start: start.toISOString().slice(0, 10),
+      end: end.toISOString().slice(0, 10),
+    };
   });
   const range = getDateRangeFromPreset(preset, customRange);
 
@@ -71,11 +76,15 @@ export function OverviewPage() {
         l.deliveryDate >= range.start &&
         l.deliveryDate <= range.end
     ).length;
-    const pendingPayments = settlements.filter((s) =>
+    const settlementPending = settlements.filter((s) =>
       ['Draft', 'Under Review', 'Approved', 'Processing', 'Partially Paid', 'On Hold'].includes(
         s.status
       )
     ).length;
+    const relayPaymentCount = payments.filter(
+      (p) => p.paymentDate >= range.start && p.paymentDate <= range.end,
+    ).length;
+    const pendingPayments = settlementPending || relayPaymentCount;
     const driverEarnings = settlements
       .filter((s) => s.weekStart >= range.start && s.weekStart <= range.end)
       .reduce((sum, s) => sum + s.netPayable, 0);
