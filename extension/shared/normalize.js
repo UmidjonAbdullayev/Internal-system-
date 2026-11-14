@@ -50,11 +50,36 @@ export function parseMiles(raw) {
   return Number.isFinite(n) ? Math.round(n * 10) / 10 : null;
 }
 
+const MONTHS = {
+  jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+  may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10,
+  dec: 11, december: 11,
+};
+
 export function parseDate(raw) {
   if (!raw) return null;
   const s = String(raw).trim();
   const iso = s.match(/(\d{4}-\d{2}-\d{2})/);
   if (iso) return iso[1];
+
+  // Fri, Nov 13, 04:01 PST  |  13 Nov, 03:02 PST
+  let m = s.match(
+    /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+([A-Za-z]+)\s+(\d{1,2})(?:,?\s*(\d{4}))?/i,
+  );
+  if (!m) {
+    const dmy = s.match(/\b(\d{1,2})\s+([A-Za-z]+)(?:,?\s*(\d{4}))?/i);
+    if (dmy) m = [dmy[0], dmy[2], dmy[1], dmy[3]];
+  }
+  if (!m) m = s.match(/\b([A-Za-z]+)\s+(\d{1,2})(?:,?\s*(\d{4}))?/i);
+  if (m) {
+    const mon = MONTHS[String(m[1]).toLowerCase()];
+    if (mon != null) {
+      const year = m[3] ? Number(m[3]) : new Date().getFullYear();
+      return `${year}-${String(mon + 1).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
+    }
+  }
+
   const mdy = s.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
   if (mdy) {
     const year = mdy[3].length === 2 ? `20${mdy[3]}` : mdy[3];

@@ -20,14 +20,16 @@ export const SECTIONS = [
   {
     id: 'tours',
     label: 'Tours / My Loads',
-    urlHints: ['/tours', '/loads', '/work'],
+    // Relay SPA uses /trips (and sometimes /tours, /loads, /work)
+    urlHints: ['/trips', '/trip', '/tours', '/tour', '/loads', '/load', '/work', '/schedule'],
     required: true,
     collects: 'load_id, amazon_ref_id, status, locations, dates, rates, driver name',
   },
   {
     id: 'load_detail',
     label: 'Load detail',
-    urlHints: ['/tour/', '/load/', '/loads/'],
+    // Detail is often an in-page expand on Trips; URL may stay /trips
+    urlHints: ['/tour/', '/tours/', '/trip/', '/trips/', '/load/', '/loads/'],
     required: false,
     collects: 'trailer, miles, additional charges, detailed status',
   },
