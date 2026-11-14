@@ -41,9 +41,15 @@ export function formatPercent(n: number): string {
   return `${sign}${n.toFixed(1)}%`;
 }
 
-export function formatDate(date: string | Date, fmt = 'MMM d, yyyy'): string {
-  const d = typeof date === 'string' ? parseISO(date) : date;
-  return format(d, fmt);
+export function formatDate(date: string | Date | null | undefined, fmt = 'MMM d, yyyy'): string {
+  if (date == null || date === '') return '—';
+  try {
+    const d = typeof date === 'string' ? parseISO(date) : date;
+    if (Number.isNaN(d.getTime())) return '—';
+    return format(d, fmt);
+  } catch {
+    return '—';
+  }
 }
 
 export function formatShortDate(date: string | Date): string {
