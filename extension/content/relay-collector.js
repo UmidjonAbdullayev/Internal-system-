@@ -38,21 +38,61 @@
     december: 11,
   };
 
+  function isTripsBoardUrl(url = location.href) {
+    const u = String(url || '');
+    // /trips, /trips/, /trips?x, /trips#x, /trips/upcoming|in-transit|history
+    if (/\/trips?(?:\/(?:upcoming|in[_-]?transit|history|active|all|list)?)?(?:[/?#]|$)/i.test(u)) {
+      // Real detail: /trips/T-XXXX or /trip/T-XXXX or /trips/123ABC
+      if (/\/trips?\/(T-[A-Za-z0-9]+|[0-9]{2,3}[A-Z0-9]{5,})(?:[/?#]|$)/i.test(u)) return false;
+      return true;
+    }
+    if (/\/(tours?|loads?|work|loadboard|my-?loads|schedule)(?:[/?#]|$)/i.test(u)) {
+      if (/\/(tours?|loads?)\/(T-[A-Za-z0-9]+|[0-9]{2,3}[A-Z0-9]{5,})(?:[/?#]|$)/i.test(u)) {
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  function isTripsBoardDom() {
+    const text = document.body?.innerText?.slice(0, 12000) || '';
+    const title = document.title || '';
+    if (findTripTabButtons().length >= 2) return true;
+    if (/\b(Upcoming|In Transit|History)\b/.test(text) && /\bT-[A-Z0-9]{5,}\b/i.test(text)) {
+      return true;
+    }
+    if (/\b\d+-\d+\s+of\s+\d+\s+results\b/i.test(text) && /\bT-[A-Z0-9]{5,}\b/i.test(text)) {
+      return true;
+    }
+    if (/\b(trips?|tours?|my loads)\b/i.test(title) && /\bT-[A-Z0-9]{5,}\b/i.test(text)) {
+      return true;
+    }
+    return false;
+  }
+
   const SECTION_RULES = [
     { id: 'payments', test: (u) => /payment|settlement|invoice/i.test(u) },
     {
-      id: 'load_detail',
-      test: (u) => /\/(tour|tours|trip|trips|load|loads)\/[A-Za-z0-9_-]+/i.test(u),
+      id: 'tours',
+      // Prefer board URLs over detail — /trips/in-transit is tours, not load_detail
+      test: (u) => isTripsBoardUrl(u),
     },
     {
-      id: 'tours',
-      test: (u) =>
-        /\/(tours?|trips?|loads?|work|loadboard|my-?loads|schedule)/i.test(u),
+      id: 'load_detail',
+      test: (u) => {
+        if (isTripsBoardUrl(u)) return false;
+        return /\/(tour|tours|trip|trips|load|loads)\/[A-Za-z0-9_-]+/i.test(u);
+      },
     },
   ];
 
   function detectSection() {
     const url = location.href;
+    // DOM wins when Relay SPA keeps a generic path but shows Trips board chrome
+    if (!/payment|settlement|invoice/i.test(url) && (isTripsBoardUrl(url) || isTripsBoardDom())) {
+      return 'tours';
+    }
     for (const rule of SECTION_RULES) {
       if (rule.test(url)) return rule.id;
     }
@@ -66,11 +106,11 @@
       /\b\d+-\d+\s+of\s+\d+\s+results\b/i.test(text) ||
       /\b(trips?|tours?|my loads)\b/i.test(document.title + ' ' + text.slice(0, 500))
     ) {
-      return /trailer\s*id|tractor\s*id|equipment|stops|arrival|departure/i.test(text)
-        ? 'tours'
-        : 'tours';
+      return 'tours';
     }
     if (/tour|load id|pickup|delivery|origin|destination/i.test(text)) {
+      // Expanded equipment on the board is still tours; only true single-load pages → detail
+      if (isTripsBoardDom()) return 'tours';
       return /trailer|equipment|stops|rate breakdown/i.test(text) ? 'load_detail' : 'tours';
     }
     return null;
@@ -812,7 +852,11 @@
     if (msg?.type === 'RELAY_COLLECT') {
       (async () => {
         try {
-          const section = detectSection();
+          let section = detectSection();
+          // Hard override: Trips board UI / URL must never stay stuck as load_detail
+          if (section !== 'payments' && (isTripsBoardUrl() || isTripsBoardDom())) {
+            section = 'tours';
+          }
           if (section === 'tours' && msg?.allTripTabs !== false) {
             const multi = await collectAllTripBuckets();
             sendResponse({
@@ -824,6 +868,23 @@
                 trip_buckets_scanned: multi.trip_buckets_scanned,
                 auto_tab_switch: multi.auto_tab_switch,
                 detail_detected: multi.loads.some((l) => l.trailer_id || l.tractor_id),
+                payments: [],
+                pageTitle: document.title,
+                url: location.href,
+              },
+            });
+            return;
+          }
+          // Even on sync single-tab path, force board scrape when mislabeled
+          if (section === 'load_detail' && (isTripsBoardUrl() || isTripsBoardDom())) {
+            const loads = collectVisibleTrips();
+            sendResponse({
+              ok: true,
+              data: {
+                section: 'tours',
+                loads,
+                trip_bucket: detectTripBucket(),
+                detail_detected: loads.some((l) => l.trailer_id || l.tractor_id),
                 payments: [],
                 pageTitle: document.title,
                 url: location.href,
@@ -843,6 +904,7 @@
         ok: true,
         section: detectSection(),
         trip_bucket: detectTripBucket(),
+        trips_board: isTripsBoardUrl() || isTripsBoardDom(),
         url: location.href,
       });
       return true;

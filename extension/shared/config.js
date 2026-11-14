@@ -20,8 +20,23 @@ export const SECTIONS = [
   {
     id: 'tours',
     label: 'Tours / My Loads',
-    // Relay SPA uses /trips (and sometimes /tours, /loads, /work)
-    urlHints: ['/trips', '/trip', '/tours', '/tour', '/loads', '/load', '/work', '/schedule'],
+    // Relay SPA: /trips, /trips/upcoming|in-transit|history (board — not detail)
+    urlHints: [
+      '/trips/upcoming',
+      '/trips/in-transit',
+      '/trips/in_transit',
+      '/trips/history',
+      '/trips',
+      '/trip',
+      '/tours',
+      '/tour',
+      '/loads',
+      '/load',
+      '/work',
+      '/schedule',
+      '/loadboard',
+      '/my-loads',
+    ],
     required: true,
     collects:
       'trip/load ids, tractor, trailer, driver, pay, trip_bucket, status_bar, CRM dates/locations',
@@ -29,8 +44,8 @@ export const SECTIONS = [
   {
     id: 'load_detail',
     label: 'Load detail',
-    // Detail is often an in-page expand on Trips; URL may stay /trips
-    urlHints: ['/tour/', '/tours/', '/trip/', '/trips/', '/load/', '/loads/'],
+    // True detail URLs only (…/trips/T-XXXX). Board paths handled as tours.
+    urlHints: ['/tour/t-', '/tours/t-', '/trip/t-', '/trips/t-', '/load/'],
     required: false,
     collects: 'trailer, tractor, miles, additional charges, detailed status',
   },
@@ -42,6 +57,13 @@ export const SECTIONS = [
     collects: 'payment_status, payment_date, settlement amounts',
   },
 ];
+
+/** Board vs detail: /trips/in-transit is tours; /trips/T-XXXX is detail. */
+export function isTripsBoardUrl(url) {
+  const u = String(url || '').toLowerCase();
+  if (/\/trips?\/(t-[a-z0-9]+|[0-9]{2,3}[a-z0-9]{5,})(?:[/?#]|$)/i.test(u)) return false;
+  return /\/trips?(?:\/(?:upcoming|in[_-]?transit|history|active|all|list)?)?(?:[/?#]|$)/i.test(u);
+}
 
 export const STALE_AFTER_MS = 36 * 60 * 60 * 1000;
 export const TAB_SCAN_ALARM = 'relay-tab-scan';
