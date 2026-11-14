@@ -18,6 +18,7 @@ import {
   isCompleteLoad,
   isCompletePayment,
   finalizeLoadForSync,
+  isValidRelayLoadId,
 } from '../shared/normalize.js';
 
 const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
@@ -262,10 +263,10 @@ async function ingestCollection(data) {
       };
       collected += 1;
 
-      // Payment status can update matching load rows
+      // Payment status can update matching load rows (only real trip/leg IDs)
       if (payment.load_id || payment.amazon_ref_id) {
         const loadKey = payment.load_id || payment.amazon_ref_id;
-        if (pendingLoads[loadKey] || loadKey) {
+        if (loadKey && isValidRelayLoadId(loadKey)) {
           pendingLoads[loadKey] = {
             ...(pendingLoads[loadKey] || { load_id: loadKey }),
             payment_status: payment.payment_status || pendingLoads[loadKey]?.payment_status,
@@ -283,7 +284,7 @@ async function ingestCollection(data) {
     });
   } else {
     for (const load of data.loads || []) {
-      if (!load.load_id) continue;
+      if (!load.load_id || !isValidRelayLoadId(load.load_id)) continue;
       const prev = pendingLoads[load.load_id] || {};
       pendingLoads[load.load_id] = {
         ...prev,
@@ -357,8 +358,9 @@ async function flushToEdge() {
 
   const loads = [];
   for (const raw of Object.values(state.pendingLoads)) {
+    if (!isCompleteLoad(raw)) continue;
     const load = finalizeLoadForSync(raw);
-    if (!isCompleteLoad(load)) continue;
+    if (!load || !isCompleteLoad(load)) continue;
     const content_hash = await hashLoadPayload(load);
     loads.push({ ...load, content_hash, payment_status: load.payment_status || 'Not Received' });
   }

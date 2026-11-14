@@ -245,6 +245,19 @@
     return (m ? m[0] : s).slice(0, 40);
   }
 
+  /** Reject schedule dates mistaken for trip/leg IDs (e.g. "Sep 29, 2026"). */
+  function isValidRelayLoadId(id) {
+    if (id == null) return false;
+    const s = String(id).trim();
+    if (!s || s.length < 6 || s.length > 40) return false;
+    if (/\s/.test(s)) return false;
+    if (/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)/i.test(s)) return false;
+    if (/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(s)) return false;
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return false;
+    if (/^\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}$/.test(s)) return false;
+    return /^T-[A-Z0-9]{5,}$/i.test(s) || /^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(s);
+  }
+
   function detectTripBucket() {
     const selected = document.querySelector(
       '[aria-selected="true"], [role="tab"][aria-current="page"], button[aria-pressed="true"]',
@@ -376,13 +389,12 @@
   function parseTripBlock(block, section, extras = {}) {
     const tripMatch = block.match(/\b(T-[A-Z0-9]{5,})\b/i);
     const loadMatch = block.match(/\b([0-9]{2,3}[A-Z0-9]{5,})\b/);
-    // Prefer leg/load id when nested under a trip; keep parent_trip_id
+    // Prefer T- trip id as load_id (never a schedule date); numeric leg → amazon_ref
     const parentTripId = tripMatch?.[1] ? String(tripMatch[1]).toUpperCase() : null;
-    const loadId =
-      (loadMatch && tripMatch && loadMatch[1] !== tripMatch[1] ? loadMatch[1] : null) ||
-      tripMatch?.[1] ||
-      loadMatch?.[1];
-    if (!loadId) return null;
+    const tripId = parentTripId;
+    const legId = loadMatch?.[1] && isValidRelayLoadId(loadMatch[1]) ? String(loadMatch[1]) : null;
+    const loadId = (tripId && isValidRelayLoadId(tripId) ? tripId : null) || legId;
+    if (!loadId || !isValidRelayLoadId(loadId)) return null;
 
     // Route: APC2 … → SBD3 …   or  APC2 → MARS...
     const arrow = block.match(
@@ -453,10 +465,7 @@
 
     return {
       load_id: String(loadId).trim(),
-      amazon_ref_id:
-        tripMatch && loadMatch && loadMatch[1] !== tripMatch[1]
-          ? loadMatch[1]
-          : tripMatch?.[1] || loadMatch?.[1] || null,
+      amazon_ref_id: legId && legId !== String(loadId) ? legId : tripId || legId || null,
       parent_trip_id: parentTripId && String(loadId).toUpperCase() !== parentTripId ? parentTripId : parentTripId,
       load_status: status,
       payment_status: null,
@@ -549,7 +558,16 @@
     tables.forEach((table) => {
       const headers = headersFromTable(table);
       if (!headers.length) return;
-      const idIdx = indexOfHeader(headers, [/load\s*id/, /tour/, /trip/, /work\s*id/, /^id$/]);
+      // Do NOT match bare /tour|trip/ — that grabbed "Tour date" / "Trip date" cells as load_id
+      const idIdx = indexOfHeader(headers, [
+        /load\s*id/,
+        /tour\s*id/,
+        /trip\s*id/,
+        /work\s*id/,
+        /^tour$/,
+        /^trip$/,
+        /^id$/,
+      ]);
       const refIdx = indexOfHeader(headers, [/amazon/, /reference/, /ref/, /confirmation/]);
       const statusIdx = indexOfHeader(headers, [/status/, /state/]);
       const pickupIdx = indexOfHeader(headers, [/pickup/, /origin/, /from/]);
@@ -567,9 +585,11 @@
       for (const row of rows) {
         const cells = cellsFromRow(row);
         if (cells.length < 2) continue;
-        const loadId =
+        const rawId =
           (idIdx >= 0 ? cells[idIdx] : null) ||
-          cells.find((c) => /^(T-)?[A-Z0-9-]{6,}$/i.test(c) && !/\$/.test(c));
+          cells.find((c) => /^T-[A-Z0-9]{5,}$/i.test(c)) ||
+          cells.find((c) => /^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(c));
+        const loadId = rawId && isValidRelayLoadId(rawId) ? String(rawId).trim() : null;
         if (!loadId) continue;
         const statusRaw = statusIdx >= 0 ? cells[statusIdx] : null;
         const load = {
@@ -959,10 +979,14 @@
     if (fromExpand.length) return fromExpand;
 
     const text = document.body?.innerText || '';
-    const loadId =
-      extractLabeledValue(text, ['Load ID', 'Tour ID', 'Trip ID', 'Work ID']) ||
+    const labeled = extractLabeledValue(text, ['Load ID', 'Tour ID', 'Trip ID', 'Work ID']);
+    const fromPath = location.pathname.split('/').filter(Boolean).pop();
+    const loadIdCandidate =
+      (labeled && isValidRelayLoadId(labeled) ? labeled : null) ||
       (text.match(/\b(T-[A-Z0-9]{5,})\b/i) || [])[1] ||
-      location.pathname.split('/').filter(Boolean).pop();
+      (text.match(/\b([0-9]{2,3}[A-Z0-9]{5,})\b/) || [])[1] ||
+      (fromPath && isValidRelayLoadId(fromPath) ? fromPath : null);
+    const loadId = loadIdCandidate && isValidRelayLoadId(loadIdCandidate) ? String(loadIdCandidate).trim() : null;
     if (!loadId || /^(tours|trips|loads|work|payment)/i.test(loadId)) return [];
     const statusRaw = extractLabeledValue(text, ['Status', 'Load status', 'Tour status']);
     const fuel = parseMoney(extractLabeledValue(text, ['Fuel surcharge', 'Fuel']));

@@ -65,9 +65,22 @@ function requireExtensionKey(req: Request): string | Response {
   return expected;
 }
 
+/** Reject scrapes that used a schedule date as load_id (e.g. "Sep 29, 2026"). */
+function isValidRelayLoadId(id: unknown): boolean {
+  if (id == null) return false;
+  const s = String(id).trim();
+  if (!s || s.length < 6 || s.length > 40) return false;
+  if (/\s/.test(s)) return false;
+  if (/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)/i.test(s)) return false;
+  if (/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(s)) return false;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return false;
+  if (/^\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}$/.test(s)) return false;
+  return /^T-[A-Z0-9]{5,}$/i.test(s) || /^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(s);
+}
+
 function isCompleteLoad(load: LoadIn) {
   return Boolean(
-    load?.load_id &&
+    isValidRelayLoadId(load?.load_id) &&
       load?.load_status &&
       load?.pickup_location &&
       load?.delivery_location &&
@@ -253,6 +266,12 @@ Deno.serve(async (req: Request) => {
     const driversCache: DriverRow[] = (driverRows || []) as DriverRow[];
 
     for (const load of loads) {
+      if (!isValidRelayLoadId(load?.load_id)) {
+        errors.push(
+          `Invalid load_id skipped (expected T-… / leg id, not a date): ${load?.load_id || "(missing id)"}`,
+        );
+        continue;
+      }
       if (!isCompleteLoad(load)) {
         errors.push(`Incomplete load skipped: ${load?.load_id || "(missing id)"}`);
         continue;
@@ -381,9 +400,13 @@ Deno.serve(async (req: Request) => {
       };
 
       if (!existing) {
-        const { error } = await sb.from("loads").insert(row);
+        // UPSERT on load_id so concurrent tab scans never hit loads_load_id_key
+        const { error } = await sb.from("loads").upsert(row, {
+          onConflict: "load_id",
+          ignoreDuplicates: false,
+        });
         if (error) {
-          errors.push(`Insert ${load.load_id}: ${error.message}`);
+          errors.push(`Upsert ${load.load_id}: ${error.message}`);
           continue;
         }
         loadsInserted += 1;
@@ -399,7 +422,7 @@ Deno.serve(async (req: Request) => {
         const { error } = await sb
           .from("loads")
           .update({ last_observed: now, last_synchronized: now, is_stale: false })
-          .eq("id", existing.id);
+          .eq("load_id", load.load_id);
         if (error) errors.push(`Touch ${load.load_id}: ${error.message}`);
         else {
           syncedLoadIds.push(load.load_id);
@@ -408,10 +431,12 @@ Deno.serve(async (req: Request) => {
       } else {
         const { error } = await sb
           .from("loads")
-          .update({ ...row, last_changed: now })
-          .eq("id", existing.id);
+          .upsert(
+            { ...row, last_changed: now },
+            { onConflict: "load_id", ignoreDuplicates: false },
+          );
         if (error) {
-          errors.push(`Update ${load.load_id}: ${error.message}`);
+          errors.push(`Upsert ${load.load_id}: ${error.message}`);
           continue;
         }
         loadsUpdated += 1;
