@@ -18,17 +18,6 @@ import type {
   SettlementAdjustment,
   AppUser,
 } from '@/types';
-import {
-  drivers as seedDrivers,
-  loads as seedLoads,
-  driverFees as seedFees,
-  oneTimeCharges as seedCharges,
-  settlements as seedSettlements,
-  activityLogs as seedActivity,
-  grossAdjustments as seedAdjustments,
-  currentUser as seedUser,
-  companySettings as seedSettings,
-} from '@/data/sampleData';
 import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations';
 import { generateId, getWeekRange } from '@/lib/utils';
 import { toast } from 'sonner';
@@ -42,6 +31,25 @@ interface CompanySettings {
   currency: string;
   timezone: string;
 }
+
+/** Clean-start defaults — no sample drivers/loads (sampleData kept for scripts only). */
+const EMPTY_USER: AppUser = {
+  id: 'user-1',
+  name: 'Admin',
+  email: 'admin@internal.local',
+  role: 'Owner',
+  companyName: 'Internal Sys',
+};
+
+const EMPTY_SETTINGS: CompanySettings = {
+  companyName: 'Internal Sys',
+  companyAddress: '',
+  ein: '',
+  weekStartsOn: 1,
+  defaultDispatchFeePercent: 10,
+  currency: 'USD',
+  timezone: 'America/Chicago',
+};
 
 interface DataContextValue {
   drivers: Driver[];
@@ -100,16 +108,15 @@ function now() {
 }
 
 export function DataProvider({ children }: { children: ReactNode }) {
-  const [drivers, setDrivers] = useState<Driver[]>(seedDrivers);
-  const [loads, setLoads] = useState<Load[]>(seedLoads);
-  const [driverFees, setDriverFees] = useState<DriverFee[]>(seedFees);
-  const [oneTimeCharges, setOneTimeCharges] = useState<OneTimeCharge[]>(seedCharges);
-  const [settlements, setSettlements] = useState<Settlement[]>(seedSettlements);
-  const [activityLogs, setActivityLogs] = useState<ActivityLog[]>(seedActivity);
-  const [grossAdjustments, setGrossAdjustments] =
-    useState<GrossAdjustment[]>(seedAdjustments);
-  const [currentUser] = useState<AppUser>(seedUser);
-  const [companySettings, setCompanySettings] = useState<CompanySettings>(seedSettings);
+  const [drivers, setDrivers] = useState<Driver[]>([]);
+  const [loads, setLoads] = useState<Load[]>([]);
+  const [driverFees, setDriverFees] = useState<DriverFee[]>([]);
+  const [oneTimeCharges, setOneTimeCharges] = useState<OneTimeCharge[]>([]);
+  const [settlements, setSettlements] = useState<Settlement[]>([]);
+  const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
+  const [grossAdjustments, setGrossAdjustments] = useState<GrossAdjustment[]>([]);
+  const [currentUser] = useState<AppUser>(EMPTY_USER);
+  const [companySettings, setCompanySettings] = useState<CompanySettings>(EMPTY_SETTINGS);
 
   const logActivity = useCallback(
     (entry: Omit<ActivityLog, 'id' | 'timestamp' | 'user'>) => {
