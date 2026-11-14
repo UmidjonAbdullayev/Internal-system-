@@ -76,6 +76,126 @@ function isCompleteLoad(load: LoadIn) {
   );
 }
 
+type DriverRow = {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  notes: string | null;
+  driver_id?: string | null;
+};
+
+function normName(s: string): string {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Match Relay display names ("U. Aminov", "Umed Aminov", "AMINOV UMED")
+ * to CRM drivers (case-insensitive; initial+surname; swapped order; notes partners).
+ */
+function matchDriverId(rawName: string, drivers: DriverRow[]): string | null {
+  const raw = String(rawName || "").trim().replace(/\s+/g, " ");
+  if (!raw || !drivers.length) return null;
+  const parts = raw.split(/\s+/).filter(Boolean);
+  if (!parts.length) return null;
+
+  const n = normName(raw);
+  const tokens = n.split(" ").filter(Boolean);
+
+  // Exact full-name forms: "umed aminov" / "aminov umed"
+  for (const d of drivers) {
+    const fn = normName(d.first_name || "");
+    const ln = normName(d.last_name || "");
+    if (!fn || !ln) continue;
+    if (n === `${fn} ${ln}` || n === `${ln} ${fn}`) return d.id;
+  }
+
+  const looksInitial = (t: string) => /^[a-z]$/.test(t.replace(/\./g, ""));
+
+  // "U. Aminov" / "U Aminov" → last=Aminov, first initial U
+  if (parts.length >= 2) {
+    const firstTok = normName(parts[0]);
+    const lastTok = normName(parts[parts.length - 1]);
+    const mid = parts.length > 2 ? normName(parts.slice(1, -1).join(" ")) : "";
+
+    // Prefer surname = last token (Western Relay order)
+    let candidates = drivers.filter((d) => normName(d.last_name || "") === lastTok);
+    if (!candidates.length) {
+      // Surname-first Relay rare: first token is surname
+      candidates = drivers.filter((d) => normName(d.last_name || "") === firstTok);
+    }
+    // Also try first_name holding surname (bad seed) or notes
+    if (!candidates.length) {
+      candidates = drivers.filter((d) => {
+        const hay = `${normName(d.first_name || "")} ${normName(d.last_name || "")} ${normName(d.notes || "")}`;
+        return hay.includes(lastTok) || hay.includes(firstTok);
+      });
+    }
+
+    if (looksInitial(firstTok) || /^[a-z]\.?$/.test(parts[0].toLowerCase())) {
+      const initial = firstTok.charAt(0);
+      const hit = candidates.find((d) => {
+        const fn = normName(d.first_name || "");
+        const ln = normName(d.last_name || "");
+        // Umed Aminov: first starts with U, last Aminov
+        if (ln === lastTok && fn.startsWith(initial)) return true;
+        if (fn === lastTok && ln.startsWith(initial)) return true; // swapped storage
+        // notes partner "Umed Aminov"
+        const notes = normName(d.notes || "");
+        if (notes.includes(lastTok) && new RegExp(`\\b${initial}[a-z]*\\b`).test(notes)) {
+          return true;
+        }
+        return false;
+      });
+      if (hit) return hit.id;
+    }
+
+    // Full first + last
+    const hitFull = candidates.find((d) => {
+      const fn = normName(d.first_name || "");
+      const ln = normName(d.last_name || "");
+      if (ln === lastTok && (fn === firstTok || fn.startsWith(firstTok) || firstTok.startsWith(fn))) {
+        return true;
+      }
+      if (fn === lastTok && (ln === firstTok || ln.startsWith(firstTok))) return true;
+      if (mid && (fn.includes(mid) || normName(d.notes || "").includes(mid))) return true;
+      return false;
+    });
+    if (hitFull) return hitFull.id;
+
+    // Unique surname match
+    if (candidates.length === 1) return candidates[0].id;
+  }
+
+  // Single token: unique first or last or notes
+  if (tokens.length === 1) {
+    const t = tokens[0];
+    const byLast = drivers.filter((d) => normName(d.last_name || "") === t);
+    if (byLast.length === 1) return byLast[0].id;
+    const byFirst = drivers.filter((d) => normName(d.first_name || "") === t);
+    if (byFirst.length === 1) return byFirst[0].id;
+    const byNotes = drivers.filter((d) => normName(d.notes || "").includes(t));
+    if (byNotes.length === 1) return byNotes[0].id;
+  }
+
+  // Fuzzy: all raw tokens appear across first/last/notes
+  const scored = drivers
+    .map((d) => {
+      const hay = `${normName(d.first_name || "")} ${normName(d.last_name || "")} ${normName(d.notes || "")}`;
+      const hits = tokens.filter((t) => t.length > 1 && hay.includes(t)).length;
+      return { d, hits };
+    })
+    .filter((x) => x.hits >= Math.min(2, tokens.length))
+    .sort((a, b) => b.hits - a.hits);
+  if (scored.length && scored[0].hits > 0) {
+    if (scored.length === 1 || scored[0].hits > scored[1].hits) return scored[0].d.id;
+  }
+  return null;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -127,6 +247,11 @@ Deno.serve(async (req: Request) => {
       load_id?: string | null;
     }> = [];
 
+    const { data: driverRows } = await sb
+      .from("drivers")
+      .select("id, first_name, last_name, notes, driver_id");
+    const driversCache: DriverRow[] = (driverRows || []) as DriverRow[];
+
     for (const load of loads) {
       if (!isCompleteLoad(load)) {
         errors.push(`Incomplete load skipped: ${load?.load_id || "(missing id)"}`);
@@ -145,39 +270,9 @@ Deno.serve(async (req: Request) => {
         continue;
       }
 
-      let driverId: string | null = null;
-      if (load.driver_name_raw) {
-        const raw = String(load.driver_name_raw).trim().replace(/\s+/g, " ");
-        const parts = raw.split(/\s+/);
-        if (parts.length >= 2) {
-          const last = parts[parts.length - 1];
-          const firstToken = parts[0].replace(/\./g, "");
-          // "U. Aminov" / "Umed Aminov"
-          const { data: byLast } = await sb
-            .from("drivers")
-            .select("id, first_name, last_name")
-            .ilike("last_name", last)
-            .limit(20);
-          const match = (byLast || []).find((d) => {
-            const fn = String(d.first_name || "");
-            if (/^[A-Za-z]\.?$/.test(parts[0])) {
-              return fn.toLowerCase().startsWith(firstToken.toLowerCase().charAt(0));
-            }
-            return fn.toLowerCase() === firstToken.toLowerCase() ||
-              fn.toLowerCase().startsWith(firstToken.toLowerCase());
-          });
-          driverId = match?.id ?? null;
-          if (!driverId) {
-            const { data: driver } = await sb
-              .from("drivers")
-              .select("id")
-              .ilike("first_name", parts[0].replace(/\./g, ""))
-              .ilike("last_name", parts.slice(1).join(" "))
-              .maybeSingle();
-            driverId = driver?.id ?? null;
-          }
-        }
-      }
+      const driverId = load.driver_name_raw
+        ? matchDriverId(String(load.driver_name_raw), driversCache)
+        : null;
 
       const statusHistory = Array.isArray(existing?.status_history)
         ? [...existing.status_history]
