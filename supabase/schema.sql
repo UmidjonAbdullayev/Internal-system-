@@ -222,6 +222,44 @@ create table if not exists public.relay_notification_dedupe (
 create index if not exists relay_notif_dedupe_created_idx
   on public.relay_notification_dedupe(created_at desc);
 
+-- Per-driver Telegram groups (one chat = one driver); add rows to onboard — no code change
+create table if not exists public.driver_telegram_groups (
+  id uuid primary key default gen_random_uuid(),
+  telegram_chat_id text not null unique,
+  driver_id uuid not null references public.drivers(id) on delete cascade,
+  group_title text,
+  active boolean not null default true,
+  notify_dispatch boolean not null default true,
+  notify_trailer boolean not null default true,
+  notify_status_digest boolean not null default true,
+  notify_alerts boolean not null default true,
+  last_status_digest_at timestamptz,
+  bot_can_post boolean not null default true,
+  last_error text,
+  last_error_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists driver_telegram_groups_driver_idx
+  on public.driver_telegram_groups(driver_id);
+
+create table if not exists public.telegram_notification_history (
+  id uuid primary key default gen_random_uuid(),
+  telegram_chat_id text,
+  driver_id uuid references public.drivers(id) on delete set null,
+  event_type text not null,
+  dedupe_key text not null,
+  message text not null,
+  status text not null check (status in ('sent', 'deduped', 'failed', 'skipped')),
+  error text,
+  meta jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists telegram_notif_history_chat_idx
+  on public.telegram_notification_history(telegram_chat_id, created_at desc);
+
 -- RLS: extension writes via Edge Functions (service role); authenticated CRM can read
 alter table public.users enable row level security;
 alter table public.drivers enable row level security;
@@ -235,6 +273,8 @@ alter table public.payments enable row level security;
 alter table public.activity_logs enable row level security;
 alter table public.relay_sync_runs enable row level security;
 alter table public.relay_notification_dedupe enable row level security;
+alter table public.driver_telegram_groups enable row level security;
+alter table public.telegram_notification_history enable row level security;
 
 do $$
 begin
@@ -255,5 +295,11 @@ begin
   end if;
   if not exists (select 1 from pg_policies where schemaname='public' and tablename='relay_sync_runs' and policyname='authenticated_read_sync_runs') then
     create policy authenticated_read_sync_runs on public.relay_sync_runs for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='driver_telegram_groups' and policyname='authenticated_read_driver_telegram_groups') then
+    create policy authenticated_read_driver_telegram_groups on public.driver_telegram_groups for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='telegram_notification_history' and policyname='authenticated_read_telegram_history') then
+    create policy authenticated_read_telegram_history on public.telegram_notification_history for select to authenticated using (true);
   end if;
 end$$;

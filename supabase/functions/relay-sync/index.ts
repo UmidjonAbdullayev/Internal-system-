@@ -116,6 +116,9 @@ Deno.serve(async (req: Request) => {
       event_type: string;
       dedupe_key: string;
       message: string;
+      driver_id?: string | null;
+      trailer_id?: string | null;
+      load_id?: string | null;
     }> = [];
 
     for (const load of loads) {
@@ -126,7 +129,7 @@ Deno.serve(async (req: Request) => {
 
       const { data: existing, error: findErr } = await sb
         .from("loads")
-        .select("id, load_id, load_status, payment_status, content_hash, status_history")
+        .select("id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, driver_id")
         .eq("load_id", load.load_id)
         .maybeSingle();
       if (findErr) {
@@ -162,8 +165,27 @@ Deno.serve(async (req: Request) => {
             event_type: "load_status_change",
             dedupe_key: `load_status:${load.load_id}:${load.load_status}`,
             message: `Load ${load.load_id} status: ${existing.load_status} → ${load.load_status}`,
+            driver_id: driverId || existing.driver_id,
+            trailer_id: load.trailer_id ?? existing.trailer_id,
+            load_id: load.load_id,
           });
         }
+      }
+
+      if (
+        existing &&
+        load.trailer_id &&
+        existing.trailer_id &&
+        load.trailer_id !== existing.trailer_id
+      ) {
+        notifications.push({
+          event_type: "trailer_change",
+          dedupe_key: `trailer:${load.load_id}:${load.trailer_id}`,
+          message: `Load ${load.load_id} trailer: ${existing.trailer_id} → ${load.trailer_id}`,
+          driver_id: driverId || existing.driver_id,
+          trailer_id: load.trailer_id,
+          load_id: load.load_id,
+        });
       }
 
       const row = {
@@ -234,6 +256,9 @@ Deno.serve(async (req: Request) => {
             event_type: "payment_change",
             dedupe_key: `pay_status:${load.load_id}:${row.payment_status}`,
             message: `Load ${load.load_id} payment: ${existing.payment_status} → ${row.payment_status}`,
+            driver_id: driverId || existing.driver_id,
+            trailer_id: row.trailer_id,
+            load_id: load.load_id,
           });
         }
       }
