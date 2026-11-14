@@ -6,9 +6,15 @@ import {
   SECTIONS,
   TAB_SCAN_ALARM,
   SYNC_ALARM,
+  isTripsBoardUrl,
 } from '../shared/config.js';
 import { getState, setState, updateSection, ensureClientId } from '../shared/state.js';
-import { hashLoadPayload, isCompleteLoad, isCompletePayment } from '../shared/normalize.js';
+import {
+  hashLoadPayload,
+  isCompleteLoad,
+  isCompletePayment,
+  finalizeLoadForSync,
+} from '../shared/normalize.js';
 
 const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
 
@@ -69,10 +75,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Set Extension API key (RELAY_EXTENSION_API_KEY) first' });
         return;
       }
-      const next = await setState({ live: true, syncErrors: [], prompts: [] });
+      const next = await setState({
+        live: true,
+        syncErrors: [],
+        prompts: [],
+        collectionLocks: {},
+        sections: {
+          tours: { state: 'Not checked', lastError: null, lastCollectedAt: null },
+          load_detail: { state: 'Not checked', lastError: null, lastCollectedAt: null },
+          payments: { state: 'Not checked', lastError: null, lastCollectedAt: null },
+        },
+      });
       await scanTabsAndCollect();
       await flushToEdge();
-      sendResponse({ ok: true, state: next });
+      sendResponse({ ok: true, state: await getState() });
       return;
     }
     if (msg?.type === 'STOP') {
@@ -96,9 +112,12 @@ async function listRelayTabs() {
 }
 
 function matchSectionForUrl(url) {
-  const lower = url.toLowerCase();
+  const lower = String(url || '').toLowerCase();
+  if (/payment|settlement|invoice/.test(lower)) return 'payments';
+  // Trips board paths (/trips, /trips/in-transit, …) are always Tours — never Load detail
+  if (isTripsBoardUrl(lower)) return 'tours';
   for (const section of SECTIONS) {
-    if (section.urlHints.some((h) => lower.includes(h))) return section.id;
+    if (section.urlHints.some((h) => lower.includes(h.toLowerCase()))) return section.id;
   }
   return null;
 }
@@ -137,8 +156,21 @@ async function scanTabsAndCollect() {
       }
       const data = result.data;
       if (!data.section) continue;
+      // Content may still label a Trips board as load_detail — coerce for status UI
+      if (
+        data.section === 'load_detail' &&
+        (isTripsBoardUrl(tab.url) || (data.loads || []).some((l) => /^T-/i.test(l.load_id || '')))
+      ) {
+        data.section = 'tours';
+      }
       seenSections.add(data.section);
+      if (data.section === 'tours' || (data.loads || []).length) {
+        seenSections.add('tours');
+      }
       await updateSection(data.section, { state: 'Collecting', lastError: null });
+      if (data.section === 'tours') {
+        await updateSection('tours', { state: 'Collecting', lastError: null });
+      }
       await ingestCollection(data);
     } finally {
       const latest = await getState();
@@ -250,15 +282,21 @@ async function ingestCollection(data) {
 async function promptMissingSections(seenSections) {
   const state = await getState();
   const prompts = [];
+  // Open Trips board tab counts as tours even if content script was slow
+  const hasTripsTab = (state.openTabs || []).some((t) => isTripsBoardUrl(t.url));
+  if (hasTripsTab) seenSections.add('tours');
+
   for (const section of SECTIONS.filter((s) => s.required)) {
     const st = state.sections[section.id]?.state;
-    if (!seenSections.has(section.id) && st !== 'Synced') {
+    if (!seenSections.has(section.id) && st !== 'Synced' && st !== 'Collecting') {
       const message =
         section.id === 'payments'
           ? 'Payment information not detected. Please open the Payments page.'
-          : `${section.label} not detected. Please open the corresponding Amazon Relay page.`;
+          : section.id === 'tours'
+            ? 'Tours / Trips not detected. Open Amazon Relay → Trips (Upcoming, In Transit, or History). One tab is enough — the extension auto-clicks those in-page tabs.'
+            : `${section.label} not detected. Please open the corresponding Amazon Relay page.`;
       prompts.push({ sectionId: section.id, message });
-      if (st === 'Not checked' || st === 'Synced') {
+      if (st === 'Not checked' || st === 'Synced' || st === 'Waiting for page') {
         await updateSection(section.id, { state: 'Waiting for page' });
       }
       await maybeNotifyTelegram({
@@ -276,7 +314,8 @@ async function flushToEdge() {
   if (!state.live || !state.extensionApiKey) return;
 
   const loads = [];
-  for (const load of Object.values(state.pendingLoads)) {
+  for (const raw of Object.values(state.pendingLoads)) {
+    const load = finalizeLoadForSync(raw);
     if (!isCompleteLoad(load)) continue;
     const content_hash = await hashLoadPayload(load);
     loads.push({ ...load, content_hash, payment_status: load.payment_status || 'Not Received' });

@@ -126,17 +126,46 @@ export async function hashLoadPayload(load) {
 }
 
 /**
+ * Fill CRM-required gaps from Relay Trips cards so scrapes insert instead of
+ * stalling forever when a date/location line was collapsed/hidden.
+ */
+export function finalizeLoadForSync(load) {
+  if (!load?.load_id) return load;
+  const today = new Date().toISOString().slice(0, 10);
+  const pickup = load.pickup_location || load.delivery_location || 'Unknown origin';
+  const delivery = load.delivery_location || load.pickup_location || 'Unknown destination';
+  const pickupDate = load.pickup_date || load.delivery_date || today;
+  const deliveryDate = load.delivery_date || load.pickup_date || today;
+  let status = load.load_status;
+  if (!status) {
+    if (load.trip_bucket === 'history') status = 'Completed';
+    else if (load.trip_bucket === 'upcoming') status = 'Booked';
+    else status = 'In Transit';
+  }
+  return {
+    ...load,
+    load_status: status,
+    pickup_location: pickup,
+    delivery_location: delivery,
+    pickup_date: pickupDate,
+    delivery_date: deliveryDate,
+    payment_status: load.payment_status || 'Not Received',
+  };
+}
+
+/**
  * A load is syncable only when required CRM fields are present.
  * Incomplete rows must not be marked Synced.
  */
 export function isCompleteLoad(load) {
+  const finalized = finalizeLoadForSync(load);
   return Boolean(
-    load?.load_id &&
-      load?.load_status &&
-      load?.pickup_location &&
-      load?.delivery_location &&
-      load?.pickup_date &&
-      load?.delivery_date
+    finalized?.load_id &&
+      finalized?.load_status &&
+      finalized?.pickup_location &&
+      finalized?.delivery_location &&
+      finalized?.pickup_date &&
+      finalized?.delivery_date
   );
 }
 
