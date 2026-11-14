@@ -17,6 +17,16 @@ Bot token lives **only** in Edge Function secrets (`TELEGRAM_BOT_TOKEN`). Never 
 
 `TELEGRAM_BOT_TOKEN`, `RELAY_EXTENSION_API_KEY`, optional `TELEGRAM_OPS_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET`.
 
+MCP has no secret-setter; Management API needs `SUPABASE_ACCESS_TOKEN` (not available in the agent VM).
+
+## Webhook
+
+Registered for `@inter_sysbot`:
+
+`https://iiyqkdjwxlnfqvlidbqr.supabase.co/functions/v1/telegram-webhook`
+
+Inbound updates work after `TELEGRAM_BOT_TOKEN` is set. Optional `TELEGRAM_WEBHOOK_SECRET` requires a matching `setWebhook` `secret_token`.
+
 ## Deploy
 
 ```bash
