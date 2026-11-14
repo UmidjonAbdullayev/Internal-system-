@@ -16,6 +16,8 @@ const DEFAULT_STATE = {
   pendingLoads: {},
   pendingPayments: {},
   collectionLocks: {},
+  /** load_id → { at, hasTrailer, hasTractor } — skip re-expand across tabs */
+  detailScraped: {},
   extensionApiKey: '',
   clientId: null,
 };

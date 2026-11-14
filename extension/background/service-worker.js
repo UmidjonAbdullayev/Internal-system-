@@ -7,6 +7,10 @@ import {
   TAB_SCAN_ALARM,
   SYNC_ALARM,
   isTripsBoardUrl,
+  DETAIL_SCRAPE_TTL_MS,
+  EXPAND_DELAY_MS,
+  EXPAND_COLLAPSE_DELAY_MS,
+  MAX_EXPAND_PER_SCAN,
 } from '../shared/config.js';
 import { getState, setState, updateSection, ensureClientId } from '../shared/state.js';
 import {
@@ -101,6 +105,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true, state: await getState() });
       return;
     }
+    if (msg?.type === 'GET_DETAIL_SCRAPED') {
+      const state = await getState();
+      const now = Date.now();
+      const fresh = {};
+      for (const [id, meta] of Object.entries(state.detailScraped || {})) {
+        if (meta?.at && now - meta.at < DETAIL_SCRAPE_TTL_MS) fresh[id] = meta;
+      }
+      if (Object.keys(fresh).length !== Object.keys(state.detailScraped || {}).length) {
+        await setState({ detailScraped: fresh });
+      }
+      sendResponse({ ok: true, detailScraped: fresh });
+      return;
+    }
+    if (msg?.type === 'MARK_DETAIL_SCRAPED') {
+      const state = await getState();
+      const next = { ...(state.detailScraped || {}) };
+      for (const row of msg.rows || []) {
+        if (!row?.load_id) continue;
+        const prev = next[row.load_id] || {};
+        next[row.load_id] = {
+          at: Date.now(),
+          hasTrailer: Boolean(row.trailer_id) || Boolean(prev.hasTrailer),
+          hasTractor: Boolean(row.tractor_id) || Boolean(prev.hasTractor),
+          trailer_id: row.trailer_id || prev.trailer_id || null,
+          tractor_id: row.tractor_id || prev.tractor_id || null,
+          notes: row.notes || prev.notes || null,
+        };
+      }
+      await setState({ detailScraped: next });
+      sendResponse({ ok: true });
+      return;
+    }
     sendResponse({ ok: false, error: 'Unknown message' });
   })();
   return true;
@@ -184,7 +220,13 @@ async function scanTabsAndCollect() {
 }
 
 async function collectFromTab(tabId, opts = {}) {
-  const payload = { type: 'RELAY_COLLECT', allTripTabs: opts.allTripTabs !== false };
+  const payload = {
+    type: 'RELAY_COLLECT',
+    allTripTabs: opts.allTripTabs !== false,
+    maxExpand: opts.maxExpand ?? MAX_EXPAND_PER_SCAN,
+    expandDelayMs: opts.expandDelayMs ?? EXPAND_DELAY_MS,
+    collapseDelayMs: opts.collapseDelayMs ?? EXPAND_COLLAPSE_DELAY_MS,
+  };
   try {
     return await chrome.tabs.sendMessage(tabId, payload);
   } catch {
@@ -261,7 +303,7 @@ async function ingestCollection(data) {
         ? completeCount === 0
           ? 'Rows found but required CRM fields incomplete'
           : null
-        : 'No load rows detected — open Trips (Upcoming / In Transit / History). Collapsed rows are scraped when IDs/rates are visible; expand for tractor/trailer detail.',
+        : 'No load rows detected — open Trips (Upcoming / In Transit / History). Extension auto-expands rows for trailer/stop detail when needed.',
       lastCollectedAt: hasRows ? new Date().toISOString() : null,
     });
 

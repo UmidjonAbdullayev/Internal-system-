@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.1.1",
-  "description": "Sync Amazon Relay load and payment data into Internal Sys CRM via Supabase Edge Functions.",
+  "version": "1.2.0",
+  "description": "Sync Amazon Relay Trips/Payments into Internal Sys CRM (auto-expands trip rows for trailer/stop detail).",
   "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
   "host_permissions": [
     "https://relay.amazon.com/*",

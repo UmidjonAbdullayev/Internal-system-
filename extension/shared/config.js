@@ -68,3 +68,9 @@ export function isTripsBoardUrl(url) {
 export const STALE_AFTER_MS = 36 * 60 * 60 * 1000;
 export const TAB_SCAN_ALARM = 'relay-tab-scan';
 export const SYNC_ALARM = 'relay-sync-flush';
+
+/** Auto-expand Trips rows for trailer/tractor/stop detail */
+export const EXPAND_DELAY_MS = 500;
+export const EXPAND_COLLAPSE_DELAY_MS = 180;
+export const MAX_EXPAND_PER_SCAN = 20;
+export const DETAIL_SCRAPE_TTL_MS = 6 * 60 * 60 * 1000;
