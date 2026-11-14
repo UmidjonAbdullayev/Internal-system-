@@ -118,6 +118,7 @@ export async function hashLoadPayload(load) {
     'additional_charges',
     'payment_date',
     'driver_name_raw',
+    'notes',
   ];
   const normalized = keys.map((k) => `${k}=${load[k] ?? ''}`).join('|');
   const data = new TextEncoder().encode(normalized);

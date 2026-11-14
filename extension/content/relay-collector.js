@@ -598,6 +598,330 @@
     return loads;
   }
 
+  function extractStopAndLateNotes(block) {
+    const lateFlags = [];
+    const stopBits = [];
+    const lines = String(block || '')
+      .split(/\n+/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    for (const line of lines) {
+      if (/\blate\b/i.test(line) && !/template|calculate/i.test(line)) {
+        lateFlags.push(line.slice(0, 160));
+      }
+      if (/\b(arriv(?:al|ed)|depart(?:ure|ed)|stop\s*\d)\b/i.test(line)) {
+        const arrival = (line.match(/arriv(?:al|ed)?\s*[:\s]+([^|;]+)/i) || [])[1]?.trim();
+        const departure = (line.match(/depart(?:ure|ed)?\s*[:\s]+([^|;]+)/i) || [])[1]?.trim();
+        if (arrival || departure || /\bstop\b/i.test(line)) {
+          stopBits.push(
+            [
+              line.slice(0, 120),
+              arrival ? `arr=${arrival.slice(0, 40)}` : null,
+              departure ? `dep=${departure.slice(0, 40)}` : null,
+            ]
+              .filter(Boolean)
+              .join(' | '),
+          );
+        }
+      }
+    }
+    const parts = [];
+    if (lateFlags.length) parts.push(`Late: ${[...new Set(lateFlags)].slice(0, 5).join(' · ')}`);
+    if (stopBits.length) parts.push(`Stops: ${[...new Set(stopBits)].slice(0, 8).join(' · ')}`);
+    return parts.length ? parts.join('\n').slice(0, 1500) : null;
+  }
+
+  function detailIsRich(load) {
+    return Boolean(load?.trailer_id || load?.tractor_id);
+  }
+
+  /** Prefer React fiber / props when Relay already hydrated expand data. */
+  function readReactEquipment(el, depth = 0) {
+    if (!el || depth > 5) return null;
+    const key = Object.keys(el).find(
+      (k) =>
+        k.startsWith('__reactFiber$') ||
+        k.startsWith('__reactInternalInstance$') ||
+        k.startsWith('__reactProps$'),
+    );
+    if (!key) return null;
+    try {
+      let node = el[key];
+      for (let i = 0; i < 14 && node; i += 1) {
+        const memo = node.memoizedProps || node.pendingProps || null;
+        if (memo && typeof memo === 'object') {
+          const blob = JSON.stringify(memo).slice(0, 14000);
+          if (/\b(trailer|tractor|equipment|arrival|departure)\b/i.test(blob)) {
+            const trailer =
+              normalizeTrailer(
+                (blob.match(/"trailer(?:Id|ID|Number)?"\s*:\s*"([^"]+)"/i) || [])[1] ||
+                  (blob.match(/Trailer(?:\s*ID)?[#:\s]+([A-Z0-9][A-Z0-9\s-]{3,24})/i) || [])[1],
+              ) || null;
+            const tractorRaw =
+              (blob.match(/"tractor(?:Id|ID|Number)?"\s*:\s*"([^"]+)"/i) || [])[1] ||
+              (blob.match(/Tractor(?:\s*ID)?[#:\s]+([A-Z0-9][A-Z0-9\s-]{2,20})/i) || [])[1] ||
+              null;
+            const tractor = tractorRaw
+              ? String(tractorRaw).replace(/\s+/g, ' ').trim().slice(0, 40)
+              : null;
+            if (trailer || tractor) {
+              return {
+                trailer_id: trailer,
+                tractor_id: tractor,
+                notes: extractStopAndLateNotes(blob),
+                detail_method: 'react_props',
+              };
+            }
+          }
+        }
+        node = node.return || node._owner || null;
+      }
+    } catch {
+      /* revoked / circular */
+    }
+    return null;
+  }
+
+  function findExpandControl(cardRoot) {
+    if (!cardRoot) return null;
+    const selectors = [
+      'button[aria-expanded="false"]',
+      '[aria-expanded="false"]',
+      'button[aria-label*="expand" i]',
+      'button[aria-label*="detail" i]',
+      'button[aria-label*="chevron" i]',
+      '[data-testid*="expand" i]',
+      '[class*="chevron" i]',
+      '[class*="Expand" i]',
+    ];
+    for (const sel of selectors) {
+      try {
+        const el = cardRoot.querySelector(sel);
+        if (el) return el.closest('button, [role="button"], a') || el;
+      } catch {
+        /* invalid selector in older Chromium — skip */
+      }
+    }
+    const buttons = [...cardRoot.querySelectorAll('button, [role="button"]')].filter((b) => {
+      const label = `${b.getAttribute('aria-label') || ''} ${b.className || ''}`;
+      return /expand|chevron|caret|detail|toggle|arrow/i.test(label) || b.querySelector('svg');
+    });
+    return buttons[0] || null;
+  }
+
+  function isCardExpanded(cardRoot) {
+    if (!cardRoot) return false;
+    if (cardRoot.querySelector('[aria-expanded="true"]')) return true;
+    const t = cardRoot.innerText || '';
+    return /\bTrailer\b/i.test(t) && /\bTractor\b/i.test(t);
+  }
+
+  async function bgMessage(payload) {
+    try {
+      return await chrome.runtime.sendMessage(payload);
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  async function getDetailScrapedMap() {
+    const res = await bgMessage({ type: 'GET_DETAIL_SCRAPED' });
+    return res?.detailScraped || {};
+  }
+
+  async function markDetailScraped(rows) {
+    const rich = (rows || []).filter((r) => r?.load_id && detailIsRich(r));
+    if (!rich.length) return;
+    await bgMessage({
+      type: 'MARK_DETAIL_SCRAPED',
+      rows: rich.map((r) => ({
+        load_id: r.load_id,
+        trailer_id: r.trailer_id,
+        tractor_id: r.tractor_id,
+        notes: r.notes || null,
+      })),
+    });
+  }
+
+  function findCardRootForLoadId(loadId) {
+    if (!loadId) return null;
+    const needle = String(loadId).trim();
+    const anchors = [...document.querySelectorAll('a, button, [role="link"], span, div')].filter(
+      (el) => (el.innerText || el.textContent || '').trim().toUpperCase() === needle.toUpperCase(),
+    );
+    for (const el of anchors) {
+      let node = el;
+      for (let i = 0; i < 8 && node; i += 1) {
+        const text = (node.innerText || '').trim();
+        if (text.length > 80 && /mi\b|\$|→|->|driver|payout|spot|trailer|equipment/i.test(text)) {
+          return node;
+        }
+        node = node.parentElement;
+      }
+      const fallback = el.closest('[class], section, article, li, tr') || el;
+      if (fallback) return fallback;
+    }
+    return null;
+  }
+
+  function parseDetailFromCard(cardRoot, forcedBucket, section = 'tours') {
+    if (!cardRoot) return null;
+    const block = (cardRoot.innerText || '').slice(0, 6000);
+    const statusBar = scrapeStatusBar(cardRoot);
+    const parsed = parseTripBlock(block, section, {
+      trip_bucket: forcedBucket || detectTripBucket(),
+      status_bar: statusBar,
+    });
+    if (!parsed) return null;
+    const stopNotes = extractStopAndLateNotes(block);
+    if (stopNotes) {
+      parsed.notes = [parsed.notes, stopNotes].filter(Boolean).join('\n').slice(0, 2000);
+    }
+    const react = readReactEquipment(cardRoot) || readReactEquipment(cardRoot.firstElementChild);
+    if (react) {
+      parsed.trailer_id = parsed.trailer_id || react.trailer_id;
+      parsed.tractor_id = parsed.tractor_id || react.tractor_id;
+      if (react.notes) {
+        parsed.notes = [parsed.notes, react.notes].filter(Boolean).join('\n').slice(0, 2000);
+      }
+      if (react.detail_method) parsed.detail_method = react.detail_method;
+    }
+    return parsed;
+  }
+
+  /**
+   * DOM/React first; click-expand when Trailer/Tractor not already visible.
+   * Rate-limited; collapses after scrape. Skips IDs already in chrome.storage.
+   */
+  async function expandAndEnrichLoad(load, opts = {}) {
+    const {
+      expandDelayMs = 500,
+      collapseDelayMs = 180,
+      allowExpand = true,
+    } = opts;
+
+    if (detailIsRich(load) && load.notes && /Late:|Stops:/.test(load.notes)) {
+      return { load, method: 'already_rich', expanded: false };
+    }
+
+    const cardRoot = findCardRootForLoadId(load.load_id);
+    if (!cardRoot) {
+      return { load, method: 'no_card', expanded: false };
+    }
+
+    let enriched = parseDetailFromCard(cardRoot, load.trip_bucket, load.section || 'tours');
+    if (enriched) {
+      load = {
+        ...load,
+        ...Object.fromEntries(
+          Object.entries(enriched).filter(([, v]) => v != null && v !== ''),
+        ),
+      };
+    }
+
+    if (detailIsRich(load) || isCardExpanded(cardRoot)) {
+      if (isCardExpanded(cardRoot) && !detailIsRich(load)) {
+        enriched = parseDetailFromCard(cardRoot, load.trip_bucket, load.section || 'tours');
+        if (enriched) {
+          load = {
+            ...load,
+            ...Object.fromEntries(
+              Object.entries(enriched).filter(([, v]) => v != null && v !== ''),
+            ),
+          };
+        }
+      }
+      load.detail_method = load.detail_method || (detailIsRich(load) ? 'dom' : 'open_no_equip');
+      return { load, method: load.detail_method, expanded: false };
+    }
+
+    if (!allowExpand) {
+      load.detail_method = 'skipped_limit_or_cache';
+      return { load, method: load.detail_method, expanded: false };
+    }
+
+    const control = findExpandControl(cardRoot);
+    if (!control) {
+      load.detail_method = 'no_control';
+      return { load, method: 'no_control', expanded: false };
+    }
+
+    try {
+      control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    } catch {
+      try {
+        control.click();
+      } catch {
+        load.detail_method = 'click_failed';
+        return { load, method: 'click_failed', expanded: false };
+      }
+    }
+
+    await sleep(expandDelayMs);
+
+    // Detail often mounts on the card or next sibling panel
+    const scopes = [cardRoot, cardRoot.nextElementSibling, cardRoot.parentElement].filter(Boolean);
+    for (const scope of scopes) {
+      const parsed = parseDetailFromCard(scope, load.trip_bucket, load.section || 'tours');
+      if (!parsed) continue;
+      load = {
+        ...load,
+        ...Object.fromEntries(Object.entries(parsed).filter(([, v]) => v != null && v !== '')),
+      };
+      if (detailIsRich(load)) break;
+    }
+
+    await sleep(collapseDelayMs);
+    try {
+      const collapse =
+        cardRoot.querySelector('[aria-expanded="true"]') ||
+        findExpandControl(cardRoot) ||
+        control;
+      collapse.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    } catch {
+      /* leave open if collapse fails */
+    }
+
+    load.detail_method = 'click_expand';
+    return { load, method: 'click_expand', expanded: true };
+  }
+
+  async function enrichLoadsWithAutoExpand(loads, expandOpts = {}) {
+    const {
+      maxExpand = 20,
+      expandDelayMs = 500,
+      collapseDelayMs = 180,
+      scrapedMap = null,
+    } = expandOpts;
+
+    const already = scrapedMap || (await getDetailScrapedMap());
+    let expandCount = 0;
+    const out = [];
+
+    for (const raw of loads || []) {
+      const prior = already[raw.load_id];
+      const skipExpand = Boolean(prior?.hasTrailer || prior?.hasTractor);
+      // Still refresh DOM/React without clicking when cached
+      const allowExpand = !skipExpand && expandCount < maxExpand && !detailIsRich(raw);
+      const { load, method } = await expandAndEnrichLoad(raw, {
+        expandDelayMs,
+        collapseDelayMs,
+        allowExpand,
+      });
+      if (method === 'click_expand') expandCount += 1;
+      if (prior && (!load.trailer_id || !load.tractor_id || !load.notes)) {
+        load.trailer_id = load.trailer_id || prior.trailer_id || null;
+        load.tractor_id = load.tractor_id || prior.tractor_id || null;
+        if (!load.notes && prior.notes) load.notes = prior.notes;
+        if (skipExpand) load.detail_method = load.detail_method || 'cache_skip_expand';
+      }
+      out.push(load);
+    }
+
+    await markDetailScraped(out);
+    return { loads: out, expanded: expandCount };
+  }
+
   function collectExpandedDetail() {
     const text = document.body?.innerText || '';
     // Expanded stop/equipment panel on Trips board
@@ -618,6 +942,12 @@
       ) || parsed.trailer_id;
 
     if (trailer) parsed.trailer_id = trailer;
+    const tractor =
+      extractLabeledValue(block, ['Tractor ID', 'Tractor']) ||
+      (block.match(/Tractor(?:\s*ID)?\s*[:\s]*([A-Z0-9][A-Z0-9\s-]{2,20})/i) || [])[1];
+    if (tractor) parsed.tractor_id = String(tractor).replace(/\s+/g, ' ').trim().slice(0, 40);
+    const stopNotes = extractStopAndLateNotes(block);
+    if (stopNotes) parsed.notes = stopNotes;
     parsed.section = 'load_detail';
     // Ensure required CRM fields for sync when detail is expanded
     if (!parsed.load_status) parsed.load_status = inferStatusFromText(block);
@@ -732,7 +1062,7 @@
     return [...map.values()];
   }
 
-  function collectVisibleTrips(forcedBucket = null) {
+  function collectVisibleTripsSync(forcedBucket = null) {
     const cardLoads = collectTripsFromCards(forcedBucket);
     const tableLoads = collectLoadsFromTables().map((l) => ({
       ...l,
@@ -743,11 +1073,17 @@
       trip_bucket: forcedBucket || l.trip_bucket || detectTripBucket(),
       tractor_id:
         l.tractor_id ||
-        normalizeTrailer(extractLabeledValue(document.body?.innerText || '', ['Tractor ID', 'Tractor'])),
+        (extractLabeledValue(document.body?.innerText || '', ['Tractor ID', 'Tractor']) || null),
       status_bar_state: l.status_bar_state || scrapeStatusBar(document.body).state,
       status_stop_index: l.status_stop_index || scrapeStatusBar(document.body).stopIndex,
     }));
     return mergeLoads(mergeLoads(cardLoads, tableLoads), detailLoads);
+  }
+
+  async function collectVisibleTrips(forcedBucket = null, expandOpts = {}) {
+    const base = collectVisibleTripsSync(forcedBucket);
+    const { loads, expanded } = await enrichLoadsWithAutoExpand(base, expandOpts);
+    return { loads, expanded, trip_bucket: forcedBucket || detectTripBucket() };
   }
 
   function sleep(ms) {
@@ -757,15 +1093,19 @@
   /**
    * Prefer one Chrome tab: click Upcoming / In Transit / History in-page if Relay
    * loads list data on tab click. Falls back to current tab only when tabs missing.
+   * Auto-expands rows (rate-limited) for trailer/tractor/stop detail.
    */
-  async function collectAllTripBuckets() {
+  async function collectAllTripBuckets(expandOpts = {}) {
+    const maxExpand = expandOpts.maxExpand ?? 20;
+    const scrapedMap = expandOpts.scrapedMap || (await getDetailScrapedMap());
     const tabs = findTripTabButtons();
     if (tabs.length < 2) {
-      const loads = collectVisibleTrips();
+      const result = await collectVisibleTrips(null, { ...expandOpts, maxExpand, scrapedMap });
       return {
-        loads,
+        loads: result.loads,
         trip_buckets_scanned: [detectTripBucket()].filter(Boolean),
         auto_tab_switch: false,
+        rows_expanded: result.expanded,
       };
     }
 
@@ -777,6 +1117,9 @@
 
     let merged = [];
     const scanned = [];
+    let remainingExpand = maxExpand;
+    let rowsExpanded = 0;
+
     for (const tab of tabs) {
       try {
         tab.el.click();
@@ -784,12 +1127,27 @@
       } catch {
         /* continue with whatever is visible */
       }
-      const loads = collectVisibleTrips(tab.bucket).map((l) => ({
+      const result = await collectVisibleTrips(tab.bucket, {
+        ...expandOpts,
+        maxExpand: remainingExpand,
+        scrapedMap,
+      });
+      const loads = result.loads.map((l) => ({
         ...l,
         trip_bucket: tab.bucket,
       }));
+      remainingExpand = Math.max(0, remainingExpand - (result.expanded || 0));
+      rowsExpanded += result.expanded || 0;
       scanned.push(tab.bucket);
       merged = mergeLoads(merged, loads);
+      for (const load of loads) {
+        if (!detailIsRich(load)) continue;
+        scrapedMap[load.load_id] = {
+          at: Date.now(),
+          hasTrailer: Boolean(load.trailer_id),
+          hasTractor: Boolean(load.tractor_id),
+        };
+      }
     }
 
     if (activeEl) {
@@ -805,6 +1163,7 @@
       loads: merged,
       trip_buckets_scanned: scanned,
       auto_tab_switch: true,
+      rows_expanded: rowsExpanded,
     };
   }
 
@@ -823,9 +1182,9 @@
       };
     }
 
-    // Sync path: current visible Trips tab only (fast scan)
+    // Sync path: current visible Trips tab only (fast, no expand) — expand runs on RELAY_COLLECT allTripTabs
     if (section === 'tours') {
-      const loads = collectVisibleTrips();
+      const loads = collectVisibleTripsSync();
       return {
         section: 'tours',
         loads,
@@ -858,7 +1217,11 @@
             section = 'tours';
           }
           if (section === 'tours' && msg?.allTripTabs !== false) {
-            const multi = await collectAllTripBuckets();
+            const multi = await collectAllTripBuckets({
+              maxExpand: msg?.maxExpand ?? 20,
+              expandDelayMs: msg?.expandDelayMs ?? 500,
+              collapseDelayMs: msg?.collapseDelayMs ?? 180,
+            });
             sendResponse({
               ok: true,
               data: {
@@ -867,6 +1230,7 @@
                 trip_bucket: detectTripBucket(),
                 trip_buckets_scanned: multi.trip_buckets_scanned,
                 auto_tab_switch: multi.auto_tab_switch,
+                rows_expanded: multi.rows_expanded || 0,
                 detail_detected: multi.loads.some((l) => l.trailer_id || l.tractor_id),
                 payments: [],
                 pageTitle: document.title,
@@ -877,14 +1241,19 @@
           }
           // Even on sync single-tab path, force board scrape when mislabeled
           if (section === 'load_detail' && (isTripsBoardUrl() || isTripsBoardDom())) {
-            const loads = collectVisibleTrips();
+            const result = await collectVisibleTrips(null, {
+              maxExpand: msg?.maxExpand ?? 20,
+              expandDelayMs: msg?.expandDelayMs ?? 500,
+              collapseDelayMs: msg?.collapseDelayMs ?? 180,
+            });
             sendResponse({
               ok: true,
               data: {
                 section: 'tours',
-                loads,
+                loads: result.loads,
                 trip_bucket: detectTripBucket(),
-                detail_detected: loads.some((l) => l.trailer_id || l.tractor_id),
+                rows_expanded: result.expanded || 0,
+                detail_detected: result.loads.some((l) => l.trailer_id || l.tractor_id),
                 payments: [],
                 pageTitle: document.title,
                 url: location.href,
