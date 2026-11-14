@@ -73,11 +73,17 @@ export function DriversPage() {
       .filter((d) => {
         if (!search) return true;
         const q = search.toLowerCase();
+        const name = getDriverFullName(d.firstName || '', d.lastName || '').toLowerCase();
+        const id = (d.driverId || '').toLowerCase();
+        const email = (d.email || '').toLowerCase();
+        const phone = d.phone || '';
+        const notes = (d.notes || '').toLowerCase();
         return (
-          getDriverFullName(d.firstName, d.lastName).toLowerCase().includes(q) ||
-          d.driverId.toLowerCase().includes(q) ||
-          d.email.toLowerCase().includes(q) ||
-          d.phone.includes(q)
+          name.includes(q) ||
+          id.includes(q) ||
+          email.includes(q) ||
+          phone.includes(q) ||
+          notes.includes(q)
         );
       })
       .map((driver) => {
@@ -275,12 +281,12 @@ export function DriversPage() {
                     </Link>
                   </td>
                   <td className="px-3 py-2.5 text-xs text-text-secondary">{r.driver.driverId}</td>
-                  <td className="px-3 py-2.5 text-xs">{r.driver.phone}</td>
-                  <td className="px-3 py-2.5 text-xs text-text-secondary">{r.driver.email}</td>
-                  <td className="px-3 py-2.5"><Badge status={r.driver.status} /></td>
+                  <td className="px-3 py-2.5 text-xs">{r.driver.phone || '—'}</td>
+                  <td className="px-3 py-2.5 text-xs text-text-secondary">{r.driver.email || '—'}</td>
+                  <td className="px-3 py-2.5"><Badge status={r.driver.status || 'Available'} /></td>
                   <td className="px-3 py-2.5 text-xs">{r.driver.assignedTruck || '—'}</td>
                   <td className="px-3 py-2.5 text-xs">{r.driver.trailerId || '—'}</td>
-                  <td className="px-3 py-2.5 text-xs">{formatDate(r.driver.hireDate, 'MMM d, yyyy')}</td>
+                  <td className="px-3 py-2.5 text-xs">{formatDate(r.driver.hireDate || null, 'MMM d, yyyy')}</td>
                   <td className="px-3 py-2.5 text-right tabular-nums">{r.totalLoads}</td>
                   <td className="px-3 py-2.5 text-right tabular-nums font-medium">{formatCurrency(r.weeklyGross)}</td>
                   <td className="px-3 py-2.5">
