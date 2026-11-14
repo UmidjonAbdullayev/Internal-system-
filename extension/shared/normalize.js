@@ -94,6 +94,22 @@ export function parseDate(raw) {
   return null;
 }
 
+/**
+ * Relay trip/leg IDs only — reject date strings and other scrapes that
+ * used a schedule cell as load_id (e.g. "Sep 29, 2026").
+ */
+export function isValidRelayLoadId(id) {
+  if (id == null) return false;
+  const s = String(id).trim();
+  if (!s || s.length < 6 || s.length > 40) return false;
+  if (/\s/.test(s)) return false; // real IDs never contain spaces
+  if (/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)/i.test(s)) return false;
+  if (/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(s)) return false;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return false;
+  if (/^\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}$/.test(s)) return false;
+  return /^T-[A-Z0-9]{5,}$/i.test(s) || /^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(s);
+}
+
 /** Stable content hash for change detection (CRM-required fields only). */
 export async function hashLoadPayload(load) {
   const keys = [
@@ -131,7 +147,7 @@ export async function hashLoadPayload(load) {
  * stalling forever when a date/location line was collapsed/hidden.
  */
 export function finalizeLoadForSync(load) {
-  if (!load?.load_id) return load;
+  if (!load?.load_id || !isValidRelayLoadId(load.load_id)) return null;
   const today = new Date().toISOString().slice(0, 10);
   const pickup = load.pickup_location || load.delivery_location || 'Unknown origin';
   const delivery = load.delivery_location || load.pickup_location || 'Unknown destination';
@@ -159,6 +175,7 @@ export function finalizeLoadForSync(load) {
  * Incomplete rows must not be marked Synced.
  */
 export function isCompleteLoad(load) {
+  if (!isValidRelayLoadId(load?.load_id)) return false;
   const finalized = finalizeLoadForSync(load);
   return Boolean(
     finalized?.load_id &&
