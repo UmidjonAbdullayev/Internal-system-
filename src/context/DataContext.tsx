@@ -4,6 +4,7 @@ import {
   useState,
   useCallback,
   useMemo,
+  useEffect,
   type ReactNode,
 } from 'react';
 import type {
@@ -20,6 +21,15 @@ import type {
 } from '@/types';
 import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations';
 import { generateId, getWeekRange } from '@/lib/utils';
+import { supabase } from '@/lib/supabase';
+import {
+  mapActivity,
+  mapCharge,
+  mapDriver,
+  mapFee,
+  mapLoad,
+  mapSettlement,
+} from '@/lib/supabaseMappers';
 import { toast } from 'sonner';
 
 interface CompanySettings {
@@ -117,6 +127,119 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [grossAdjustments, setGrossAdjustments] = useState<GrossAdjustment[]>([]);
   const [currentUser] = useState<AppUser>(EMPTY_USER);
   const [companySettings, setCompanySettings] = useState<CompanySettings>(EMPTY_SETTINGS);
+
+  /** Hydrate from Supabase iiyqkdjwxlnfqvlidbqr — empty DB ⇒ empty UI (no sample seed). */
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrate() {
+      const [
+        driversRes,
+        loadsRes,
+        feesRes,
+        chargesRes,
+        settlementsRes,
+        settlementLoadsRes,
+        settlementChargesRes,
+        paymentsRes,
+        activityRes,
+      ] = await Promise.all([
+        supabase.from('drivers').select('*').order('created_at', { ascending: true }),
+        supabase.from('loads').select('*').order('created_at', { ascending: false }),
+        supabase.from('driver_fees').select('*'),
+        supabase.from('one_time_charges').select('*'),
+        supabase.from('settlements').select('*'),
+        supabase.from('settlement_loads').select('*'),
+        supabase.from('settlement_charges').select('*'),
+        supabase.from('payments').select('*'),
+        supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
+      ]);
+
+      if (cancelled) return;
+
+      const err =
+        driversRes.error ||
+        loadsRes.error ||
+        feesRes.error ||
+        chargesRes.error ||
+        settlementsRes.error ||
+        activityRes.error;
+      if (err) {
+        console.error('Supabase CRM hydrate failed', err.message);
+        return;
+      }
+
+      const loadIdsBySettlement = new Map<string, string[]>();
+      for (const row of settlementLoadsRes.data || []) {
+        const sid = String((row as { settlement_id: string }).settlement_id);
+        const lid = String((row as { load_id: string }).load_id);
+        const list = loadIdsBySettlement.get(sid) || [];
+        list.push(lid);
+        loadIdsBySettlement.set(sid, list);
+      }
+
+      const chargesBySettlement = new Map<string, Settlement['charges']>();
+      for (const row of settlementChargesRes.data || []) {
+        const r = row as Record<string, unknown>;
+        const sid = String(r.settlement_id);
+        const list = chargesBySettlement.get(sid) || [];
+        list.push({
+          id: String(r.id),
+          chargeName: String(r.charge_name ?? ''),
+          category: r.category as Settlement['charges'][number]['category'],
+          calculationType: r.calculation_type as Settlement['charges'][number]['calculationType'],
+          originalAmountOrRate: Number(r.original_amount_or_rate) || 0,
+          appliedAmount: Number(r.applied_amount) || 0,
+          frequency: r.frequency as Settlement['charges'][number]['frequency'],
+          chargeType: r.charge_type as Settlement['charges'][number]['chargeType'],
+          sourceId: String(r.source_id ?? ''),
+        });
+        chargesBySettlement.set(sid, list);
+      }
+
+      const paymentsBySettlement = new Map<string, Settlement['payments']>();
+      for (const row of paymentsRes.data || []) {
+        const r = row as Record<string, unknown>;
+        if (!r.settlement_id) continue;
+        const sid = String(r.settlement_id);
+        const list = paymentsBySettlement.get(sid) || [];
+        list.push({
+          id: String(r.id),
+          date: String(r.payment_date ?? ''),
+          method: String(r.method ?? ''),
+          referenceId: String(r.reference_id ?? ''),
+          amount: Number(r.amount) || 0,
+          notes: String(r.notes ?? ''),
+        });
+        paymentsBySettlement.set(sid, list);
+      }
+
+      setDrivers((driversRes.data || []).map((r) => mapDriver(r as Record<string, unknown>)));
+      setLoads((loadsRes.data || []).map((r) => mapLoad(r as Record<string, unknown>)));
+      setDriverFees((feesRes.data || []).map((r) => mapFee(r as Record<string, unknown>)));
+      setOneTimeCharges((chargesRes.data || []).map((r) => mapCharge(r as Record<string, unknown>)));
+      setSettlements(
+        (settlementsRes.data || []).map((r) => {
+          const row = r as Record<string, unknown>;
+          const id = String(row.id);
+          return mapSettlement(
+            row,
+            loadIdsBySettlement.get(id) || [],
+            chargesBySettlement.get(id) || [],
+            paymentsBySettlement.get(id) || [],
+          );
+        }),
+      );
+      setActivityLogs((activityRes.data || []).map((r) => mapActivity(r as Record<string, unknown>)));
+    }
+
+    void hydrate();
+    const timer = window.setInterval(() => void hydrate(), 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const logActivity = useCallback(
     (entry: Omit<ActivityLog, 'id' | 'timestamp' | 'user'>) => {
