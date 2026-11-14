@@ -219,17 +219,28 @@ async function ingestCollection(data) {
       };
       collected += 1;
     }
-    const completeCount = Object.values(pendingLoads).filter(isCompleteLoad).length;
+    const sectionLoads = data.loads || [];
+    const completeCount = sectionLoads.filter(isCompleteLoad).length;
+    const hasRows = sectionLoads.length > 0;
     await updateSection(data.section, {
-      state: completeCount > 0 ? 'Collecting' : data.loads?.length ? 'Collecting' : 'Error',
-      lastError:
-        data.loads?.length && completeCount === 0
+      state: hasRows ? 'Collecting' : 'Error',
+      lastError: hasRows
+        ? completeCount === 0
           ? 'Rows found but required CRM fields incomplete'
-          : data.loads?.length
-            ? null
-            : 'No load rows detected on page',
-      lastCollectedAt: data.loads?.length ? new Date().toISOString() : null,
+          : null
+        : 'No load rows detected on page (open Trips/Tours and expand a load)',
+      lastCollectedAt: hasRows ? new Date().toISOString() : null,
     });
+
+    // Expanded trip detail (trailer/equipment) often lives on the same /trips URL
+    const detailLoads = sectionLoads.filter((l) => l.trailer_id || l.section === 'load_detail');
+    if (data.detail_detected || detailLoads.length) {
+      await updateSection('load_detail', {
+        state: 'Collecting',
+        lastError: null,
+        lastCollectedAt: new Date().toISOString(),
+      });
+    }
   }
 
   await setState({ pendingLoads, pendingPayments, recordsCollected: collected });

@@ -24,7 +24,8 @@ Set `SUPABASE_ANON_KEY` in `shared/config.js` from that project's Settings → A
 3. Login: username `admin` / password `qwerty`
 4. Paste `RELAY_EXTENSION_API_KEY` (must match the Supabase Edge Function secret)
 5. Click **GO LIVE**
-6. Open required Relay pages (Tours/My Loads + Payments). The checklist updates as pages are detected and data is written.
+6. Open Relay **Trips** (or Tours) with at least one trip expanded, plus **Payments**. Checklist updates as pages are detected.
+7. After updating this folder, use **Reload** on `chrome://extensions` (v1.1.0+ scrapes Trips SPA cards; host match stays `relay.amazon.com`).
 
 ## Security
 
