@@ -24,6 +24,8 @@ const DRIVER_EVENTS = new Set([
   "alert_app_usage",
   "alert_ready",
   "status_digest",
+  "facility_arrived",
+  "loaded_enroute",
 ]);
 
 const OPS_EVENTS = new Set(["sync_error", "missing_page"]);
@@ -100,7 +102,13 @@ function eventAllowedForGroup(
     notify_alerts: boolean;
   },
 ): boolean {
-  if (eventType === "dispatch_update" || eventType === "load_status_change" || eventType === "payment_change") {
+  if (
+    eventType === "dispatch_update" ||
+    eventType === "load_status_change" ||
+    eventType === "payment_change" ||
+    eventType === "facility_arrived" ||
+    eventType === "loaded_enroute"
+  ) {
     return group.notify_dispatch;
   }
   if (eventType === "trailer_change") return group.notify_trailer;

@@ -23,7 +23,8 @@ export const SECTIONS = [
     // Relay SPA uses /trips (and sometimes /tours, /loads, /work)
     urlHints: ['/trips', '/trip', '/tours', '/tour', '/loads', '/load', '/work', '/schedule'],
     required: true,
-    collects: 'load_id, amazon_ref_id, status, locations, dates, rates, driver name',
+    collects:
+      'trip/load ids, tractor, trailer, driver, pay, trip_bucket, status_bar, CRM dates/locations',
   },
   {
     id: 'load_detail',
@@ -31,7 +32,7 @@ export const SECTIONS = [
     // Detail is often an in-page expand on Trips; URL may stay /trips
     urlHints: ['/tour/', '/tours/', '/trip/', '/trips/', '/load/', '/loads/'],
     required: false,
-    collects: 'trailer, miles, additional charges, detailed status',
+    collects: 'trailer, tractor, miles, additional charges, detailed status',
   },
   {
     id: 'payments',

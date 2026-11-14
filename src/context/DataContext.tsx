@@ -284,13 +284,42 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   const addDriver = useCallback(
     (data: Omit<Driver, 'id' | 'createdAt' | 'updatedAt'>) => {
+      const id = crypto.randomUUID();
+      const ts = now();
       const driver: Driver = {
         ...data,
-        id: generateId('drv'),
-        createdAt: now(),
-        updatedAt: now(),
+        id,
+        createdAt: ts,
+        updatedAt: ts,
       };
       setDrivers((prev) => [...prev, driver]);
+      void supabase
+        .from('drivers')
+        .insert({
+          id,
+          driver_id: data.driverId,
+          first_name: data.firstName,
+          last_name: data.lastName,
+          phone: data.phone,
+          email: data.email,
+          status: data.status,
+          assigned_truck: data.assignedTruck,
+          trailer_id: data.trailerId,
+          hire_date: data.hireDate || null,
+          notes: data.notes,
+          address: data.address,
+          city: data.city,
+          state: data.state,
+          zip: data.zip,
+          license_number: data.licenseNumber,
+          license_expiry: data.licenseExpiry || null,
+          created_at: ts,
+          updated_at: ts,
+        })
+        .then(({ error }) => {
+          if (error) toast.error(`Driver sync failed: ${error.message}`);
+          else void hydrate();
+        });
       logActivity({
         type: 'driver',
         action: 'created',
@@ -300,14 +329,39 @@ export function DataProvider({ children }: { children: ReactNode }) {
       toast.success('Driver added successfully');
       return driver;
     },
-    [logActivity]
+    [logActivity, hydrate]
   );
 
   const updateDriver = useCallback(
     (id: string, patch: Partial<Driver>) => {
+      const ts = now();
       setDrivers((prev) =>
-        prev.map((d) => (d.id === id ? { ...d, ...patch, updatedAt: now() } : d))
+        prev.map((d) => (d.id === id ? { ...d, ...patch, updatedAt: ts } : d))
       );
+      const row: Record<string, unknown> = { updated_at: ts };
+      if (patch.driverId != null) row.driver_id = patch.driverId;
+      if (patch.firstName != null) row.first_name = patch.firstName;
+      if (patch.lastName != null) row.last_name = patch.lastName;
+      if (patch.phone != null) row.phone = patch.phone;
+      if (patch.email != null) row.email = patch.email;
+      if (patch.status != null) row.status = patch.status;
+      if (patch.assignedTruck != null) row.assigned_truck = patch.assignedTruck;
+      if (patch.trailerId != null) row.trailer_id = patch.trailerId;
+      if (patch.hireDate != null) row.hire_date = patch.hireDate;
+      if (patch.notes != null) row.notes = patch.notes;
+      if (patch.address != null) row.address = patch.address;
+      if (patch.city != null) row.city = patch.city;
+      if (patch.state != null) row.state = patch.state;
+      if (patch.zip != null) row.zip = patch.zip;
+      if (patch.licenseNumber != null) row.license_number = patch.licenseNumber;
+      if (patch.licenseExpiry != null) row.license_expiry = patch.licenseExpiry;
+      void supabase
+        .from('drivers')
+        .update(row)
+        .eq('id', id)
+        .then(({ error }) => {
+          if (error) toast.error(`Driver update failed: ${error.message}`);
+        });
       logActivity({
         type: 'driver',
         action: 'updated',
@@ -326,6 +380,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
           d.id === id ? { ...d, status: 'Inactive', updatedAt: now() } : d
         )
       );
+      void supabase
+        .from('drivers')
+        .update({ status: 'Inactive', updated_at: now() })
+        .eq('id', id);
       logActivity({
         type: 'driver',
         action: 'deactivated',
@@ -409,13 +467,35 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   const addFee = useCallback(
     (data: Omit<DriverFee, 'id' | 'createdAt' | 'updatedAt'>) => {
+      const id = crypto.randomUUID();
+      const ts = now();
       const fee: DriverFee = {
         ...data,
-        id: generateId('fee'),
-        createdAt: now(),
-        updatedAt: now(),
+        id,
+        createdAt: ts,
+        updatedAt: ts,
       };
       setDriverFees((prev) => [...prev, fee]);
+      void supabase
+        .from('driver_fees')
+        .insert({
+          id,
+          driver_id: data.driverId,
+          fee_name: data.feeName,
+          category: data.category,
+          calculation_type: data.calculationType,
+          amount: data.amount,
+          frequency: data.frequency,
+          active: data.active,
+          start_date: data.startDate,
+          end_date: data.endDate,
+          description: data.description,
+          created_at: ts,
+          updated_at: ts,
+        })
+        .then(({ error }) => {
+          if (error) toast.error(`Fee sync failed: ${error.message}`);
+        });
       toast.success('Fee configuration added');
       return fee;
     },
@@ -423,21 +503,52 @@ export function DataProvider({ children }: { children: ReactNode }) {
   );
 
   const updateFee = useCallback((id: string, patch: Partial<DriverFee>) => {
+    const ts = now();
     setDriverFees((prev) =>
-      prev.map((f) => (f.id === id ? { ...f, ...patch, updatedAt: now() } : f))
+      prev.map((f) => (f.id === id ? { ...f, ...patch, updatedAt: ts } : f))
     );
+    const row: Record<string, unknown> = { updated_at: ts };
+    if (patch.feeName != null) row.fee_name = patch.feeName;
+    if (patch.category != null) row.category = patch.category;
+    if (patch.calculationType != null) row.calculation_type = patch.calculationType;
+    if (patch.amount != null) row.amount = patch.amount;
+    if (patch.frequency != null) row.frequency = patch.frequency;
+    if (patch.active != null) row.active = patch.active;
+    if (patch.startDate != null) row.start_date = patch.startDate;
+    if (patch.endDate !== undefined) row.end_date = patch.endDate;
+    if (patch.description != null) row.description = patch.description;
+    void supabase.from('driver_fees').update(row).eq('id', id);
     toast.success('Fee updated');
   }, []);
 
   const deleteFee = useCallback((id: string) => {
     setDriverFees((prev) => prev.filter((f) => f.id !== id));
+    void supabase.from('driver_fees').delete().eq('id', id);
     toast.success('Fee removed');
   }, []);
 
   const addOneTimeCharge = useCallback(
     (data: Omit<OneTimeCharge, 'id' | 'createdAt'>) => {
-      const charge: OneTimeCharge = { ...data, id: generateId('otc'), createdAt: now() };
+      const id = crypto.randomUUID();
+      const ts = now();
+      const charge: OneTimeCharge = { ...data, id, createdAt: ts };
       setOneTimeCharges((prev) => [...prev, charge]);
+      void supabase
+        .from('one_time_charges')
+        .insert({
+          id,
+          driver_id: data.driverId,
+          description: data.description,
+          amount: data.amount,
+          date: data.date,
+          settlement_week_start: data.settlementWeekStart,
+          category: data.category,
+          notes: data.notes,
+          created_at: ts,
+        })
+        .then(({ error }) => {
+          if (error) toast.error(`Charge sync failed: ${error.message}`);
+        });
       // Recalculate non-finalized settlement for that week
       setSettlements((prev) =>
         prev.map((s) => {

@@ -19,7 +19,7 @@ import {
   downloadCSV,
   getDriverFullName,
 } from '@/lib/utils';
-import type { Load, LoadStatus, PaymentStatus, TrailerType } from '@/types';
+import type { Load, LoadStatus, PaymentStatus, TrailerType, TripBucket } from '@/types';
 
 const LOAD_STATUSES: LoadStatus[] = [
   'Available', 'Booked', 'Dispatched', 'In Transit', 'Delivered', 'Completed', 'Cancelled', 'Rejected',
@@ -29,6 +29,43 @@ const PAYMENT_STATUSES: PaymentStatus[] = [
 ];
 const TRAILER_TYPES: TrailerType[] = ['Dry Van', 'Reefer', 'Flatbed', 'Step Deck', 'Box Truck'];
 
+type LoadsTab = TripBucket | 'all';
+
+const TRIP_TABS: { id: LoadsTab; label: string }[] = [
+  { id: 'upcoming', label: 'Upcoming' },
+  { id: 'in_transit', label: 'In Transit' },
+  { id: 'history', label: 'History' },
+  { id: 'all', label: 'All' },
+];
+
+function inferTripBucket(load: Load): TripBucket | null {
+  if (load.tripBucket) return load.tripBucket;
+  if (load.loadStatus === 'Completed' || load.loadStatus === 'Delivered' || load.loadStatus === 'Cancelled') {
+    return 'history';
+  }
+  if (load.loadStatus === 'In Transit' || load.loadStatus === 'Dispatched') return 'in_transit';
+  if (load.loadStatus === 'Booked' || load.loadStatus === 'Available') return 'upcoming';
+  return null;
+}
+
+function driverDisplayName(
+  load: Load,
+  driverMap: Record<string, { firstName: string; lastName: string }>,
+): string {
+  if (load.driverId && driverMap[load.driverId]) {
+    return getDriverFullName(driverMap[load.driverId].firstName, driverMap[load.driverId].lastName);
+  }
+  return load.driverNameRaw || 'Unassigned';
+}
+
+function statusBarLabel(load: Load): string {
+  if (load.statusBarState === 'arrived') return `Arrived · stop ${load.statusStopIndex ?? 1}`;
+  if (load.statusBarState === 'loaded_enroute') return `Loaded / en route · stop ${load.statusStopIndex ?? 1}`;
+  if (load.statusBarState === 'cancelled') return 'Cancelled stop';
+  if (load.statusBarState) return String(load.statusBarState);
+  return load.loadStatus;
+}
+
 const emptyForm = {
   loadId: '',
   amazonRefId: '',
@@ -37,10 +74,11 @@ const emptyForm = {
   paymentStatus: 'Not Received' as PaymentStatus,
   pickupLocation: '',
   deliveryLocation: '',
-  pickupDate: '2026-11-10',
-  deliveryDate: '2026-11-11',
+  pickupDate: new Date().toISOString().slice(0, 10),
+  deliveryDate: new Date().toISOString().slice(0, 10),
   trailerId: '',
   trailerType: 'Dry Van' as TrailerType,
+  tractorId: '',
   distanceMiles: 0,
   rateGross: 0,
   additionalCharges: 0,
@@ -49,8 +87,9 @@ const emptyForm = {
 };
 
 export function LoadsPage() {
-  const { loads, drivers, addLoad, updateLoad, deleteLoad } = useData();
+  const { loads, drivers, addLoad, updateLoad, deleteLoad, dataSource, refreshData } = useData();
   const [params, setParams] = useSearchParams();
+  const [tab, setTab] = useState<LoadsTab>((params.get('tab') as LoadsTab) || 'in_transit');
   const [search, setSearch] = useState(params.get('q') ?? '');
   const [statusFilter, setStatusFilter] = useState(params.get('status') ?? '');
   const [paymentFilter, setPaymentFilter] = useState(params.get('paymentStatus') ?? '');
@@ -71,6 +110,8 @@ export function LoadsPage() {
       params.delete('action');
       setParams(params, { replace: true });
     }
+    const t = params.get('tab') as LoadsTab | null;
+    if (t && TRIP_TABS.some((x) => x.id === t)) setTab(t);
   }, [params, setParams]);
 
   const driverMap = useMemo(
@@ -78,23 +119,40 @@ export function LoadsPage() {
     [drivers]
   );
 
+  const tabCounts = useMemo(() => {
+    const counts: Record<LoadsTab, number> = {
+      upcoming: 0,
+      in_transit: 0,
+      history: 0,
+      all: loads.length,
+    };
+    for (const l of loads) {
+      const b = inferTripBucket(l);
+      if (b) counts[b] += 1;
+    }
+    return counts;
+  }, [loads]);
+
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
     return loads.filter((l) => {
+      const bucket = inferTripBucket(l);
+      if (tab !== 'all' && bucket !== tab) return false;
       if (statusFilter && l.loadStatus !== statusFilter) return false;
       if (paymentFilter && l.paymentStatus !== paymentFilter) return false;
       if (driverFilter && l.driverId !== driverFilter) return false;
       if (dateFrom && l.deliveryDate < dateFrom) return false;
       if (dateTo && l.deliveryDate > dateTo) return false;
       if (q) {
-        const driver = l.driverId ? driverMap[l.driverId] : null;
         const hay = [
           l.loadId,
           l.amazonRefId,
+          l.parentTripId,
           l.trailerId,
+          l.tractorId,
           l.pickupLocation,
           l.deliveryLocation,
-          driver ? getDriverFullName(driver.firstName, driver.lastName) : '',
+          driverDisplayName(l, driverMap),
         ]
           .join(' ')
           .toLowerCase();
@@ -102,7 +160,7 @@ export function LoadsPage() {
       }
       return true;
     });
-  }, [loads, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, driverMap]);
+  }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, driverMap]);
 
   const sorted = useSort(filtered, sortKey, sortDir, {
     loadId: (l) => l.loadId,
@@ -112,10 +170,9 @@ export function LoadsPage() {
     distanceMiles: (l) => l.distanceMiles,
     loadStatus: (l) => l.loadStatus,
     paymentStatus: (l) => l.paymentStatus,
-    driver: (l) => {
-      const d = l.driverId ? driverMap[l.driverId] : null;
-      return d ? getDriverFullName(d.firstName, d.lastName) : '';
-    },
+    driver: (l) => driverDisplayName(l, driverMap),
+    tractor: (l) => l.tractorId || '',
+    trailer: (l) => l.trailerId || '',
   });
 
   const handleSort = (key: string) => {
@@ -150,6 +207,7 @@ export function LoadsPage() {
       deliveryDate: load.deliveryDate,
       trailerId: load.trailerId,
       trailerType: load.trailerType,
+      tractorId: load.tractorId || '',
       distanceMiles: load.distanceMiles,
       rateGross: load.rateGross,
       additionalCharges: load.additionalCharges,
@@ -161,19 +219,14 @@ export function LoadsPage() {
 
   const saveForm = () => {
     if (!form.loadId || !form.pickupLocation || !form.deliveryLocation) return;
-    if (editing) {
-      updateLoad(editing.id, {
-        ...form,
-        driverId: form.driverId || null,
-        paymentDate: form.paymentDate || null,
-      });
-    } else {
-      addLoad({
-        ...form,
-        driverId: form.driverId || null,
-        paymentDate: form.paymentDate || null,
-      });
-    }
+    const payload = {
+      ...form,
+      driverId: form.driverId || null,
+      paymentDate: form.paymentDate || null,
+      tractorId: form.tractorId || '',
+    };
+    if (editing) updateLoad(editing.id, payload);
+    else addLoad(payload);
     setFormOpen(false);
   };
 
@@ -181,40 +234,45 @@ export function LoadsPage() {
     downloadCSV(
       'loads-export.csv',
       [
-        'Load ID', 'Amazon Ref', 'Driver', 'Load Status', 'Payment Status',
-        'Pickup', 'Delivery', 'Pickup Date', 'Delivery Date', 'Trailer', 'Miles',
-        'Gross', 'Additional', 'Final Gross', 'Notes',
+        'Trip/Load ID', 'Parent Trip', 'Driver', 'Status', 'Status Bar', 'Tractor', 'Trailer',
+        'Pickup', 'Delivery', 'Pickup Date', 'Delivery Date', 'Miles', 'Pay', 'Bucket',
       ],
-      sorted.map((l) => {
-        const d = l.driverId ? driverMap[l.driverId] : null;
-        return [
-          l.loadId,
-          l.amazonRefId,
-          d ? getDriverFullName(d.firstName, d.lastName) : '',
-          l.loadStatus,
-          l.paymentStatus,
-          l.pickupLocation,
-          l.deliveryLocation,
-          l.pickupDate,
-          l.deliveryDate,
-          l.trailerId,
-          l.distanceMiles,
-          l.rateGross,
-          l.additionalCharges,
-          getLoadFinalGross(l),
-          l.notes,
-        ];
-      })
+      sorted.map((l) => [
+        l.loadId,
+        l.parentTripId || '',
+        driverDisplayName(l, driverMap),
+        l.loadStatus,
+        statusBarLabel(l),
+        l.tractorId || '',
+        l.trailerId || '',
+        l.pickupLocation,
+        l.deliveryLocation,
+        l.pickupDate,
+        l.deliveryDate,
+        l.distanceMiles,
+        getLoadFinalGross(l),
+        inferTripBucket(l) || '',
+      ])
     );
+  };
+
+  const selectTab = (id: LoadsTab) => {
+    setTab(id);
+    const next = new URLSearchParams(params);
+    next.set('tab', id);
+    setParams(next, { replace: true });
   };
 
   return (
     <div>
       <PageHeader
-        title="Loads CRM"
-        subtitle={`${sorted.length} loads · Amazon Relay & manual entries`}
+        title="Loads / Trips"
+        subtitle={`${sorted.length} shown · live ${dataSource} · mirrors Relay Upcoming / In Transit / History`}
         actions={
           <>
+            <Button variant="outline" size="sm" onClick={() => void refreshData()}>
+              Refresh
+            </Button>
             <Button variant="outline" size="sm" onClick={exportCSV}>
               <Download className="h-4 w-4" /> Export
             </Button>
@@ -225,12 +283,30 @@ export function LoadsPage() {
         }
       />
 
+      <div className="mb-4 flex flex-wrap gap-1 border-b border-border">
+        {TRIP_TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => selectTab(t.id)}
+            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              tab === t.id
+                ? 'border-primary text-primary'
+                : 'border-transparent text-text-secondary hover:text-text'
+            }`}
+          >
+            {t.label}
+            <span className="ml-2 text-xs tabular-nums text-text-secondary">{tabCounts[t.id]}</span>
+          </button>
+        ))}
+      </div>
+
       <Card className="mb-4 p-3">
         <div className="flex flex-wrap gap-2">
           <SearchInput
             value={search}
             onChange={setSearch}
-            placeholder="Search load ID, driver, trailer, location..."
+            placeholder="Search trip, load, driver, tractor, trailer..."
             className="w-full sm:w-72"
           />
           <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="w-36">
@@ -263,17 +339,14 @@ export function LoadsPage() {
           <table className="w-full text-sm min-w-[1400px]">
             <thead>
               <tr className="border-b border-border bg-bg/80">
-                <SortHeader label="Load ID" sortKey="loadId" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Amazon Ref</th>
+                <SortHeader label="Trip / Load" sortKey="loadId" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
                 <SortHeader label="Driver" sortKey="driver" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <SortHeader label="Status" sortKey="loadStatus" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
+                <SortHeader label="Tractor" sortKey="tractor" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
+                <SortHeader label="Trailer" sortKey="trailer" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
                 <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Route</th>
-                <SortHeader label="Pickup" sortKey="pickupDate" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
+                <SortHeader label="Status" sortKey="loadStatus" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
+                <SortHeader label="Pay" sortKey="rateGross" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
                 <SortHeader label="Delivery" sortKey="deliveryDate" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Trailer</th>
-                <SortHeader label="Miles" sortKey="distanceMiles" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                <SortHeader label="Final Gross" sortKey="rateGross" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                <SortHeader label="Payment" sortKey="paymentStatus" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
                 <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Actions</th>
               </tr>
             </thead>
@@ -286,45 +359,47 @@ export function LoadsPage() {
                     className="border-b border-border/60 table-row-hover cursor-pointer"
                     onClick={() => setDetail(l)}
                   >
-                    <td className="px-3 py-2.5 font-medium text-primary">{l.loadId}</td>
-                    <td className="px-3 py-2.5 text-xs text-text-secondary">{l.amazonRefId}</td>
                     <td className="px-3 py-2.5">
-                      {d ? (
-                        <div>
-                          <Link
-                            to={`/drivers/${d.id}`}
-                            className="font-medium hover:underline"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {getDriverFullName(d.firstName, d.lastName)}
-                          </Link>
-                          <div className="mt-0.5"><Badge status={d.status} /></div>
-                        </div>
-                      ) : (
-                        <span className="text-text-secondary italic">Unassigned</span>
+                      <div className="font-medium text-primary">{l.loadId}</div>
+                      {l.parentTripId && l.parentTripId !== l.loadId && (
+                        <div className="text-[11px] text-text-secondary">Trip {l.parentTripId}</div>
+                      )}
+                      {l.jobType && (
+                        <div className="text-[10px] text-text-secondary">{l.jobType}</div>
                       )}
                     </td>
-                    <td className="px-3 py-2.5"><Badge status={l.loadStatus} /></td>
-                    <td className="px-3 py-2.5 text-xs">
-                      <div>{l.pickupLocation}</div>
-                      <div className="text-text-secondary">→ {l.deliveryLocation}</div>
+                    <td className="px-3 py-2.5">
+                      {d ? (
+                        <Link
+                          to={`/drivers/${d.id}`}
+                          className="font-medium hover:underline"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {getDriverFullName(d.firstName, d.lastName)}
+                        </Link>
+                      ) : (
+                        <span className={l.driverNameRaw ? '' : 'text-text-secondary italic'}>
+                          {l.driverNameRaw || 'Unassigned'}
+                        </span>
+                      )}
                     </td>
-                    <td className="px-3 py-2.5 text-xs whitespace-nowrap">{formatDate(l.pickupDate, 'MMM d')}</td>
-                    <td className="px-3 py-2.5 text-xs whitespace-nowrap">{formatDate(l.deliveryDate, 'MMM d')}</td>
+                    <td className="px-3 py-2.5 text-xs tabular-nums">{l.tractorId || '—'}</td>
                     <td className="px-3 py-2.5 text-xs">
                       <div>{l.trailerId || '—'}</div>
                       <div className="text-text-secondary">{l.trailerType}</div>
                     </td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{l.distanceMiles}</td>
+                    <td className="px-3 py-2.5 text-xs">
+                      <div>{l.pickupLocation}</div>
+                      <div className="text-text-secondary">→ {l.deliveryLocation}</div>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <Badge status={l.loadStatus} />
+                      <div className="mt-1 text-[11px] text-text-secondary">{statusBarLabel(l)}</div>
+                    </td>
                     <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
                       {formatCurrency(getLoadFinalGross(l))}
-                      {l.additionalCharges > 0 && (
-                        <div className="text-[10px] font-normal text-text-secondary">
-                          +{formatCurrency(l.additionalCharges)}
-                        </div>
-                      )}
                     </td>
-                    <td className="px-3 py-2.5"><Badge status={l.paymentStatus} /></td>
+                    <td className="px-3 py-2.5 text-xs whitespace-nowrap">{formatDate(l.deliveryDate, 'MMM d')}</td>
                     <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
                       <div className="flex items-center justify-end gap-1">
                         <Button variant="ghost" size="sm" onClick={() => setDetail(l)}>
@@ -344,7 +419,12 @@ export function LoadsPage() {
             </tbody>
           </table>
           {sorted.length === 0 && (
-            <EmptyState title="No loads found" description="Try adjusting filters or add a new load." actionLabel="Add Load" onAction={openCreate} />
+            <EmptyState
+              title="No trips in this tab"
+              description="Open Amazon Relay Trips with the extension live, or add a load manually. Empty means Supabase has no matching trip_bucket rows yet."
+              actionLabel="Add Load"
+              onAction={openCreate}
+            />
           )}
         </div>
       </Card>
@@ -392,6 +472,7 @@ export function LoadsPage() {
           <Field label="Pickup Location"><Input value={form.pickupLocation} onChange={(e) => setForm({ ...form, pickupLocation: e.target.value })} /></Field>
           <Field label="Delivery Location"><Input value={form.deliveryLocation} onChange={(e) => setForm({ ...form, deliveryLocation: e.target.value })} /></Field>
           <Field label="Trailer ID"><Input value={form.trailerId} onChange={(e) => setForm({ ...form, trailerId: e.target.value })} /></Field>
+          <Field label="Tractor ID"><Input value={form.tractorId} onChange={(e) => setForm({ ...form, tractorId: e.target.value })} /></Field>
           <Field label="Pickup Date"><Input type="date" value={form.pickupDate} onChange={(e) => setForm({ ...form, pickupDate: e.target.value })} /></Field>
           <Field label="Delivery Date"><Input type="date" value={form.deliveryDate} onChange={(e) => setForm({ ...form, deliveryDate: e.target.value })} /></Field>
           <Field label="Trailer Type">
@@ -451,6 +532,10 @@ export function LoadsPage() {
               <Info label="Pickup Date" value={formatDate(detail.pickupDate)} />
               <Info label="Delivery Date" value={formatDate(detail.deliveryDate)} />
               <Info label="Trailer" value={`${detail.trailerId || '—'} (${detail.trailerType})`} />
+              <Info label="Tractor" value={detail.tractorId || '—'} />
+              <Info label="Parent Trip" value={detail.parentTripId || '—'} />
+              <Info label="Trip tab" value={inferTripBucket(detail) || '—'} />
+              <Info label="Status bar" value={statusBarLabel(detail)} />
               <Info label="Distance" value={`${detail.distanceMiles} mi`} />
               <Info label="Rate Gross" value={formatCurrency(detail.rateGross)} />
               <Info label="Additional Charges" value={formatCurrency(detail.additionalCharges)} />

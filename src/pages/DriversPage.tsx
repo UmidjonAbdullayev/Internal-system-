@@ -1,6 +1,6 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState, useEffect, useRef } from 'react';
 import { Link, useSearchParams, useNavigate } from 'react-router-dom';
-import { Plus, Pencil, UserX, Eye, Download } from 'lucide-react';
+import { Plus, Pencil, UserX, Eye, Download, Upload } from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { Card } from '@/components/ui/Card';
@@ -18,6 +18,8 @@ import {
   getWeekRange,
   getDriverFullName,
 } from '@/lib/utils';
+import { csvToObjects, mapDriverCsvRow } from '@/lib/csvImport';
+import { toast } from 'sonner';
 import type { Driver, DriverStatus } from '@/types';
 
 const STATUSES: DriverStatus[] = ['Active', 'Inactive', 'On Load', 'Available', 'On Break', 'Suspended'];
@@ -45,6 +47,7 @@ export function DriversPage() {
   const { drivers, loads, settlements, addDriver, updateDriver, deactivateDriver } = useData();
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
+  const importRef = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [sortKey, setSortKey] = useState('name');
@@ -54,7 +57,7 @@ export function DriversPage() {
   const [form, setForm] = useState(emptyForm);
   const [deactivateId, setDeactivateId] = useState<string | null>(null);
 
-  const week = getWeekRange(new Date('2026-11-10'));
+  const week = getWeekRange(new Date());
 
   useEffect(() => {
     if (params.get('action') === 'new') {
@@ -154,10 +157,11 @@ export function DriversPage() {
   const exportCSV = () => {
     downloadCSV(
       'drivers.csv',
-      ['Name', 'ID', 'Phone', 'Email', 'Status', 'Truck', 'Trailer', 'Hire Date', 'Loads', 'Weekly Gross'],
+      ['driver_id', 'first_name', 'last_name', 'phone', 'email', 'status', 'tractor', 'trailer_id', 'hire_date', 'Loads', 'Weekly Gross'],
       sorted.map((r) => [
-        getDriverFullName(r.driver.firstName, r.driver.lastName),
         r.driver.driverId,
+        r.driver.firstName,
+        r.driver.lastName,
         r.driver.phone,
         r.driver.email,
         r.driver.status,
@@ -170,13 +174,59 @@ export function DriversPage() {
     );
   };
 
+  const importDrivers = async (file: File) => {
+    const text = await file.text();
+    const rows = csvToObjects(text);
+    let added = 0;
+    let skipped = 0;
+    rows.forEach((row, i) => {
+      const mapped = mapDriverCsvRow(row, drivers.length + i);
+      if (!mapped) {
+        skipped += 1;
+        return;
+      }
+      const exists = drivers.some(
+        (d) =>
+          d.driverId.toLowerCase() === mapped.driverId.toLowerCase() ||
+          (d.firstName.toLowerCase() === mapped.firstName.toLowerCase() &&
+            d.lastName.toLowerCase() === mapped.lastName.toLowerCase()),
+      );
+      if (exists) {
+        skipped += 1;
+        return;
+      }
+      addDriver({
+        ...mapped,
+        status: (STATUSES.includes(mapped.status as DriverStatus)
+          ? mapped.status
+          : 'Available') as DriverStatus,
+      });
+      added += 1;
+    });
+    toast.success(`Imported ${added} drivers${skipped ? ` · skipped ${skipped}` : ''}`);
+  };
+
   return (
     <div>
       <PageHeader
         title="Drivers"
-        subtitle={`${drivers.length} drivers in fleet database`}
+        subtitle={`${drivers.length} drivers in fleet database · import currently working drivers via CSV`}
         actions={
           <>
+            <input
+              ref={importRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void importDrivers(f);
+                e.target.value = '';
+              }}
+            />
+            <Button variant="outline" size="sm" onClick={() => importRef.current?.click()}>
+              <Upload className="h-4 w-4" /> Import
+            </Button>
             <Button variant="outline" size="sm" onClick={exportCSV}>
               <Download className="h-4 w-4" /> Export
             </Button>

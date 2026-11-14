@@ -11,9 +11,13 @@ import type {
 } from '@/types';
 import { roundMoney, isDateInRange, getWeekRange } from './utils';
 
-/** Loads that count toward driver earnings */
+/** Loads that count toward driver earnings (History tab + completed/delivered). */
 export function isEligibleLoad(load: Load): boolean {
-  return load.loadStatus === 'Completed' || load.loadStatus === 'Delivered';
+  return (
+    load.loadStatus === 'Completed' ||
+    load.loadStatus === 'Delivered' ||
+    load.tripBucket === 'history'
+  );
 }
 
 export function getLoadFinalGross(load: Load): number {

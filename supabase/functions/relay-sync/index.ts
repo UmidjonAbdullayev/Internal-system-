@@ -19,6 +19,12 @@ type LoadIn = {
   delivery_date: string;
   trailer_id?: string | null;
   trailer_type?: string | null;
+  tractor_id?: string | null;
+  parent_trip_id?: string | null;
+  trip_bucket?: string | null;
+  status_bar_state?: string | null;
+  status_stop_index?: number | null;
+  job_type?: string | null;
   distance_miles?: number | null;
   rate_gross?: number | null;
   additional_charges?: number | null;
@@ -129,7 +135,9 @@ Deno.serve(async (req: Request) => {
 
       const { data: existing, error: findErr } = await sb
         .from("loads")
-        .select("id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, driver_id")
+        .select(
+          "id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, tractor_id, driver_id, status_bar_state, status_stop_index, trip_bucket, parent_trip_id, driver_name_raw, pickup_location, delivery_location, rate_gross",
+        )
         .eq("load_id", load.load_id)
         .maybeSingle();
       if (findErr) {
@@ -139,15 +147,35 @@ Deno.serve(async (req: Request) => {
 
       let driverId: string | null = null;
       if (load.driver_name_raw) {
-        const parts = String(load.driver_name_raw).trim().split(/\s+/);
+        const raw = String(load.driver_name_raw).trim().replace(/\s+/g, " ");
+        const parts = raw.split(/\s+/);
         if (parts.length >= 2) {
-          const { data: driver } = await sb
+          const last = parts[parts.length - 1];
+          const firstToken = parts[0].replace(/\./g, "");
+          // "U. Aminov" / "Umed Aminov"
+          const { data: byLast } = await sb
             .from("drivers")
-            .select("id")
-            .ilike("first_name", parts[0])
-            .ilike("last_name", parts.slice(1).join(" "))
-            .maybeSingle();
-          driverId = driver?.id ?? null;
+            .select("id, first_name, last_name")
+            .ilike("last_name", last)
+            .limit(20);
+          const match = (byLast || []).find((d) => {
+            const fn = String(d.first_name || "");
+            if (/^[A-Za-z]\.?$/.test(parts[0])) {
+              return fn.toLowerCase().startsWith(firstToken.toLowerCase().charAt(0));
+            }
+            return fn.toLowerCase() === firstToken.toLowerCase() ||
+              fn.toLowerCase().startsWith(firstToken.toLowerCase());
+          });
+          driverId = match?.id ?? null;
+          if (!driverId) {
+            const { data: driver } = await sb
+              .from("drivers")
+              .select("id")
+              .ilike("first_name", parts[0].replace(/\./g, ""))
+              .ilike("last_name", parts.slice(1).join(" "))
+              .maybeSingle();
+            driverId = driver?.id ?? null;
+          }
         }
       }
 
@@ -188,6 +216,42 @@ Deno.serve(async (req: Request) => {
         });
       }
 
+      const nextBar = load.status_bar_state || null;
+      const prevBar = existing?.status_bar_state || null;
+      if (nextBar && nextBar !== prevBar) {
+        const stop = load.status_stop_index ?? existing?.status_stop_index ?? 1;
+        const trip = load.parent_trip_id || existing?.parent_trip_id || load.load_id;
+        const driverLabel = load.driver_name_raw || existing?.driver_name_raw || "driver";
+        if (nextBar === "arrived") {
+          notifications.push({
+            event_type: "facility_arrived",
+            dedupe_key: `arrived:${load.load_id}:stop:${stop}`,
+            message:
+              `Arrived facility (stop ${stop})\n` +
+              `Trip ${trip} · Load ${load.load_id}\n` +
+              `Driver: ${driverLabel}\n` +
+              `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}\n` +
+              `Pay: $${load.rate_gross ?? existing?.rate_gross ?? 0}`,
+            driver_id: driverId || existing?.driver_id,
+            trailer_id: load.trailer_id ?? existing?.trailer_id,
+            load_id: load.load_id,
+          });
+        } else if (nextBar === "loaded_enroute") {
+          notifications.push({
+            event_type: "loaded_enroute",
+            dedupe_key: `enroute:${load.load_id}:stop:${stop}`,
+            message:
+              `Loaded & on the way (stop ${stop})\n` +
+              `Trip ${trip} · Load ${load.load_id}\n` +
+              `Driver: ${driverLabel}\n` +
+              `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}`,
+            driver_id: driverId || existing?.driver_id,
+            trailer_id: load.trailer_id ?? existing?.trailer_id,
+            load_id: load.load_id,
+          });
+        }
+      }
+
       const row = {
         load_id: load.load_id,
         amazon_ref_id: load.amazon_ref_id ?? null,
@@ -201,6 +265,12 @@ Deno.serve(async (req: Request) => {
         delivery_date: load.delivery_date,
         trailer_id: load.trailer_id ?? null,
         trailer_type: load.trailer_type ?? null,
+        tractor_id: load.tractor_id ?? null,
+        parent_trip_id: load.parent_trip_id ?? null,
+        trip_bucket: load.trip_bucket ?? null,
+        status_bar_state: load.status_bar_state ?? null,
+        status_stop_index: load.status_stop_index ?? null,
+        job_type: load.job_type ?? null,
         distance_miles: load.distance_miles ?? 0,
         rate_gross: load.rate_gross ?? 0,
         additional_charges: load.additional_charges ?? 0,

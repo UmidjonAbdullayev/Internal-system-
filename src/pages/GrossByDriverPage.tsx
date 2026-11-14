@@ -45,13 +45,18 @@ export function GrossByDriverPage() {
   const [params] = useSearchParams();
   const [driverId, setDriverId] = useState(params.get('driver') ?? drivers[0]?.id ?? '');
   const [preset, setPreset] = useState<DatePreset>('this_week');
+  const todayWeek = getWeekRange(new Date());
   const [customRange, setCustomRange] = useState<DateRange>({
-    start: '2026-11-03',
-    end: '2026-11-10',
+    start: todayWeek.start,
+    end: todayWeek.end,
   });
+  const [dateFrom, setDateFrom] = useState(todayWeek.start);
+  const [dateTo, setDateTo] = useState(todayWeek.end);
   const [statusFilter, setStatusFilter] = useState('');
   const [sortKey, setSortKey] = useState('deliveryDate');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [fleetSortKey, setFleetSortKey] = useState('gross');
+  const [fleetSortDir, setFleetSortDir] = useState<SortDir>('desc');
   const [adjOpen, setAdjOpen] = useState(false);
   const [adjAmount, setAdjAmount] = useState('');
   const [adjReason, setAdjReason] = useState('');
@@ -61,10 +66,13 @@ export function GrossByDriverPage() {
     if (d) setDriverId(d);
   }, [params]);
 
-  const range = getDateRangeFromPreset(preset, customRange);
+  const range = useMemo(() => {
+    if (dateFrom && dateTo) return { start: dateFrom, end: dateTo };
+    return getDateRangeFromPreset(preset, customRange);
+  }, [dateFrom, dateTo, preset, customRange]);
   const driver = drivers.find((d) => d.id === driverId);
-  const week = getWeekRange(new Date('2026-11-10'));
-  const month = getMonthRange(new Date('2026-11-10'));
+  const week = getWeekRange(new Date());
+  const month = getMonthRange(new Date());
 
   const driverLoads = useMemo(() => {
     let list = getEligibleLoads(loads, driverId, range);
@@ -85,6 +93,33 @@ export function GrossByDriverPage() {
     deliveryDate: (l) => l.deliveryDate,
     miles: (l) => l.distanceMiles,
     gross: (l) => getLoadFinalGross(l),
+  });
+
+  const fleetRows = useMemo(() => {
+    return drivers
+      .filter((d) => d.status !== 'Inactive')
+      .map((d) => {
+        const eligible = getEligibleLoads(loads, d.id, range);
+        const gross = getDriverGross(loads, d.id, range, grossAdjustments);
+        const charges = oneTimeCharges
+          .filter((c) => c.driverId === d.id && c.date >= range.start && c.date <= range.end)
+          .reduce((s, c) => s + c.amount, 0);
+        return {
+          driver: d,
+          loads: eligible.length,
+          gross,
+          charges,
+          net: gross - charges,
+        };
+      });
+  }, [drivers, loads, range, grossAdjustments, oneTimeCharges]);
+
+  const fleetSorted = useSort(fleetRows, fleetSortKey, fleetSortDir, {
+    name: (r) => getDriverFullName(r.driver.firstName, r.driver.lastName),
+    loads: (r) => r.loads,
+    gross: (r) => r.gross,
+    charges: (r) => r.charges,
+    net: (r) => r.net,
   });
 
   const weeklyGross = getDriverGross(loads, driverId, week, grossAdjustments);
@@ -160,7 +195,7 @@ export function GrossByDriverPage() {
     <div>
       <PageHeader
         title="Gross by Driver"
-        subtitle="Driver-level financial analysis connected to Loads CRM"
+        subtitle="Weekly salary from History-synced loads · date-from / date-to filter & sort"
         badge={
           <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-semibold text-primary">
             Priority
@@ -191,6 +226,26 @@ export function GrossByDriverPage() {
                 ))}
             </Select>
           </Field>
+          <Field label="Date from" className="w-40">
+            <Input
+              type="date"
+              value={dateFrom}
+              onChange={(e) => {
+                setDateFrom(e.target.value);
+                setPreset('custom');
+              }}
+            />
+          </Field>
+          <Field label="Date to" className="w-40">
+            <Input
+              type="date"
+              value={dateTo}
+              onChange={(e) => {
+                setDateTo(e.target.value);
+                setPreset('custom');
+              }}
+            />
+          </Field>
           <div className="flex items-center gap-3 pb-1">
             <Badge status={driver.status} />
             <span className="text-sm text-text-secondary">{driver.driverId}</span>
@@ -201,11 +256,126 @@ export function GrossByDriverPage() {
         </div>
         <DateRangeFilter
           preset={preset}
-          onPresetChange={setPreset}
+          onPresetChange={(p) => {
+            setPreset(p);
+            const next = getDateRangeFromPreset(p, customRange);
+            setDateFrom(next.start);
+            setDateTo(next.end);
+          }}
           customRange={customRange}
-          onCustomRangeChange={setCustomRange}
+          onCustomRangeChange={(r) => {
+            setCustomRange(r);
+            setDateFrom(r.start);
+            setDateTo(r.end);
+          }}
           className="mt-4"
         />
+      </Card>
+
+      <Card className="mb-5 overflow-hidden">
+        <CardHeader>
+          <CardTitle>Gross by driver ({range.start} → {range.end})</CardTitle>
+        </CardHeader>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm min-w-[700px]">
+            <thead>
+              <tr className="border-b border-border bg-bg/80">
+                <SortHeader
+                  label="Driver"
+                  sortKey="name"
+                  currentKey={fleetSortKey}
+                  direction={fleetSortDir}
+                  onSort={(k) => {
+                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+                    else {
+                      setFleetSortKey(k);
+                      setFleetSortDir(k === 'name' ? 'asc' : 'desc');
+                    }
+                  }}
+                />
+                <SortHeader
+                  label="Loads"
+                  sortKey="loads"
+                  currentKey={fleetSortKey}
+                  direction={fleetSortDir}
+                  onSort={(k) => {
+                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+                    else {
+                      setFleetSortKey(k);
+                      setFleetSortDir('desc');
+                    }
+                  }}
+                  align="right"
+                />
+                <SortHeader
+                  label="Gross"
+                  sortKey="gross"
+                  currentKey={fleetSortKey}
+                  direction={fleetSortDir}
+                  onSort={(k) => {
+                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+                    else {
+                      setFleetSortKey(k);
+                      setFleetSortDir('desc');
+                    }
+                  }}
+                  align="right"
+                />
+                <SortHeader
+                  label="Charges"
+                  sortKey="charges"
+                  currentKey={fleetSortKey}
+                  direction={fleetSortDir}
+                  onSort={(k) => {
+                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+                    else {
+                      setFleetSortKey(k);
+                      setFleetSortDir('desc');
+                    }
+                  }}
+                  align="right"
+                />
+                <SortHeader
+                  label="Net"
+                  sortKey="net"
+                  currentKey={fleetSortKey}
+                  direction={fleetSortDir}
+                  onSort={(k) => {
+                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+                    else {
+                      setFleetSortKey(k);
+                      setFleetSortDir('desc');
+                    }
+                  }}
+                  align="right"
+                />
+              </tr>
+            </thead>
+            <tbody>
+              {fleetSorted.map((r) => (
+                <tr
+                  key={r.driver.id}
+                  className={`border-b border-border/60 table-row-hover cursor-pointer ${
+                    r.driver.id === driverId ? 'bg-primary/5' : ''
+                  }`}
+                  onClick={() => setDriverId(r.driver.id)}
+                >
+                  <td className="px-3 py-2.5 font-medium">
+                    {getDriverFullName(r.driver.firstName, r.driver.lastName)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">{r.loads}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
+                    {formatCurrency(r.gross)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-danger">
+                    {formatCurrency(r.charges)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">{formatCurrency(r.net)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </Card>
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6 mb-5">
