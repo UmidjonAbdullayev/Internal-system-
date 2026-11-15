@@ -23,6 +23,13 @@ import {
   SYNC_FLUSH_MINUTES,
   PAYMENTS_MIN_INTERVAL_MS,
   TYPICAL_FULL_SYNC_SECONDS,
+  SOFT_SCAN_HARD_TIMEOUT_MS,
+  COLLECT_TAB_TIMEOUT_MS,
+  FLUSH_TIMEOUT_MS,
+  PAYMENTS_COLLECT_TIMEOUT_MS,
+  NEAR_LIVE_MIN_INTERVAL_MS,
+  NEAR_LIVE_FLUSH_DEBOUNCE_MS,
+  HISTORY_SKIP_TTL_MS,
 } from '../shared/config.js';
 import { getState, setState, updateSection, ensureClientId } from '../shared/state.js';
 import {
@@ -35,10 +42,31 @@ import {
 
 const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
 
+/** In-memory locks — never rely on persisted flags alone (SW kill left 1.3.0 stuck "busy"). */
+let tripsScanRunning = false;
+let paymentsScanRunning = false;
+let nearLiveFlushTimer = null;
+let lastNearLiveIngestAt = 0;
+/** Set after a full Upcoming+In Transit soft pass — flushed once then cleared. */
+let pendingReconcileActiveIds = null;
+/** Active load ids observed in the current Trips soft pass (not stale pending). */
+let currentScanActiveIds = null;
+
 function jitterMinutes(base, jitter) {
   const span = Math.max(0, Number(jitter) || 0);
   const b = Math.max(0.5, Number(base) || 1);
   return Math.round((b + Math.random() * span) * 100) / 100;
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)),
+      Math.max(1000, ms),
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 async function scheduleTripsAlarm() {
@@ -59,21 +87,94 @@ async function ensureAlarms() {
   await schedulePaymentsAlarm();
 }
 
+/** Clear sticky busy left by a killed SW or hung pass. */
+async function recoverStaleScans() {
+  const state = await getState();
+  const now = Date.now();
+  const patch = {};
+  const tripsStarted = state.tripsScanStartedAt ? Date.parse(state.tripsScanStartedAt) : 0;
+  const payStarted = state.paymentsScanStartedAt ? Date.parse(state.paymentsScanStartedAt) : 0;
+
+  // Memory is source of truth while SW is alive; storage alone can stick after kill.
+  if (!tripsScanRunning && state.tripsScanInProgress) {
+    if (!tripsStarted || now - tripsStarted > SOFT_SCAN_HARD_TIMEOUT_MS) {
+      patch.tripsScanInProgress = false;
+      patch.tripsScanStartedAt = null;
+    }
+  }
+  if (!paymentsScanRunning && state.paymentsScanInProgress) {
+    if (!payStarted || now - payStarted > SOFT_SCAN_HARD_TIMEOUT_MS) {
+      patch.paymentsScanInProgress = false;
+      patch.paymentsScanStartedAt = null;
+    }
+  }
+
+  const nextTrips =
+    tripsScanRunning ||
+    (patch.tripsScanInProgress === false ? false : Boolean(state.tripsScanInProgress));
+  const nextPay =
+    paymentsScanRunning ||
+    (patch.paymentsScanInProgress === false ? false : Boolean(state.paymentsScanInProgress));
+  const aggregate = Boolean(nextTrips || nextPay);
+  if (state.scanInProgress !== aggregate) patch.scanInProgress = aggregate;
+
+  const locks = { ...(state.collectionLocks || {}) };
+  let locksChanged = false;
+  for (const [key, at] of Object.entries(locks)) {
+    if (!at || now - Number(at) > SOFT_SCAN_HARD_TIMEOUT_MS) {
+      delete locks[key];
+      locksChanged = true;
+    }
+  }
+  if (locksChanged) patch.collectionLocks = locks;
+
+  if (
+    !aggregate &&
+    state.syncProgress?.phase &&
+    /^(busy|scanning|trips|payments|flushing)/i.test(state.syncProgress.phase)
+  ) {
+    const started = state.syncProgress.startedAt ? Date.parse(state.syncProgress.startedAt) : 0;
+    if (!started || now - started > SOFT_SCAN_HARD_TIMEOUT_MS) {
+      patch.syncProgress = {
+        ...state.syncProgress,
+        phase: 'idle',
+        detail: 'Recovered from stuck soft sync (timeout / SW restart).',
+        percent: 0,
+      };
+    }
+  }
+
+  if (Object.keys(patch).length) await setState(patch);
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   await ensureClientId();
+  tripsScanRunning = false;
+  paymentsScanRunning = false;
+  await setState({
+    scanInProgress: false,
+    tripsScanInProgress: false,
+    paymentsScanInProgress: false,
+    tripsScanStartedAt: null,
+    paymentsScanStartedAt: null,
+    collectionLocks: {},
+  });
   await ensureAlarms();
 });
 
 chrome.runtime.onStartup?.addListener?.(async () => {
+  tripsScanRunning = false;
+  paymentsScanRunning = false;
+  await recoverStaleScans();
   await ensureAlarms();
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   const state = await getState();
   if (!state.live || !state.loggedIn) return;
+  await recoverStaleScans();
 
   if (alarm.name === TAB_SCAN_ALARM) {
-    // Fire-and-forget soft scan — never blocks the SW event loop on page work alone
     void runSoftScan({ includeTrips: true, includePayments: false, reason: 'trips-alarm' });
     await scheduleTripsAlarm();
   }
@@ -130,12 +231,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Set Extension API key (RELAY_EXTENSION_API_KEY) first' });
         return;
       }
+      tripsScanRunning = false;
+      paymentsScanRunning = false;
       await setState({
         live: true,
         syncErrors: [],
         prompts: [],
         collectionLocks: {},
         scanInProgress: false,
+        tripsScanInProgress: false,
+        paymentsScanInProgress: false,
+        tripsScanStartedAt: null,
+        paymentsScanStartedAt: null,
         sections: {
           tours: { state: 'Not checked', lastError: null, lastCollectedAt: null },
           load_detail: { state: 'Not checked', lastError: null, lastCollectedAt: null },
@@ -143,7 +250,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         },
         syncProgress: {
           phase: 'starting',
-          detail: `Soft sync starting (typical full pass ${TYPICAL_FULL_SYNC_SECONDS}s). You can keep using Relay.`,
+          detail: `Soft sync starting (typical full pass ${TYPICAL_FULL_SYNC_SECONDS}s). Near-live Trips watch active. Keep using Relay.`,
           percent: 0,
           startedAt: new Date().toISOString(),
           typicalSeconds: TYPICAL_FULL_SYNC_SECONDS,
@@ -151,17 +258,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         },
       });
       await ensureAlarms();
-      // Non-blocking: acknowledge immediately; scan continues in background
       sendResponse({ ok: true, state: await getState() });
-      void runSoftScan({ includeTrips: true, includePayments: true, reason: 'go-live', force: true });
+      // Trips first (non-blocking); Payments on its own lock so a hang cannot freeze Trips
+      void runSoftScan({ includeTrips: true, includePayments: false, reason: 'go-live-trips', force: true });
+      void runSoftScan({ includeTrips: false, includePayments: true, reason: 'go-live-payments', force: true });
       return;
     }
     if (msg?.type === 'STOP') {
+      tripsScanRunning = false;
+      paymentsScanRunning = false;
       sendResponse({
         ok: true,
         state: await setState({
           live: false,
           scanInProgress: false,
+          tripsScanInProgress: false,
+          paymentsScanInProgress: false,
+          tripsScanStartedAt: null,
+          paymentsScanStartedAt: null,
           syncProgress: {
             phase: 'idle',
             detail: 'Stopped',
@@ -173,8 +287,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return;
     }
     if (msg?.type === 'FORCE_SCAN') {
+      await recoverStaleScans();
       sendResponse({ ok: true, state: await getState() });
-      void runSoftScan({ includeTrips: true, includePayments: true, reason: 'force', force: true });
+      void runSoftScan({ includeTrips: true, includePayments: false, reason: 'force-trips', force: true });
+      void runSoftScan({ includeTrips: false, includePayments: true, reason: 'force-payments', force: true });
       return;
     }
     if (msg?.type === 'GET_DETAIL_SCRAPED') {
@@ -221,6 +337,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true });
       return;
     }
+    if (msg?.type === 'NEAR_LIVE_TRIPS') {
+      sendResponse({ ok: true });
+      void ingestNearLiveTrips(msg);
+      return;
+    }
     sendResponse({ ok: false, error: 'Unknown message' });
   })();
   return true;
@@ -235,6 +356,11 @@ async function setProgress(patch) {
       typicalSeconds: TYPICAL_FULL_SYNC_SECONDS,
     },
   });
+}
+
+async function refreshAggregateBusy() {
+  const busy = tripsScanRunning || paymentsScanRunning;
+  await setState({ scanInProgress: busy });
 }
 
 async function listRelayTabs() {
@@ -253,22 +379,53 @@ function matchSectionForUrl(url) {
 }
 
 /**
- * Soft scan: user can keep using Relay. Progress lives in the popup only.
- * Trips and Payments run on separate cadences; force includes both.
+ * Soft scan with separate Trips / Payments locks.
+ * A hung Payments pass must not block Trips alarms or near-live.
  */
 async function runSoftScan({ includeTrips, includePayments, reason, force = false } = {}) {
   const state = await getState();
   if (!state.live) return;
-  if (state.scanInProgress && !force) {
+
+  if (includeTrips && tripsScanRunning && !force) {
     await setProgress({
       phase: 'busy',
-      detail: 'Scan already running — next pass will wait (non-blocking).',
+      detail: 'Trips soft scan already running — Payments can still proceed.',
     });
-    return;
+    // fall through only for payments if requested
+    if (!includePayments) return;
+    includeTrips = false;
   }
+  if (includePayments && paymentsScanRunning && !force) {
+    await setProgress({
+      phase: 'busy',
+      detail: 'Payments soft scan already running — Trips near-live / alarms still free.',
+    });
+    if (!includeTrips) return;
+    includePayments = false;
+  }
+  if (!includeTrips && !includePayments) return;
 
   const started = Date.now();
-  await setState({ scanInProgress: true });
+  const hardDeadline = started + SOFT_SCAN_HARD_TIMEOUT_MS;
+
+  if (includeTrips) {
+    tripsScanRunning = true;
+    currentScanActiveIds = [];
+    await setState({
+      tripsScanInProgress: true,
+      tripsScanStartedAt: new Date().toISOString(),
+      scanInProgress: true,
+    });
+  }
+  if (includePayments) {
+    paymentsScanRunning = true;
+    await setState({
+      paymentsScanInProgress: true,
+      paymentsScanStartedAt: new Date().toISOString(),
+      scanInProgress: true,
+    });
+  }
+
   await setProgress({
     phase: 'scanning',
     detail: `Soft scan (${reason || 'manual'}) — typical ${TYPICAL_FULL_SYNC_SECONDS}s. Keep using Relay.`,
@@ -278,104 +435,148 @@ async function runSoftScan({ includeTrips, includePayments, reason, force = fals
   });
 
   try {
-    const tabs = await listRelayTabs();
-    await setState({
-      openTabs: tabs.map((t) => ({ id: t.id, url: t.url, title: t.title })),
-    });
-
-    const seenSections = new Set();
-    const tripTabs = [];
-    const paymentTabs = [];
-    for (const tab of tabs) {
-      const hinted = matchSectionForUrl(tab.url);
-      if (hinted === 'payments') paymentTabs.push(tab);
-      else if (hinted === 'tours' || hinted === 'load_detail' || isTripsBoardUrl(tab.url)) {
-        tripTabs.push(tab);
-      } else if (hinted) {
-        tripTabs.push(tab);
-      }
-    }
-
-    let step = 0;
-    const totalSteps =
-      (includeTrips ? Math.max(1, tripTabs.length) : 0) +
-      (includePayments ? Math.max(1, paymentTabs.length) : 0) +
-      1;
-
-    if (includeTrips) {
-      if (!tripTabs.length) {
-        await updateSection('tours', { state: 'Waiting for page' });
-      }
-      for (const tab of tripTabs) {
-        step += 1;
-        await setProgress({
-          phase: 'trips',
-          detail: `Trips / History (incl. prior week) — tab ${step}/${totalSteps}`,
-          percent: Math.min(85, Math.round((step / totalSteps) * 80)),
+    await withTimeout(
+      (async () => {
+        const tabs = await listRelayTabs();
+        await setState({
+          openTabs: tabs.map((t) => ({ id: t.id, url: t.url, title: t.title })),
         });
-        await collectOneTab(tab, {
-          sectionHint: 'tours',
-          allTripTabs: true,
-          historyWeeks: true,
-          skipIfHidden: !force,
-        });
-        seenSections.add('tours');
-      }
-      await setState({ lastTripsScanAt: new Date().toISOString() });
-    }
 
-    if (includePayments) {
-      const latest = await getState();
-      const lastPay = latest.lastPaymentsScanAt ? Date.parse(latest.lastPaymentsScanAt) : 0;
-      const payFresh = !force && lastPay && Date.now() - lastPay < PAYMENTS_MIN_INTERVAL_MS;
-      if (payFresh) {
-        await setProgress({
-          phase: 'payments-skip',
-          detail: 'Payments skipped (recent scrape; longer cadence than Trips).',
-          percent: 90,
-        });
-        seenSections.add('payments');
-      } else if (!paymentTabs.length) {
-        await updateSection('payments', { state: 'Waiting for page' });
-      } else {
-        for (const tab of paymentTabs) {
-          step += 1;
-          await setProgress({
-            phase: 'payments',
-            detail: `Payments (light cadence) — tab ${step}/${totalSteps}`,
-            percent: Math.min(92, Math.round((step / totalSteps) * 90)),
-          });
-          await collectOneTab(tab, {
-            sectionHint: 'payments',
-            allTripTabs: false,
-            historyWeeks: false,
-            skipIfHidden: !force,
-          });
-          seenSections.add('payments');
+        const seenSections = new Set();
+        const tripTabs = [];
+        const paymentTabs = [];
+        for (const tab of tabs) {
+          const hinted = matchSectionForUrl(tab.url);
+          if (hinted === 'payments') paymentTabs.push(tab);
+          else if (hinted === 'tours' || hinted === 'load_detail' || isTripsBoardUrl(tab.url)) {
+            tripTabs.push(tab);
+          } else if (hinted) {
+            tripTabs.push(tab);
+          }
         }
-        await setState({ lastPaymentsScanAt: new Date().toISOString() });
-      }
-    }
 
-    await promptMissingSections(seenSections);
-    await setProgress({ phase: 'flushing', detail: 'Flushing to CRM…', percent: 95 });
-    await flushToEdge();
+        let step = 0;
+        const totalSteps =
+          (includeTrips ? Math.max(1, tripTabs.length) : 0) +
+          (includePayments ? Math.max(1, paymentTabs.length) : 0) +
+          1;
 
-    const durationMs = Date.now() - started;
-    await setProgress({
-      phase: 'idle',
-      detail: `Last sync finished in ${Math.round(durationMs / 1000)}s (typical ${TYPICAL_FULL_SYNC_SECONDS}s).`,
-      percent: 100,
-      lastDurationMs: durationMs,
-    });
+        if (includeTrips) {
+          if (!tripTabs.length) {
+            await updateSection('tours', { state: 'Waiting for page' });
+          }
+          for (const tab of tripTabs) {
+            if (Date.now() > hardDeadline) throw new Error('Trips soft scan hard timeout');
+            step += 1;
+            await setProgress({
+              phase: 'trips',
+              detail: `Trips / History (incl. prior week) — tab ${step}/${totalSteps}`,
+              percent: Math.min(85, Math.round((step / totalSteps) * 80)),
+            });
+            await collectOneTab(tab, {
+              sectionHint: 'tours',
+              allTripTabs: true,
+              historyWeeks: true,
+              skipIfHidden: !force,
+              timeoutMs: COLLECT_TAB_TIMEOUT_MS,
+            });
+            seenSections.add('tours');
+          }
+          // Full soft Trips pass → reconcile CRM active set to Relay Upcoming+In Transit
+          const activeIds = [...new Set(currentScanActiveIds || [])];
+          pendingReconcileActiveIds = activeIds;
+          currentScanActiveIds = null;
+          await setState({
+            lastTripsScanAt: new Date().toISOString(),
+            lastActiveLoadIds: activeIds,
+          });
+        }
+
+        if (includePayments) {
+          const latest = await getState();
+          const lastPay = latest.lastPaymentsScanAt ? Date.parse(latest.lastPaymentsScanAt) : 0;
+          const payFresh = !force && lastPay && Date.now() - lastPay < PAYMENTS_MIN_INTERVAL_MS;
+          if (payFresh) {
+            await setProgress({
+              phase: 'payments-skip',
+              detail: 'Payments skipped (recent scrape; longer cadence than Trips).',
+              percent: 90,
+            });
+            seenSections.add('payments');
+          } else if (!paymentTabs.length) {
+            await updateSection('payments', { state: 'Waiting for page' });
+          } else {
+            for (const tab of paymentTabs) {
+              if (Date.now() > hardDeadline) throw new Error('Payments soft scan hard timeout');
+              step += 1;
+              await setProgress({
+                phase: 'payments',
+                detail: `Payments (light cadence) — tab ${step}/${totalSteps}`,
+                percent: Math.min(92, Math.round((step / totalSteps) * 90)),
+              });
+              try {
+                await collectOneTab(tab, {
+                  sectionHint: 'payments',
+                  allTripTabs: false,
+                  historyWeeks: false,
+                  skipIfHidden: !force,
+                  timeoutMs: PAYMENTS_COLLECT_TIMEOUT_MS,
+                });
+                seenSections.add('payments');
+              } catch (payErr) {
+                await updateSection('payments', {
+                  state: 'Error',
+                  lastError: String(payErr?.message || payErr),
+                });
+                await setProgress({
+                  phase: 'payments-error',
+                  detail: `Payments collect failed: ${payErr?.message || payErr}`,
+                  percent: 92,
+                });
+              }
+            }
+            await setState({ lastPaymentsScanAt: new Date().toISOString() });
+          }
+        }
+
+        await promptMissingSections(seenSections);
+        await setProgress({ phase: 'flushing', detail: 'Flushing to CRM…', percent: 95 });
+        await flushToEdge();
+
+        const durationMs = Date.now() - started;
+        await setProgress({
+          phase: 'idle',
+          detail: `Last sync finished in ${Math.round(durationMs / 1000)}s (typical ${TYPICAL_FULL_SYNC_SECONDS}s).`,
+          percent: 100,
+          lastDurationMs: durationMs,
+        });
+      })(),
+      SOFT_SCAN_HARD_TIMEOUT_MS,
+      `Soft scan (${reason || 'manual'})`,
+    );
   } catch (err) {
+    const msg = String(err?.message || err);
     await setProgress({
       phase: 'error',
-      detail: String(err),
+      detail: msg,
       percent: 0,
     });
+    if (includePayments && /payment|timed out/i.test(msg)) {
+      const st = (await getState()).sections?.payments?.state;
+      if (st === 'Collecting' || st === 'Waiting for page' || st === 'Not checked') {
+        await updateSection('payments', { state: 'Error', lastError: msg });
+      }
+    }
   } finally {
-    await setState({ scanInProgress: false });
+    if (includeTrips) {
+      tripsScanRunning = false;
+      await setState({ tripsScanInProgress: false, tripsScanStartedAt: null });
+    }
+    if (includePayments) {
+      paymentsScanRunning = false;
+      await setState({ paymentsScanInProgress: false, paymentsScanStartedAt: null });
+    }
+    await refreshAggregateBusy();
   }
 }
 
@@ -384,13 +585,18 @@ async function collectOneTab(tab, opts = {}) {
   const lockKey = `tab:${tab.id}`;
   if (state.collectionLocks[lockKey]) return;
   const hinted = opts.sectionHint || matchSectionForUrl(tab.url);
+  const timeoutMs = opts.timeoutMs ?? COLLECT_TAB_TIMEOUT_MS;
 
   await setState({
     collectionLocks: { ...(await getState()).collectionLocks, [lockKey]: Date.now() },
   });
   try {
     if (hinted) await updateSection(hinted, { state: 'Waiting for page' });
-    const result = await collectFromTab(tab.id, opts);
+    const result = await withTimeout(
+      collectFromTab(tab.id, opts),
+      timeoutMs,
+      hinted === 'payments' ? 'Payments collect' : 'Trips collect',
+    );
     if (!result?.ok) {
       if (result?.skippedHidden) {
         await setProgress({
@@ -420,13 +626,32 @@ async function collectOneTab(tab, opts = {}) {
         syncProgress: {
           ...st.syncProgress,
           historyWeeks: data.history_weeks_scanned,
-          detail: `History weeks: ${data.history_weeks_scanned.join(', ')}`,
+          detail: `History weeks: ${data.history_weeks_scanned.join(', ')}${
+            data.history_filters_found?.length
+              ? ` (filters: ${data.history_filters_found.join(', ')})`
+              : ''
+          }`,
         },
       });
     }
     await updateSection(data.section, { state: 'Collecting', lastError: null });
     if (data.section === 'tours') {
       await updateSection('tours', { state: 'Collecting', lastError: null });
+    }
+    if (data.section === 'tours' && Array.isArray(currentScanActiveIds)) {
+      for (const load of data.loads || []) {
+        if (
+          load?.load_id &&
+          (load.trip_bucket === 'upcoming' || load.trip_bucket === 'in_transit')
+        ) {
+          currentScanActiveIds.push(load.load_id);
+        }
+      }
+    }
+    if (data.history_skipped) {
+      await setProgress({
+        detail: `History: skipped ${data.history_skipped} already-synced trip(s); weeks: ${(data.history_weeks_scanned || []).join(', ') || '—'}`,
+      });
     }
     await ingestCollection(data);
   } finally {
@@ -437,7 +662,28 @@ async function collectOneTab(tab, opts = {}) {
   }
 }
 
+function buildHistorySkipMap(state) {
+  const now = Date.now();
+  const map = {};
+  for (const [id, meta] of Object.entries(state.syncedLoadCache || {})) {
+    if (!meta?.at || now - meta.at > HISTORY_SKIP_TTL_MS) continue;
+    if (meta.trip_bucket !== 'history' && !/^(Completed|Delivered|Cancelled|Rejected)$/i.test(meta.load_status || '')) {
+      continue;
+    }
+    map[id] = {
+      load_status: meta.load_status || 'Completed',
+      payment_status: meta.payment_status || null,
+      trip_bucket: 'history',
+      content_hash: meta.content_hash || null,
+      skipExpand: true,
+      skipUpsert: true,
+    };
+  }
+  return map;
+}
+
 async function collectFromTab(tabId, opts = {}) {
+  const state = await getState();
   const payload = {
     type: 'RELAY_COLLECT',
     allTripTabs: opts.allTripTabs !== false,
@@ -451,6 +697,7 @@ async function collectFromTab(tabId, opts = {}) {
     tabSwitchJitterMs: TAB_SWITCH_JITTER_MS,
     historyWeekSettleMs: HISTORY_WEEK_SETTLE_MS,
     softYield: true,
+    historySkipMap: opts.historyWeeks !== false ? buildHistorySkipMap(state) : {},
   };
   try {
     return await chrome.tabs.sendMessage(tabId, payload);
@@ -465,6 +712,51 @@ async function collectFromTab(tabId, opts = {}) {
       return { ok: false, error: String(err) };
     }
   }
+}
+
+/**
+ * Near-live: content script debounced delta for Upcoming / In Transit.
+ * Does not take the soft-scan mutex; coalesces flushes.
+ */
+async function ingestNearLiveTrips(msg) {
+  const state = await getState();
+  if (!state.live || !state.loggedIn) return;
+  if (documentHiddenGuard(msg)) return;
+
+  const now = Date.now();
+  if (now - lastNearLiveIngestAt < NEAR_LIVE_MIN_INTERVAL_MS) return;
+  lastNearLiveIngestAt = now;
+
+  const loads = Array.isArray(msg.loads) ? msg.loads : [];
+  if (!loads.length) return;
+
+  await ingestCollection({
+    section: 'tours',
+    loads: loads.map((l) => ({
+      ...l,
+      trip_bucket: l.trip_bucket || msg.trip_bucket || 'in_transit',
+      near_live: true,
+    })),
+    detail_detected: loads.some((l) => l.trailer_id || l.tractor_id),
+  });
+
+  await setState({ lastNearLiveAt: new Date().toISOString() });
+  await setProgress({
+    phase: 'near-live',
+    detail: `Near-live Trips update (${loads.length} row${loads.length === 1 ? '' : 's'}) — ${msg.trip_bucket || 'board'}.`,
+    percent: Math.max(Number((await getState()).syncProgress?.percent) || 0, 40),
+  });
+
+  if (nearLiveFlushTimer) clearTimeout(nearLiveFlushTimer);
+  nearLiveFlushTimer = setTimeout(() => {
+    nearLiveFlushTimer = null;
+    void flushToEdge();
+  }, NEAR_LIVE_FLUSH_DEBOUNCE_MS);
+}
+
+function documentHiddenGuard(msg) {
+  // Content script already skips hidden; trust msg.hidden if present
+  return Boolean(msg?.hidden);
 }
 
 async function ingestCollection(data) {
@@ -499,7 +791,7 @@ async function ingestCollection(data) {
         }
       }
     }
-    const hasAny = Object.keys(pendingPayments).length > 0;
+    const hasAny = Object.keys(pendingPayments).length > 0 || (data.payments || []).length > 0;
     await updateSection('payments', {
       state: hasAny ? 'Collecting' : 'Error',
       lastError: hasAny ? null : 'No payment rows detected on page',
@@ -512,7 +804,7 @@ async function ingestCollection(data) {
       pendingLoads[load.load_id] = {
         ...prev,
         ...Object.fromEntries(
-          Object.entries(load).filter(([, v]) => v != null && v !== '')
+          Object.entries(load).filter(([, v]) => v != null && v !== ''),
         ),
         observed_at: new Date().toISOString(),
       };
@@ -577,19 +869,45 @@ async function flushToEdge() {
   const state = await getState();
   if (!state.live || !state.extensionApiKey) return;
 
+  const cache = { ...(state.syncedLoadCache || {}) };
   const loads = [];
   for (const raw of Object.values(state.pendingLoads)) {
     if (!isCompleteLoad(raw)) continue;
     const load = finalizeLoadForSync(raw);
     if (!load || !isCompleteLoad(load)) continue;
     const content_hash = await hashLoadPayload(load);
+
+    // Skip unchanged History rows already synced (status/pay/hash match)
+    if (load.trip_bucket === 'history' || /^(Completed|Delivered|Cancelled|Rejected)$/i.test(load.load_status || '')) {
+      const prev = cache[load.load_id];
+      if (
+        prev &&
+        prev.trip_bucket === 'history' &&
+        prev.load_status === load.load_status &&
+        (prev.payment_status || 'Not Received') === (load.payment_status || 'Not Received') &&
+        prev.content_hash === content_hash &&
+        !raw.force_history_upsert
+      ) {
+        continue;
+      }
+    }
+
     loads.push({ ...load, content_hash, payment_status: load.payment_status || 'Not Received' });
   }
   const payments = Object.values(state.pendingPayments).filter(
-    (p) => isCompletePayment(p) || (p.load_id && p.payment_status)
+    (p) => isCompletePayment(p) || (p.load_id && p.payment_status),
   );
 
-  if (!loads.length && !payments.length) return;
+  const reconcileIds = pendingReconcileActiveIds;
+  if (!loads.length && !payments.length && !reconcileIds) {
+    // Finish "Collecting" → Synced when page was scraped but nothing new to upsert
+    for (const id of ['tours', 'load_detail', 'payments']) {
+      if (state.sections[id]?.state === 'Collecting' && state.sections[id]?.lastCollectedAt) {
+        await updateSection(id, { state: 'Synced', lastError: null });
+      }
+    }
+    return;
+  }
 
   const clientId = await ensureClientId();
   const body = {
@@ -598,19 +916,24 @@ async function flushToEdge() {
     payments,
     section_states: state.sections,
     observed_at: new Date().toISOString(),
+    ...(reconcileIds ? { reconcile_active_ids: reconcileIds } : {}),
   };
 
   try {
-    const res = await fetch(RELAY_SYNC_FN, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        apikey: SUPABASE_ANON_KEY,
-        'X-Relay-Extension-Key': state.extensionApiKey,
-      },
-      body: JSON.stringify(body),
-    });
+    const res = await withTimeout(
+      fetch(RELAY_SYNC_FN, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          apikey: SUPABASE_ANON_KEY,
+          'X-Relay-Extension-Key': state.extensionApiKey,
+        },
+        body: JSON.stringify(body),
+      }),
+      FLUSH_TIMEOUT_MS,
+      'CRM flush',
+    );
     const json = await res.json().catch(() => ({}));
     if (!res.ok || !json.success) {
       const err = json.error || `HTTP ${res.status}`;
@@ -631,14 +954,20 @@ async function flushToEdge() {
     }
 
     const syncedSections = new Set();
-    if (json.loads_inserted || json.loads_updated) {
+    if (json.loads_inserted || json.loads_updated || loads.length) {
       syncedSections.add('tours');
       if (loads.some((l) => l.section === 'load_detail' || l.trailer_id || l.additional_charges != null)) {
         syncedSections.add('load_detail');
       }
     }
-    if (json.payments_upserted || payments.length) {
-      if (json.payments_upserted > 0 || json.loads_payment_updated > 0) syncedSections.add('payments');
+    // Mark payments Synced when the server accepted the pass — not only on non-zero upserts
+    if (payments.length && (json.success || json.payments_upserted > 0 || json.loads_payment_updated > 0)) {
+      syncedSections.add('payments');
+    } else if (
+      state.sections.payments?.state === 'Collecting' &&
+      state.sections.payments?.lastCollectedAt
+    ) {
+      syncedSections.add('payments');
     }
 
     for (const id of syncedSections) {
@@ -649,12 +978,44 @@ async function flushToEdge() {
     for (const id of json.synced_load_ids || []) delete remainingLoads[id];
     const remainingPayments = { ...state.pendingPayments };
     for (const id of json.synced_payment_refs || []) delete remainingPayments[id];
+    if (json.success && payments.length) {
+      for (const p of payments) {
+        const key = p.reference_id || p.amazon_ref_id || p.load_id;
+        if (key) delete remainingPayments[key];
+      }
+    }
+
+    // Refresh local skip-cache for History / terminal loads
+    const nextCache = { ...(state.syncedLoadCache || {}) };
+    for (const load of loads) {
+      if (!load.load_id) continue;
+      nextCache[load.load_id] = {
+        trip_bucket: load.trip_bucket || null,
+        load_status: load.load_status || null,
+        payment_status: load.payment_status || null,
+        content_hash: load.content_hash || null,
+        at: Date.now(),
+      };
+    }
+    // Drop pending history rows we intentionally skipped (already cached)
+    for (const [id, raw] of Object.entries(remainingLoads)) {
+      if (raw?.trip_bucket === 'history' && nextCache[id]?.trip_bucket === 'history') {
+        delete remainingLoads[id];
+      }
+    }
+
+    if (reconcileIds) pendingReconcileActiveIds = null;
 
     await setState({
       pendingLoads: remainingLoads,
       pendingPayments: remainingPayments,
+      syncedLoadCache: nextCache,
       lastSyncAt: new Date().toISOString(),
-      recordsUpdated: state.recordsUpdated + (json.loads_updated || 0) + (json.payments_upserted || 0),
+      recordsUpdated:
+        state.recordsUpdated +
+        (json.loads_updated || 0) +
+        (json.payments_upserted || 0) +
+        (json.loads_reconciled || 0),
       recordsInserted: state.recordsInserted + (json.loads_inserted || 0),
       syncErrors: json.errors?.length
         ? [...(state.syncErrors || []).slice(-15), ...json.errors.map((e) => ({ at: new Date().toISOString(), error: e }))]
@@ -668,6 +1029,11 @@ async function flushToEdge() {
     await setState({
       syncErrors: [...(state.syncErrors || []).slice(-19), { at: new Date().toISOString(), error: String(err) }],
     });
+    for (const section of ['tours', 'load_detail', 'payments']) {
+      if (state.sections[section]?.state === 'Collecting') {
+        await updateSection(section, { state: 'Error', lastError: String(err) });
+      }
+    }
   }
 }
 

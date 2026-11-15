@@ -31,8 +31,10 @@ function render(state) {
   const prog = state.syncProgress || {};
   const phase = prog.phase || 'idle';
   const pct = Math.max(0, Math.min(100, Number(prog.percent) || 0));
-  $('sync-phase').textContent = state.scanInProgress ? `${phase}…` : phase;
-  $('sync-bar-fill').style.width = `${state.scanInProgress || pct ? pct : 0}%`;
+  const busy =
+    state.scanInProgress || state.tripsScanInProgress || state.paymentsScanInProgress;
+  $('sync-phase').textContent = busy && phase !== 'near-live' ? `${phase}…` : phase;
+  $('sync-bar-fill').style.width = `${busy || pct ? pct : 0}%`;
   const durationNote =
     prog.lastDurationMs != null
       ? ` Last pass ${Math.round(prog.lastDurationMs / 1000)}s.`

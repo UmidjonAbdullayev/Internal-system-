@@ -219,14 +219,30 @@ export function finalizeLoadForSync(load) {
   const deliveryDate = deliveryDateRaw || pickupDateRaw || today;
 
   let status = load.load_status;
+  let tripBucket = load.trip_bucket || null;
+  const terminal = /^(Completed|Delivered|Cancelled|Rejected)$/i;
+
+  // History board → completed; terminal status → history bucket (fixes stale active rows)
+  if (tripBucket === 'history') {
+    if (!status || status === 'Booked' || status === 'In Transit' || status === 'Dispatched' || status === 'Available') {
+      status = 'Completed';
+    }
+  }
   if (!status) {
-    if (load.trip_bucket === 'history') status = 'Completed';
-    else if (load.trip_bucket === 'upcoming') status = 'Booked';
+    if (tripBucket === 'history') status = 'Completed';
+    else if (tripBucket === 'upcoming') status = 'Booked';
     else status = 'In Transit';
   }
+  if (terminal.test(String(status))) {
+    tripBucket = 'history';
+  } else if (tripBucket === 'history') {
+    status = status || 'Completed';
+  }
+
   return {
     ...load,
     load_status: status,
+    trip_bucket: tripBucket,
     pickup_location: pickup,
     delivery_location: delivery,
     pickup_date: pickupDate,

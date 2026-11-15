@@ -40,10 +40,17 @@ const TRIP_TABS: { id: LoadsTab; label: string }[] = [
 ];
 
 function inferTripBucket(load: Load): TripBucket | null {
-  if (load.tripBucket) return load.tripBucket;
-  if (load.loadStatus === 'Completed' || load.loadStatus === 'Delivered' || load.loadStatus === 'Cancelled') {
+  // Terminal statuses always History — even if trip_bucket was left stale as active.
+  if (
+    load.loadStatus === 'Completed' ||
+    load.loadStatus === 'Delivered' ||
+    load.loadStatus === 'Cancelled' ||
+    load.loadStatus === 'Rejected'
+  ) {
     return 'history';
   }
+  if (load.tripBucket === 'history') return 'history';
+  if (load.tripBucket === 'in_transit' || load.tripBucket === 'upcoming') return load.tripBucket;
   if (load.loadStatus === 'In Transit' || load.loadStatus === 'Dispatched') return 'in_transit';
   if (load.loadStatus === 'Booked' || load.loadStatus === 'Available') return 'upcoming';
   return null;

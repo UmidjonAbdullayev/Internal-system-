@@ -94,3 +94,24 @@ export const HISTORY_WEEK_SETTLE_MS = 1400;
 
 /** Skip re-scraping payments if last collection was within this window (unless force). */
 export const PAYMENTS_MIN_INTERVAL_MS = 18 * 60 * 1000;
+
+/**
+ * Soft-scan safety: hard timeouts so a hung Payments scrape / Edge flush
+ * cannot leave the popup stuck on "busy" and block Trips forever.
+ */
+export const SOFT_SCAN_HARD_TIMEOUT_MS = 120 * 1000;
+export const COLLECT_TAB_TIMEOUT_MS = 90 * 1000;
+export const FLUSH_TIMEOUT_MS = 45 * 1000;
+export const PAYMENTS_COLLECT_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * Near-live Trips (Upcoming + In Transit only): MutationObserver / network
+ * hooks debounce into an incremental sync. History + Payments stay on soft cadence.
+ */
+export const NEAR_LIVE_DEBOUNCE_MS = 2800;
+export const NEAR_LIVE_DEBOUNCE_JITTER_MS = 1800;
+export const NEAR_LIVE_MIN_INTERVAL_MS = 8 * 1000;
+export const NEAR_LIVE_FLUSH_DEBOUNCE_MS = 1500;
+
+/** History skip: keep local cache entries this long before forcing a refresh expand. */
+export const HISTORY_SKIP_TTL_MS = 7 * 24 * 60 * 60 * 1000;

@@ -18,6 +18,7 @@ const TERMINAL_LOAD: Load['loadStatus'][] = ['Cancelled', 'Rejected', 'Completed
 export function getActiveLoadsForDriver(loads: Load[], driverId: string): Load[] {
   return loads.filter((l) => {
     if (l.driverId !== driverId) return false;
+    // Never treat completed/cancelled (or history-bucket) as active — even if trip_bucket stale.
     if (TERMINAL_LOAD.includes(l.loadStatus) || l.tripBucket === 'history') return false;
     if (l.tripBucket === 'in_transit' || l.tripBucket === 'upcoming') return true;
     return (

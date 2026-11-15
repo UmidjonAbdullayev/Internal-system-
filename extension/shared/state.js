@@ -32,7 +32,20 @@ const DEFAULT_STATE = {
   },
   lastPaymentsScanAt: null,
   lastTripsScanAt: null,
+  /** UI aggregate — true if trips OR payments soft scan is running. */
   scanInProgress: false,
+  tripsScanInProgress: false,
+  paymentsScanInProgress: false,
+  tripsScanStartedAt: null,
+  paymentsScanStartedAt: null,
+  lastNearLiveAt: null,
+  /**
+   * load_id → { trip_bucket, load_status, payment_status, content_hash, at }
+   * Used to skip unchanged History expands / re-upserts.
+   */
+  syncedLoadCache: {},
+  /** Last full Upcoming+In Transit id set (for reconcile). */
+  lastActiveLoadIds: [],
 };
 
 export async function getState() {

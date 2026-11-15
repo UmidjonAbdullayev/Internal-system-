@@ -975,6 +975,20 @@
     return { load, method: 'click_expand', expanded: true };
   }
 
+  function historySkipUnchanged(load, expandOpts = {}) {
+    const skipMap = expandOpts.historySkipMap || {};
+    const meta = skipMap[load?.load_id];
+    if (!meta?.skipExpand && !meta?.skipUpsert) return null;
+    const status = load.load_status || 'Completed';
+    const pay = load.payment_status || null;
+    const statusMatch = (meta.load_status || 'Completed') === status;
+    const payMatch = (meta.payment_status || null) === pay;
+    // Bucket change (was active in cache) must NOT skip — need history upsert
+    const wasHistory = meta.trip_bucket === 'history';
+    if (wasHistory && statusMatch && payMatch) return meta;
+    return null;
+  }
+
   async function enrichLoadsWithAutoExpand(loads, expandOpts = {}) {
     const {
       maxExpand = 8,
@@ -987,11 +1001,25 @@
 
     const already = scrapedMap || (await getDetailScrapedMap());
     let expandCount = 0;
+    let skippedHistory = 0;
     const out = [];
 
     for (const raw of loads || []) {
+      const histSkip = historySkipUnchanged(raw, expandOpts);
+      if (histSkip?.skipUpsert) {
+        skippedHistory += 1;
+        out.push({
+          ...raw,
+          trip_bucket: 'history',
+          load_status: raw.load_status || histSkip.load_status || 'Completed',
+          detail_method: 'history_skip_cached',
+          history_skip: true,
+        });
+        continue;
+      }
+
       const prior = already[raw.load_id];
-      const skipExpand = Boolean(prior?.hasTrailer || prior?.hasTractor);
+      const skipExpand = Boolean(prior?.hasTrailer || prior?.hasTractor) || Boolean(histSkip?.skipExpand);
       // Still refresh DOM/React without clicking when cached
       const allowExpand = !skipExpand && expandCount < maxExpand && !detailIsRich(raw);
       const { load, method } = await expandAndEnrichLoad(raw, {
@@ -1012,8 +1040,8 @@
       out.push(load);
     }
 
-    await markDetailScraped(out);
-    return { loads: out, expanded: expandCount };
+    await markDetailScraped(out.filter((l) => !l.history_skip));
+    return { loads: out, expanded: expandCount, history_skipped: skippedHistory };
   }
 
   function collectExpandedDetail() {
@@ -1179,9 +1207,30 @@
   }
 
   async function collectVisibleTrips(forcedBucket = null, expandOpts = {}) {
-    const base = collectVisibleTripsSync(forcedBucket);
-    const { loads, expanded } = await enrichLoadsWithAutoExpand(base, expandOpts);
-    return { loads, expanded, trip_bucket: forcedBucket || detectTripBucket() };
+    const base = collectVisibleTripsSync(forcedBucket).map((l) => {
+      if (forcedBucket === 'history') {
+        return {
+          ...l,
+          trip_bucket: 'history',
+          load_status:
+            l.load_status && !/^(Booked|In Transit|Dispatched|Available)$/i.test(l.load_status)
+              ? l.load_status
+              : 'Completed',
+        };
+      }
+      return l;
+    });
+    const { loads, expanded, history_skipped } = await enrichLoadsWithAutoExpand(base, {
+      ...expandOpts,
+      // Only apply History skip-cache on History board
+      historySkipMap: forcedBucket === 'history' ? expandOpts.historySkipMap || {} : {},
+    });
+    return {
+      loads,
+      expanded,
+      history_skipped: history_skipped || 0,
+      trip_bucket: forcedBucket || detectTripBucket(),
+    };
   }
 
   function sleep(ms, jitterMs = 0) {
@@ -1201,31 +1250,42 @@
 
   /**
    * History is date-grouped; default filter often shows only the current week.
-   * Controls we look for (documented for PR A):
+   * Controls we look for:
    * - Buttons / tabs / menuitems / options: "This week", "Last week", "Previous week",
-   *   "Last 7 days", "Last 14 days", "Past week"
+   *   "Last 7 days", "Last 14 days", "Past week", "Prior week"
    * - Combobox / listbox / select labeled Week / Date / Filter / Time period
    * - Native <select> options with the same labels
-   * We scrape current week then prior week (or Last 14 days when that single control exists).
+   * Matching is substring-friendly (Relay often nests label text).
    */
   function findHistoryWeekControls() {
     const labels = [
-      { id: 'this_week', re: /^(this\s*week|current\s*week)$/i },
-      { id: 'last_week', re: /^(last\s*week|previous\s*week|past\s*week)$/i },
-      { id: 'last_7_days', re: /^last\s*7\s*days$/i },
-      { id: 'last_14_days', re: /^last\s*14\s*days$/i },
+      { id: 'this_week', re: /\bthis\s*week\b|\bcurrent\s*week\b/i },
+      { id: 'last_week', re: /\blast\s*week\b|\bprevious\s*week\b|\bpast\s*week\b|\bprior\s*week\b/i },
+      { id: 'last_7_days', re: /\blast\s*7\s*days\b|\bpast\s*7\s*days\b/i },
+      { id: 'last_14_days', re: /\blast\s*14\s*days\b|\bpast\s*14\s*days\b|\blast\s*two\s*weeks\b/i },
     ];
     const nodes = [
       ...document.querySelectorAll(
-        'button, [role="tab"], [role="menuitem"], [role="option"], [role="radio"], label, a, select option',
+        'button, [role="tab"], [role="menuitem"], [role="option"], [role="radio"], [role="listbox"] *, label, a, select option, [aria-haspopup="listbox"], [data-testid*="week"], [data-testid*="filter"], [class*="filter"], [class*="week"]',
       ),
     ];
+    const textOf = (n) =>
+      (n.innerText || n.textContent || n.getAttribute?.('aria-label') || n.title || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80);
+
     const found = [];
     for (const label of labels) {
-      const el = nodes.find((n) => label.re.test((n.innerText || n.textContent || '').trim()));
-      if (el) found.push({ id: label.id, el: el.tagName === 'OPTION' ? el.parentElement : el, option: el.tagName === 'OPTION' ? el : null });
+      const el = nodes.find((n) => label.re.test(textOf(n)));
+      if (el) {
+        found.push({
+          id: label.id,
+          el: el.tagName === 'OPTION' ? el.parentElement : el,
+          option: el.tagName === 'OPTION' ? el : null,
+        });
+      }
     }
-    // Native selects with week-ish options
     for (const sel of document.querySelectorAll('select')) {
       const opts = [...sel.options];
       for (const label of labels) {
@@ -1236,6 +1296,27 @@
       }
     }
     return found;
+  }
+
+  /** Open a Week/Date filter dropdown so options become queryable, then re-scan. */
+  async function revealHistoryFilterMenu() {
+    const triggers = [
+      ...document.querySelectorAll(
+        'button, [role="button"], [aria-haspopup="listbox"], [aria-haspopup="menu"], [data-testid*="filter"], [data-testid*="week"], [class*="filter"]',
+      ),
+    ].filter((el) =>
+      /\b(week|date|filter|period|range|time)\b/i.test(
+        (el.innerText || el.textContent || el.getAttribute('aria-label') || '').slice(0, 60),
+      ),
+    );
+    for (const el of triggers.slice(0, 3)) {
+      try {
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        await sleep(350, 120);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   async function applyHistoryWeekControl(control) {
@@ -1272,7 +1353,11 @@
     let merged = [];
     const weeks = [];
 
-    const controls = findHistoryWeekControls();
+    let controls = findHistoryWeekControls();
+    if (!controls.length) {
+      await revealHistoryFilterMenu();
+      controls = findHistoryWeekControls();
+    }
     const last14 = controls.find((c) => c.id === 'last_14_days');
     const thisWeek = controls.find((c) => c.id === 'this_week' || c.id === 'last_7_days');
     const lastWeek = controls.find((c) => c.id === 'last_week');
@@ -1283,7 +1368,13 @@
     } else {
       if (thisWeek) plan.push(thisWeek);
       if (lastWeek) plan.push(lastWeek);
+      // Prefer both weeks when last_7 is present without last_week — still scrape visible + last_7
+      if (!plan.length && controls.length) {
+        plan.push(controls[0]);
+      }
     }
+    let historySkipped = 0;
+
     // Always scrape whatever is visible once; then re-scrape after each filter change
     if (!plan.length) {
       const result = await collectVisibleTrips('history', {
@@ -1292,10 +1383,19 @@
         scrapedMap,
       });
       weeks.push('visible_default');
+      historySkipped += result.history_skipped || 0;
       return {
-        loads: result.loads.map((l) => ({ ...l, trip_bucket: 'history', history_week: 'visible_default' })),
+        loads: result.loads
+          .filter((l) => !l.history_skip)
+          .map((l) => ({
+            ...l,
+            trip_bucket: 'history',
+            load_status: l.load_status || 'Completed',
+            history_week: 'visible_default',
+          })),
         weeks,
         expanded: result.expanded || 0,
+        history_skipped: historySkipped,
         filters_found: controls.map((c) => c.id),
       };
     }
@@ -1309,11 +1409,15 @@
         maxExpand: remainingExpand,
         scrapedMap,
       });
-      const tagged = result.loads.map((l) => ({
-        ...l,
-        trip_bucket: 'history',
-        history_week: control.id,
-      }));
+      historySkipped += result.history_skipped || 0;
+      const tagged = result.loads
+        .filter((l) => !l.history_skip)
+        .map((l) => ({
+          ...l,
+          trip_bucket: 'history',
+          load_status: l.load_status || 'Completed',
+          history_week: control.id,
+        }));
       remainingExpand = Math.max(0, remainingExpand - (result.expanded || 0));
       rowsExpanded += result.expanded || 0;
       weeks.push(control.id);
@@ -1338,6 +1442,7 @@
       loads: merged,
       weeks,
       expanded: rowsExpanded,
+      history_skipped: historySkipped,
       filters_found: controls.map((c) => c.id),
     };
   }
@@ -1367,6 +1472,7 @@
           trip_buckets_scanned: ['history'],
           history_weeks_scanned: hist.weeks,
           history_filters_found: hist.filters_found,
+          history_skipped: hist.history_skipped || 0,
           auto_tab_switch: false,
           rows_expanded: hist.expanded,
         };
@@ -1393,6 +1499,7 @@
     let rowsExpanded = 0;
     let historyWeeks = [];
     let historyFilters = [];
+    let historySkipped = 0;
 
     for (const tab of tabs) {
       try {
@@ -1414,6 +1521,7 @@
         scanned.push(tab.bucket);
         historyWeeks = hist.weeks;
         historyFilters = hist.filters_found || [];
+        historySkipped += hist.history_skipped || 0;
         merged = mergeLoads(merged, hist.loads);
         continue;
       }
@@ -1455,6 +1563,7 @@
       trip_buckets_scanned: scanned,
       history_weeks_scanned: historyWeeks,
       history_filters_found: historyFilters,
+      history_skipped: historySkipped,
       auto_tab_switch: true,
       rows_expanded: rowsExpanded,
     };
@@ -1503,6 +1612,7 @@
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === 'RELAY_COLLECT') {
       (async () => {
+        window.__internalSysCollectBusy = true;
         try {
           if (msg?.skipIfHidden !== false && document.hidden) {
             sendResponse({ ok: false, skippedHidden: true, error: 'Tab hidden — soft skip' });
@@ -1525,6 +1635,7 @@
             historyWeekSettleMs: msg?.historyWeekSettleMs ?? 1400,
             historyWeeks: msg?.historyWeeks !== false,
             softYield: msg?.softYield !== false,
+            historySkipMap: msg?.historySkipMap || {},
           };
 
           if (section === 'tours' && msg?.allTripTabs !== false) {
@@ -1538,6 +1649,7 @@
                 trip_buckets_scanned: multi.trip_buckets_scanned,
                 history_weeks_scanned: multi.history_weeks_scanned || [],
                 history_filters_found: multi.history_filters_found || [],
+                history_skipped: multi.history_skipped || 0,
                 auto_tab_switch: multi.auto_tab_switch,
                 rows_expanded: multi.rows_expanded || 0,
                 detail_detected: multi.loads.some((l) => l.trailer_id || l.tractor_id),
@@ -1569,6 +1681,8 @@
           sendResponse({ ok: true, data: collect() });
         } catch (err) {
           sendResponse({ ok: false, error: String(err) });
+        } finally {
+          window.__internalSysCollectBusy = false;
         }
       })();
       return true;
@@ -1585,4 +1699,152 @@
     }
     return false;
   });
+
+  /**
+   * Near-live Trips watcher (Upcoming + In Transit only).
+   * MutationObserver + light fetch/XHR hooks → debounced incremental scrape.
+   * Skips History, Payments, hidden tabs, and while a full RELAY_COLLECT runs.
+   */
+  function setupNearLiveWatcher() {
+    if (window.__internalSysNearLive) return;
+    window.__internalSysNearLive = true;
+
+    let debounceTimer = null;
+    let lastSentAt = 0;
+    let lastFingerprint = '';
+    const DEBOUNCE_BASE = 2800;
+    const DEBOUNCE_JITTER = 1800;
+    const MIN_INTERVAL = 8000;
+
+    function liveBucketOk() {
+      const bucket = detectTripBucket();
+      return bucket === 'upcoming' || bucket === 'in_transit';
+    }
+
+    function shouldWatch() {
+      if (document.hidden) return false;
+      if (window.__internalSysCollectBusy) return false;
+      if (/payment|settlement|invoice/i.test(location.href)) return false;
+      if (!(isTripsBoardUrl() || isTripsBoardDom())) return false;
+      return liveBucketOk();
+    }
+
+    function fingerprintLoads(loads) {
+      return loads
+        .map(
+          (l) =>
+            `${l.load_id}|${l.status || ''}|${l.status_bar_state || ''}|${l.driver_name || ''}|${l.trailer_id || ''}`,
+        )
+        .sort()
+        .join(';');
+    }
+
+    function schedule(reason) {
+      if (!shouldWatch()) return;
+      clearTimeout(debounceTimer);
+      const wait = DEBOUNCE_BASE + Math.floor(Math.random() * DEBOUNCE_JITTER);
+      debounceTimer = setTimeout(() => {
+        void runIncremental(reason || 'dom');
+      }, wait);
+    }
+
+    async function runIncremental(reason) {
+      try {
+        if (!shouldWatch()) return;
+        const now = Date.now();
+        if (now - lastSentAt < MIN_INTERVAL) return;
+
+        const bucket = detectTripBucket();
+        const loads = collectVisibleTripsSync(bucket);
+        if (!loads.length) return;
+        const fp = fingerprintLoads(loads);
+        if (fp === lastFingerprint) return;
+
+        lastFingerprint = fp;
+        lastSentAt = now;
+        chrome.runtime.sendMessage({
+          type: 'NEAR_LIVE_TRIPS',
+          loads,
+          trip_bucket: bucket,
+          url: location.href,
+          hidden: document.hidden,
+          reason,
+        });
+      } catch {
+        /* non-fatal */
+      }
+    }
+
+    const mo = new MutationObserver(() => schedule('mutation'));
+    const startMo = () => {
+      if (!document.body) return;
+      try {
+        mo.observe(document.body, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+      } catch {
+        /* ignore */
+      }
+    };
+    if (document.body) startMo();
+    else document.addEventListener('DOMContentLoaded', startMo, { once: true });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) schedule('visible');
+    });
+
+    // Light network hooks — schedule only, never read bodies
+    try {
+      const origFetch = window.fetch;
+      if (typeof origFetch === 'function' && !origFetch.__internalSysWrapped) {
+        const wrapped = async function (...args) {
+          const res = await origFetch.apply(this, args);
+          try {
+            const u = String(args[0]?.url || args[0] || '');
+            if (/trip|tour|load|relay|work|schedule/i.test(u)) schedule('fetch');
+          } catch {
+            /* ignore */
+          }
+          return res;
+        };
+        wrapped.__internalSysWrapped = true;
+        window.fetch = wrapped;
+      }
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      const XO = XMLHttpRequest.prototype.open;
+      const XS = XMLHttpRequest.prototype.send;
+      if (!XO.__internalSysWrapped) {
+        XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+          this.__internalSysUrl = url;
+          return XO.call(this, method, url, ...rest);
+        };
+        XMLHttpRequest.prototype.open.__internalSysWrapped = true;
+        XMLHttpRequest.prototype.send = function (...args) {
+          this.addEventListener('loadend', () => {
+            try {
+              if (/trip|tour|load|relay|work|schedule/i.test(String(this.__internalSysUrl || ''))) {
+                schedule('xhr');
+              }
+            } catch {
+              /* ignore */
+            }
+          });
+          return XS.apply(this, args);
+        };
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // Initial pass shortly after inject when already on live board
+    setTimeout(() => schedule('init'), 2000 + Math.floor(Math.random() * 1000));
+  }
+
+  setupNearLiveWatcher();
 })();

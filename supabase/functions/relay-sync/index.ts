@@ -89,6 +89,25 @@ function isCompleteLoad(load: LoadIn) {
   );
 }
 
+const TERMINAL_STATUSES = new Set(["Completed", "Delivered", "Cancelled", "Rejected"]);
+
+/** Keep trip_bucket + load_status consistent so History never sticks as active. */
+function normalizeLoadBucketStatus(load: LoadIn): LoadIn {
+  let status = load.load_status;
+  let bucket = load.trip_bucket ?? null;
+  if (bucket === "history") {
+    if (!status || status === "Booked" || status === "In Transit" || status === "Dispatched" || status === "Available") {
+      status = "Completed";
+    }
+  }
+  if (status && TERMINAL_STATUSES.has(status)) {
+    bucket = "history";
+  } else if (bucket === "history" && !status) {
+    status = "Completed";
+  }
+  return { ...load, load_status: status, trip_bucket: bucket };
+}
+
 type DriverRow = {
   id: string;
   first_name: string | null;
@@ -231,6 +250,10 @@ Deno.serve(async (req: Request) => {
     const loads: LoadIn[] = Array.isArray(body.loads) ? body.loads : [];
     const payments: PaymentIn[] = Array.isArray(body.payments) ? body.payments : [];
     const clientId = typeof body.client_id === "string" ? body.client_id : null;
+    /** When set (full Upcoming+In Transit pass), demote other active amazon_relay rows to History. */
+    const reconcileActiveIds: string[] | null = Array.isArray(body.reconcile_active_ids)
+      ? body.reconcile_active_ids.filter((id: unknown) => isValidRelayLoadId(id)).map(String)
+      : null;
     const now = new Date().toISOString();
 
     const { data: run, error: runErr } = await sb
@@ -265,7 +288,8 @@ Deno.serve(async (req: Request) => {
       .select("id, first_name, last_name, notes, driver_id");
     const driversCache: DriverRow[] = (driverRows || []) as DriverRow[];
 
-    for (const load of loads) {
+    for (const rawLoad of loads) {
+      const load = normalizeLoadBucketStatus(rawLoad);
       if (!isValidRelayLoadId(load?.load_id)) {
         errors.push(
           `Invalid load_id skipped (expected T-… / leg id, not a date): ${load?.load_id || "(missing id)"}`,
@@ -568,13 +592,84 @@ Deno.serve(async (req: Request) => {
       .eq("source", "amazon_relay")
       .eq("is_stale", false);
 
+    // Full active pass: anything still upcoming/in_transit but not in Relay's active set → History
+    let loadsReconciled = 0;
+    if (reconcileActiveIds) {
+      const activeSet = new Set(reconcileActiveIds.map((id) => id.toUpperCase()));
+      const { data: activeRows, error: activeErr } = await sb
+        .from("loads")
+        .select("id, load_id, load_status, trip_bucket, status_history")
+        .eq("source", "amazon_relay")
+        .in("trip_bucket", ["upcoming", "in_transit"]);
+      if (activeErr) {
+        errors.push(`Active reconcile lookup: ${activeErr.message}`);
+      } else {
+        for (const row of activeRows || []) {
+          const lid = String(row.load_id || "").toUpperCase();
+          if (!lid || activeSet.has(lid)) continue;
+          if (TERMINAL_STATUSES.has(String(row.load_status))) {
+            const { error } = await sb
+              .from("loads")
+              .update({
+                trip_bucket: "history",
+                last_changed: now,
+                last_synchronized: now,
+                updated_at: now,
+              })
+              .eq("id", row.id);
+            if (!error) loadsReconciled += 1;
+            continue;
+          }
+          const nextStatus = "Completed";
+          const prevHistory = Array.isArray(row.status_history) ? row.status_history : [];
+          const { error } = await sb
+            .from("loads")
+            .update({
+              trip_bucket: "history",
+              load_status: nextStatus,
+              last_changed: now,
+              last_synchronized: now,
+              last_observed: now,
+              updated_at: now,
+              status_history: [
+                ...prevHistory,
+                {
+                  status: nextStatus,
+                  timestamp: now,
+                  note: "Reconciled off Relay active set (Upcoming/In Transit)",
+                },
+              ],
+            })
+            .eq("id", row.id);
+          if (error) errors.push(`Reconcile ${row.load_id}: ${error.message}`);
+          else {
+            loadsReconciled += 1;
+            notifications.push({
+              event_type: "load_status_change",
+              dedupe_key: `reconcile_history:${row.load_id}:${nextStatus}`,
+              message: `Load ${row.load_id} moved to History (no longer on Relay active trips)`,
+              load_id: row.load_id,
+            });
+          }
+        }
+      }
+
+      // Also fix any terminal-status rows still tagged upcoming/in_transit
+      await sb
+        .from("loads")
+        .update({ trip_bucket: "history", updated_at: now, last_synchronized: now })
+        .eq("source", "amazon_relay")
+        .in("trip_bucket", ["upcoming", "in_transit"])
+        .in("load_status", ["Completed", "Delivered", "Cancelled", "Rejected"]);
+    }
+
     await sb
       .from("relay_sync_runs")
       .update({
         finished_at: now,
         status: errors.length ? "completed_with_errors" : "completed",
         records_collected: loads.length + payments.length,
-        records_updated: loadsUpdated + paymentsUpserted + loadsPaymentUpdated,
+        records_updated: loadsUpdated + paymentsUpserted + loadsPaymentUpdated + loadsReconciled,
         records_inserted: loadsInserted,
         error_count: errors.length,
         errors,
@@ -588,6 +683,7 @@ Deno.serve(async (req: Request) => {
       loads_inserted: loadsInserted,
       loads_updated: loadsUpdated,
       loads_payment_updated: loadsPaymentUpdated,
+      loads_reconciled: loadsReconciled,
       payments_upserted: paymentsUpserted,
       synced_load_ids: syncedLoadIds,
       synced_payment_refs: syncedPaymentRefs,
