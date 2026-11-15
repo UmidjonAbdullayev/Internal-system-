@@ -10,6 +10,7 @@ import {
 import type {
   Driver,
   Load,
+  LoadReport,
   DriverFee,
   OneTimeCharge,
   Settlement,
@@ -24,14 +25,17 @@ import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations
 import { generateId, getWeekRange } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
 import {
+  loadReportToRow,
   mapActivity,
   mapCharge,
   mapDriver,
   mapFee,
   mapLoad,
+  mapLoadReport,
   mapRelayPayment,
   mapSettlement,
 } from '@/lib/supabaseMappers';
+import { buildReportFromLoad, loadInDateRange } from '@/lib/reportRows';
 import { toast } from 'sonner';
 
 interface CompanySettings {
@@ -66,6 +70,7 @@ const EMPTY_SETTINGS: CompanySettings = {
 interface DataContextValue {
   drivers: Driver[];
   loads: Load[];
+  loadReports: LoadReport[];
   payments: RelayPayment[];
   driverFees: DriverFee[];
   oneTimeCharges: OneTimeCharge[];
@@ -88,6 +93,17 @@ interface DataContextValue {
   updateLoad: (id: string, patch: Partial<Load>) => void;
   deleteLoad: (id: string) => void;
   getLoad: (id: string) => Load | undefined;
+  // Load reports (ops spreadsheet)
+  addLoadReport: (
+    report: Omit<LoadReport, 'id' | 'createdAt' | 'updatedAt'>,
+  ) => LoadReport;
+  updateLoadReport: (id: string, patch: Partial<LoadReport>) => void;
+  deleteLoadReport: (id: string) => void;
+  syncLoadReportsForRange: (
+    start: string,
+    end: string,
+    opts?: { quiet?: boolean },
+  ) => Promise<number>;
   // Fees
   addFee: (fee: Omit<DriverFee, 'id' | 'createdAt' | 'updatedAt'>) => DriverFee;
   updateFee: (id: string, patch: Partial<DriverFee>) => void;
@@ -127,6 +143,7 @@ function now() {
 export function DataProvider({ children }: { children: ReactNode }) {
   const [drivers, setDrivers] = useState<Driver[]>([]);
   const [loads, setLoads] = useState<Load[]>([]);
+  const [loadReports, setLoadReports] = useState<LoadReport[]>([]);
   const [payments, setPayments] = useState<RelayPayment[]>([]);
   const [driverFees, setDriverFees] = useState<DriverFee[]>([]);
   const [oneTimeCharges, setOneTimeCharges] = useState<OneTimeCharge[]>([]);
@@ -143,6 +160,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const [
       driversRes,
       loadsRes,
+      loadReportsRes,
       feesRes,
       chargesRes,
       settlementsRes,
@@ -153,6 +171,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     ] = await Promise.all([
       supabase.from('drivers').select('*').order('created_at', { ascending: true }),
       supabase.from('loads').select('*').order('created_at', { ascending: false }),
+      supabase.from('load_reports').select('*').order('pickup_date', { ascending: true }),
       supabase.from('driver_fees').select('*'),
       supabase.from('one_time_charges').select('*'),
       supabase.from('settlements').select('*'),
@@ -165,6 +184,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const err =
       driversRes.error ||
       loadsRes.error ||
+      loadReportsRes.error ||
       feesRes.error ||
       chargesRes.error ||
       settlementsRes.error ||
@@ -229,6 +249,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
     setDrivers((driversRes.data || []).map((r) => mapDriver(r as Record<string, unknown>)));
     setLoads((loadsRes.data || []).map((r) => mapLoad(r as Record<string, unknown>)));
+    setLoadReports(
+      (loadReportsRes.data || []).map((r) => mapLoadReport(r as Record<string, unknown>)),
+    );
     setPayments(mappedPayments);
     setDriverFees((feesRes.data || []).map((r) => mapFee(r as Record<string, unknown>)));
     setOneTimeCharges((chargesRes.data || []).map((r) => mapCharge(r as Record<string, unknown>)));
@@ -463,6 +486,123 @@ export function DataProvider({ children }: { children: ReactNode }) {
       toast.success('Load deleted');
     },
     [loads, logActivity]
+  );
+
+  const addLoadReport = useCallback(
+    (data: Omit<LoadReport, 'id' | 'createdAt' | 'updatedAt'>) => {
+      const id = crypto.randomUUID();
+      const ts = now();
+      const report: LoadReport = {
+        ...data,
+        id,
+        createdAt: ts,
+        updatedAt: ts,
+      };
+      setLoadReports((prev) => [...prev, report]);
+      void supabase
+        .from('load_reports')
+        .insert(loadReportToRow(report))
+        .then(({ error }) => {
+          if (error) toast.error(`Report save failed: ${error.message}`);
+          else void hydrate();
+        });
+      logActivity({
+        type: 'load',
+        action: 'report_added',
+        description: `Report row ${report.loadIds || report.trip || id} added`,
+        entityId: id,
+      });
+      toast.success('Report row added');
+      return report;
+    },
+    [hydrate, logActivity],
+  );
+
+  const updateLoadReport = useCallback(
+    (id: string, patch: Partial<LoadReport>) => {
+      const ts = now();
+      setLoadReports((prev) =>
+        prev.map((r) => (r.id === id ? { ...r, ...patch, updatedAt: ts } : r)),
+      );
+      const row = loadReportToRow({ ...patch, updatedAt: ts });
+      void supabase
+        .from('load_reports')
+        .update(row)
+        .eq('id', id)
+        .then(({ error }) => {
+          if (error) toast.error(`Report update failed: ${error.message}`);
+        });
+      logActivity({
+        type: 'load',
+        action: 'report_updated',
+        description: 'Report row updated',
+        entityId: id,
+      });
+      toast.success('Report updated');
+    },
+    [logActivity],
+  );
+
+  const deleteLoadReport = useCallback(
+    (id: string) => {
+      const row = loadReports.find((r) => r.id === id);
+      setLoadReports((prev) => prev.filter((r) => r.id !== id));
+      void supabase
+        .from('load_reports')
+        .delete()
+        .eq('id', id)
+        .then(({ error }) => {
+          if (error) toast.error(`Report delete failed: ${error.message}`);
+        });
+      logActivity({
+        type: 'load',
+        action: 'report_deleted',
+        description: `Report row ${row?.loadIds ?? id} deleted`,
+        entityId: id,
+      });
+      toast.success('Report row deleted');
+    },
+    [loadReports, logActivity],
+  );
+
+  const syncLoadReportsForRange = useCallback(
+    async (start: string, end: string, opts?: { quiet?: boolean }) => {
+      const linked = new Set(
+        loadReports.map((r) => r.loadUuid).filter((id): id is string => Boolean(id)),
+      );
+      const missing = loads.filter(
+        (l) => loadInDateRange(l, start, end) && !linked.has(l.id),
+      );
+      if (!missing.length) {
+        if (!opts?.quiet) toast.message('Reports already up to date for this range');
+        return 0;
+      }
+      const ts = now();
+      const rows: LoadReport[] = missing.map((load) => {
+        const base = buildReportFromLoad(load, drivers, '', 'sync');
+        return {
+          ...base,
+          id: crypto.randomUUID(),
+          createdAt: ts,
+          updatedAt: ts,
+        };
+      });
+      setLoadReports((prev) => [...prev, ...rows]);
+      const { error } = await supabase
+        .from('load_reports')
+        .insert(rows.map((r) => loadReportToRow(r)));
+      if (error) {
+        toast.error(`Sync failed: ${error.message}`);
+        await hydrate();
+        return 0;
+      }
+      if (!opts?.quiet) {
+        toast.success(`Synced ${rows.length} load${rows.length === 1 ? '' : 's'} into Reports`);
+      }
+      await hydrate();
+      return rows.length;
+    },
+    [drivers, hydrate, loadReports, loads],
   );
 
   const addFee = useCallback(
@@ -826,6 +966,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     () => ({
       drivers,
       loads,
+      loadReports,
       payments,
       driverFees,
       oneTimeCharges,
@@ -846,6 +987,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
       updateLoad,
       deleteLoad,
       getLoad,
+      addLoadReport,
+      updateLoadReport,
+      deleteLoadReport,
+      syncLoadReportsForRange,
       addFee,
       updateFee,
       deleteFee,
@@ -866,6 +1011,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     [
       drivers,
       loads,
+      loadReports,
       payments,
       driverFees,
       oneTimeCharges,
@@ -885,6 +1031,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
       updateLoad,
       deleteLoad,
       getLoad,
+      addLoadReport,
+      updateLoadReport,
+      deleteLoadReport,
+      syncLoadReportsForRange,
       addFee,
       updateFee,
       deleteFee,

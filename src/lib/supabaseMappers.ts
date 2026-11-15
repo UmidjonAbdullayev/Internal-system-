@@ -4,6 +4,7 @@ import type {
   DriverFee,
   DriverStatus,
   Load,
+  LoadReport,
   LoadStatus,
   OneTimeCharge,
   PaymentStatus,
@@ -165,4 +166,57 @@ export function mapRelayPayment(row: Record<string, unknown>): RelayPayment {
     createdAt: str(row.created_at),
     lastSynchronized: row.last_synchronized ? str(row.last_synchronized) : null,
   };
+}
+
+export function mapLoadReport(row: Record<string, unknown>): LoadReport {
+  const sourceRaw = str(row.source, 'sync');
+  const source: LoadReport['source'] =
+    sourceRaw === 'auto' || sourceRaw === 'manual' || sourceRaw === 'sync'
+      ? sourceRaw
+      : 'sync';
+  return {
+    id: str(row.id),
+    loadUuid: row.load_uuid ? str(row.load_uuid) : null,
+    broker: str(row.broker, 'Amazon'),
+    trip: str(row.trip),
+    loadIds: str(row.load_ids),
+    driverName: str(row.driver_name),
+    pickupDate: row.pickup_date ? str(row.pickup_date) : null,
+    deliveryDate: row.delivery_date ? str(row.delivery_date) : null,
+    puLocation: str(row.pu_location),
+    delLocation: str(row.del_location),
+    mile: str(row.mile),
+    amazonPaid: num(row.amazon_paid),
+    driverPaid: num(row.driver_paid),
+    rpm: num(row.rpm),
+    comment: str(row.comment),
+    dispatch: str(row.dispatch),
+    source,
+    createdAt: str(row.created_at),
+    updatedAt: str(row.updated_at),
+  };
+}
+
+export function loadReportToRow(report: Partial<LoadReport> & { id?: string }): Record<string, unknown> {
+  const row: Record<string, unknown> = {};
+  if (report.id != null) row.id = report.id;
+  if (report.loadUuid !== undefined) row.load_uuid = report.loadUuid;
+  if (report.broker != null) row.broker = report.broker;
+  if (report.trip != null) row.trip = report.trip;
+  if (report.loadIds != null) row.load_ids = report.loadIds;
+  if (report.driverName != null) row.driver_name = report.driverName;
+  if (report.pickupDate !== undefined) row.pickup_date = report.pickupDate;
+  if (report.deliveryDate !== undefined) row.delivery_date = report.deliveryDate;
+  if (report.puLocation != null) row.pu_location = report.puLocation;
+  if (report.delLocation != null) row.del_location = report.delLocation;
+  if (report.mile != null) row.mile = report.mile;
+  if (report.amazonPaid != null) row.amazon_paid = report.amazonPaid;
+  if (report.driverPaid != null) row.driver_paid = report.driverPaid;
+  if (report.rpm != null) row.rpm = report.rpm;
+  if (report.comment != null) row.comment = report.comment;
+  if (report.dispatch != null) row.dispatch = report.dispatch;
+  if (report.source != null) row.source = report.source;
+  if (report.createdAt != null) row.created_at = report.createdAt;
+  if (report.updatedAt != null) row.updated_at = report.updatedAt;
+  return row;
 }

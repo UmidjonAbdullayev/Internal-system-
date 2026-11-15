@@ -248,3 +248,26 @@ export type DatePreset =
   | 'this_month'
   | 'last_month'
   | 'custom';
+
+/** Spreadsheet row for Reports tab (persisted ops sheet). */
+export interface LoadReport {
+  id: string;
+  loadUuid: string | null;
+  broker: string;
+  trip: string;
+  loadIds: string;
+  driverName: string;
+  pickupDate: string | null;
+  deliveryDate: string | null;
+  puLocation: string;
+  delLocation: string;
+  mile: string;
+  amazonPaid: number;
+  driverPaid: number;
+  rpm: number;
+  comment: string;
+  dispatch: string;
+  source: 'sync' | 'auto' | 'manual';
+  createdAt: string;
+  updatedAt: string;
+}

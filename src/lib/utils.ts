@@ -88,8 +88,13 @@ export function getWeekRange(date: Date | string = new Date()): DateRange {
   };
 }
 
-export function getDateRangeFromPreset(preset: DatePreset, custom?: DateRange): DateRange {
-  const today = new Date();
+/** Ops-calendar presets. Pass `todayYmd` (America/Chicago) when available. */
+export function getDateRangeFromPreset(
+  preset: DatePreset,
+  custom?: DateRange,
+  todayYmd?: string,
+): DateRange {
+  const today = todayYmd ? parseISO(todayYmd) : new Date();
   switch (preset) {
     case 'today':
       return {
