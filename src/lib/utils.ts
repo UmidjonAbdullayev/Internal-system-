@@ -64,6 +64,20 @@ export function generateId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+/** Calendar date (yyyy-MM-dd) in a company ops timezone. Defaults to America/Chicago. */
+export function todayISO(timeZone = 'America/Chicago'): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+  } catch {
+    return format(new Date(), 'yyyy-MM-dd');
+  }
+}
+
 export function getWeekRange(date: Date | string = new Date()): DateRange {
   const d = typeof date === 'string' ? parseISO(date) : date;
   const start = startOfWeek(d, { weekStartsOn: 1 });

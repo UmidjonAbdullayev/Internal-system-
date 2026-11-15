@@ -18,6 +18,7 @@ import {
   formatDate,
   downloadCSV,
   getDriverFullName,
+  todayISO,
 } from '@/lib/utils';
 import type { Load, LoadStatus, PaymentStatus, TrailerType, TripBucket } from '@/types';
 
@@ -87,15 +88,18 @@ const emptyForm = {
 };
 
 export function LoadsPage() {
-  const { loads, drivers, addLoad, updateLoad, deleteLoad, dataSource, refreshData } = useData();
+  const { loads, drivers, addLoad, updateLoad, deleteLoad, dataSource, refreshData, companySettings } =
+    useData();
   const [params, setParams] = useSearchParams();
+  const today = todayISO(companySettings.timezone || 'America/Chicago');
   const [tab, setTab] = useState<LoadsTab>((params.get('tab') as LoadsTab) || 'in_transit');
   const [search, setSearch] = useState(params.get('q') ?? '');
   const [statusFilter, setStatusFilter] = useState(params.get('status') ?? '');
   const [paymentFilter, setPaymentFilter] = useState(params.get('paymentStatus') ?? '');
   const [driverFilter, setDriverFilter] = useState('');
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
+  /** Default = current ops date (America/Chicago unless Settings override). */
+  const [dateFrom, setDateFrom] = useState(params.get('from') || today);
+  const [dateTo, setDateTo] = useState(params.get('to') || today);
   const [sortKey, setSortKey] = useState('deliveryDate');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [formOpen, setFormOpen] = useState(false);
@@ -141,8 +145,16 @@ export function LoadsPage() {
       if (statusFilter && l.loadStatus !== statusFilter) return false;
       if (paymentFilter && l.paymentStatus !== paymentFilter) return false;
       if (driverFilter && l.driverId !== driverFilter) return false;
-      if (dateFrom && l.deliveryDate < dateFrom) return false;
-      if (dateTo && l.deliveryDate > dateTo) return false;
+      if (dateFrom || dateTo) {
+        const inRange = (d: string) => {
+          if (!d) return false;
+          if (dateFrom && d < dateFrom) return false;
+          if (dateTo && d > dateTo) return false;
+          return true;
+        };
+        // Match ops day on pickup or delivery (Relay dates).
+        if (!inRange(l.deliveryDate) && !inRange(l.pickupDate)) return false;
+      }
       if (q) {
         const hay = [
           l.loadId,
@@ -302,7 +314,7 @@ export function LoadsPage() {
       </div>
 
       <Card className="mb-4 p-3">
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-end gap-2">
           <SearchInput
             value={search}
             onChange={setSearch}
@@ -329,8 +341,50 @@ export function LoadsPage() {
               </option>
             ))}
           </Select>
-          <Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="w-36" />
-          <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="w-36" />
+          <div className="flex flex-col gap-0.5">
+            <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+              From
+            </label>
+            <Input
+              type="date"
+              value={dateFrom}
+              onChange={(e) => setDateFrom(e.target.value)}
+              className="w-36"
+            />
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+              To
+            </label>
+            <Input
+              type="date"
+              value={dateTo}
+              onChange={(e) => setDateTo(e.target.value)}
+              className="w-36"
+            />
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            type="button"
+            onClick={() => {
+              setDateFrom(today);
+              setDateTo(today);
+            }}
+          >
+            Today
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            type="button"
+            onClick={() => {
+              setDateFrom('');
+              setDateTo('');
+            }}
+          >
+            All dates
+          </Button>
         </div>
       </Card>
 

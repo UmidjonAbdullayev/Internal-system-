@@ -41,7 +41,7 @@ export function TopNav() {
 
         <div className="hidden md:flex items-center gap-2 rounded-lg border border-border bg-bg px-3 py-1.5 text-xs text-text-secondary">
           <Calendar className="h-3.5 w-3.5" />
-          <span>{format(new Date('2026-11-10'), 'EEE, MMM d, yyyy')}</span>
+          <span>{format(new Date(), 'EEE, MMM d, yyyy')}</span>
         </div>
 
         <Button size="sm" onClick={() => setShowQuickAdd(true)} className="shrink-0">

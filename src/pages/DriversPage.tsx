@@ -10,7 +10,12 @@ import { SearchInput } from '@/components/ui/SearchInput';
 import { Select, Input, Field, Textarea } from '@/components/ui/Input';
 import { Modal, ConfirmDialog } from '@/components/ui/Modal';
 import { SortHeader, useSort, type SortDir } from '@/components/shared/SortHeader';
-import { getDriverGross, getEligibleLoads } from '@/lib/calculations';
+import {
+  deriveDriverStatus,
+  getActiveLoadsForDriver,
+  getDriverGross,
+  getEligibleLoads,
+} from '@/lib/calculations';
 import {
   formatCurrency,
   formatDate,
@@ -69,10 +74,28 @@ export function DriversPage() {
 
   const rows = useMemo(() => {
     return drivers
-      .filter((d) => !statusFilter || d.status === statusFilter)
-      .filter((d) => {
+      .map((driver) => {
+        const liveStatus = deriveDriverStatus(driver, loads);
+        const activeLoads = getActiveLoadsForDriver(loads, driver.id);
+        const weeklyGross = getDriverGross(loads, driver.id, week);
+        const totalLoads = getEligibleLoads(loads, driver.id).length;
+        const latestSettlement = settlements
+          .filter((s) => s.driverId === driver.id)
+          .sort((a, b) => b.weekStart.localeCompare(a.weekStart))[0];
+        return {
+          driver,
+          liveStatus,
+          activeLoads,
+          weeklyGross,
+          totalLoads,
+          paymentStatus: latestSettlement?.status as string | undefined,
+        };
+      })
+      .filter((r) => !statusFilter || r.liveStatus === statusFilter)
+      .filter((r) => {
         if (!search) return true;
         const q = search.toLowerCase();
+        const d = r.driver;
         const name = getDriverFullName(d.firstName || '', d.lastName || '').toLowerCase();
         const id = (d.driverId || '').toLowerCase();
         const email = (d.email || '').toLowerCase();
@@ -85,19 +108,6 @@ export function DriversPage() {
           phone.includes(q) ||
           notes.includes(q)
         );
-      })
-      .map((driver) => {
-        const weeklyGross = getDriverGross(loads, driver.id, week);
-        const totalLoads = getEligibleLoads(loads, driver.id).length;
-        const latestSettlement = settlements
-          .filter((s) => s.driverId === driver.id)
-          .sort((a, b) => b.weekStart.localeCompare(a.weekStart))[0];
-        return {
-          driver,
-          weeklyGross,
-          totalLoads,
-          paymentStatus: latestSettlement?.status as string | undefined,
-        };
       });
   }, [drivers, loads, settlements, search, statusFilter, week]);
 
@@ -106,7 +116,7 @@ export function DriversPage() {
     weeklyGross: (r) => r.weeklyGross,
     totalLoads: (r) => r.totalLoads,
     hireDate: (r) => r.driver.hireDate,
-    status: (r) => r.driver.status,
+    status: (r) => r.liveStatus,
   });
 
   const handleSort = (key: string) => {
@@ -170,7 +180,7 @@ export function DriversPage() {
         r.driver.lastName,
         r.driver.phone,
         r.driver.email,
-        r.driver.status,
+        r.liveStatus,
         r.driver.assignedTruck,
         r.driver.trailerId,
         r.driver.hireDate,
@@ -216,7 +226,7 @@ export function DriversPage() {
     <div>
       <PageHeader
         title="Drivers"
-        subtitle={`${drivers.length} drivers in fleet database · import currently working drivers via CSV`}
+        subtitle={`${drivers.length} drivers · status from live trips/loads (On Load when In Transit / Booked)`}
         actions={
           <>
             <input
@@ -283,7 +293,15 @@ export function DriversPage() {
                   <td className="px-3 py-2.5 text-xs text-text-secondary">{r.driver.driverId}</td>
                   <td className="px-3 py-2.5 text-xs">{r.driver.phone || '—'}</td>
                   <td className="px-3 py-2.5 text-xs text-text-secondary">{r.driver.email || '—'}</td>
-                  <td className="px-3 py-2.5"><Badge status={r.driver.status || 'Available'} /></td>
+                  <td className="px-3 py-2.5">
+                    <Badge status={r.liveStatus} />
+                    {r.activeLoads[0] && (
+                      <div className="mt-0.5 text-[10px] text-text-secondary tabular-nums">
+                        {r.activeLoads[0].loadId}
+                        {r.activeLoads.length > 1 ? ` +${r.activeLoads.length - 1}` : ''}
+                      </div>
+                    )}
+                  </td>
                   <td className="px-3 py-2.5 text-xs">{r.driver.assignedTruck || '—'}</td>
                   <td className="px-3 py-2.5 text-xs">{r.driver.trailerId || '—'}</td>
                   <td className="px-3 py-2.5 text-xs">{formatDate(r.driver.hireDate || null, 'MMM d, yyyy')}</td>
@@ -300,7 +318,7 @@ export function DriversPage() {
                       <Button variant="ghost" size="sm" onClick={() => openEdit(r.driver)}>
                         <Pencil className="h-3.5 w-3.5" />
                       </Button>
-                      {r.driver.status !== 'Inactive' && (
+                      {r.liveStatus !== 'Inactive' && r.driver.status !== 'Inactive' && (
                         <Button variant="ghost" size="sm" onClick={() => setDeactivateId(r.driver.id)}>
                           <UserX className="h-3.5 w-3.5 text-danger" />
                         </Button>

@@ -33,6 +33,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { DateRangeFilter } from '@/components/ui/DateRangeFilter';
 import { Badge } from '@/components/ui/Badge';
 import {
+  deriveDriverStatus,
   getEligibleLoads,
   getFleetGross,
   groupLoadsByStatus,
@@ -67,9 +68,10 @@ export function OverviewPage() {
   const kpis = useMemo(() => {
     const eligible = getEligibleLoads(loads, undefined, range);
     const totalGross = getFleetGross(loads, range);
-    const activeDrivers = drivers.filter((d) =>
-      ['Active', 'On Load', 'Available', 'On Break'].includes(d.status)
-    ).length;
+    const activeDrivers = drivers.filter((d) => {
+      const s = deriveDriverStatus(d, loads);
+      return ['Active', 'On Load', 'Available', 'On Break'].includes(s);
+    }).length;
     const completed = loads.filter(
       (l) =>
         (l.loadStatus === 'Completed' || l.loadStatus === 'Delivered') &&

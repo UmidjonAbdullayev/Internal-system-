@@ -10,6 +10,7 @@ import { KpiCard } from '@/components/ui/KpiCard';
 import { Modal, ConfirmDialog } from '@/components/ui/Modal';
 import { Input, Field, Select, Textarea } from '@/components/ui/Input';
 import {
+  deriveDriverStatus,
   getDriverGross,
   getEligibleLoads,
   getLoadFinalGross,
@@ -20,6 +21,7 @@ import {
   formatDate,
   getWeekRange,
   getDriverFullName,
+  todayISO,
 } from '@/lib/utils';
 import type { ChargeCategory, FeeCalculationType, FeeFrequency, DriverFee } from '@/types';
 
@@ -37,6 +39,7 @@ export function DriverDetailPage() {
     addFee,
     updateFee,
     deleteFee,
+    companySettings,
   } = useData();
 
   const driver = getDriver(id ?? '');
@@ -56,8 +59,9 @@ export function DriverDetailPage() {
     description: '',
   });
 
-  const week = getWeekRange(new Date('2026-11-10'));
-  const month = getMonthRange(new Date('2026-11-10'));
+  const today = todayISO(companySettings.timezone || 'America/Chicago');
+  const week = getWeekRange(today);
+  const month = getMonthRange(today);
 
   const driverLoads = useMemo(
     () => loads.filter((l) => l.driverId === id).sort((a, b) => b.deliveryDate.localeCompare(a.deliveryDate)),
@@ -148,7 +152,7 @@ export function DriverDetailPage() {
       <PageHeader
         title={getDriverFullName(driver.firstName, driver.lastName)}
         subtitle={`${driver.driverId} · ${driver.city}, ${driver.state}`}
-        badge={<Badge status={driver.status} />}
+        badge={<Badge status={deriveDriverStatus(driver, loads)} />}
         actions={
           <>
             <Link to={`/gross-by-driver?driver=${driver.id}`}>
