@@ -16,6 +16,7 @@ import {
   dailyRevenueSeries,
   topDriversByGross,
   groupLoadsByStatus,
+  getMonthRange,
 } from '@/lib/calculations';
 import {
   formatCurrency,
@@ -23,17 +24,17 @@ import {
   downloadCSV,
   getDateRangeFromPreset,
   getDriverFullName,
+  todayISO,
 } from '@/lib/utils';
 import type { DatePreset, DateRange } from '@/types';
 import { toast } from 'sonner';
 
 export function ReportsPage() {
-  const { loads, drivers, settlements } = useData();
+  const { loads, drivers, settlements, companySettings } = useData();
   const [preset, setPreset] = useState<DatePreset>('this_month');
-  const [customRange, setCustomRange] = useState<DateRange>({
-    start: '2026-11-01',
-    end: '2026-11-10',
-  });
+  const [customRange, setCustomRange] = useState<DateRange>(() =>
+    getMonthRange(todayISO(companySettings.timezone || 'America/Chicago')),
+  );
   const range = getDateRangeFromPreset(preset, customRange);
 
   const eligible = getEligibleLoads(loads, undefined, range);

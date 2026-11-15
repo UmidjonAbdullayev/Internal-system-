@@ -1,6 +1,7 @@
 import { parseISO, getDay, format, startOfWeek, endOfWeek, subWeeks } from 'date-fns';
 import type {
   Driver,
+  DriverStatus,
   Load,
   DriverFee,
   OneTimeCharge,
@@ -11,6 +12,45 @@ import type {
 } from '@/types';
 import { roundMoney, isDateInRange, getWeekRange } from './utils';
 
+const TERMINAL_LOAD: Load['loadStatus'][] = ['Cancelled', 'Rejected', 'Completed', 'Delivered'];
+
+/** Active / assigned work from synced Relay trip buckets or load status. */
+export function getActiveLoadsForDriver(loads: Load[], driverId: string): Load[] {
+  return loads.filter((l) => {
+    if (l.driverId !== driverId) return false;
+    if (TERMINAL_LOAD.includes(l.loadStatus) || l.tripBucket === 'history') return false;
+    if (l.tripBucket === 'in_transit' || l.tripBucket === 'upcoming') return true;
+    return (
+      l.loadStatus === 'In Transit' ||
+      l.loadStatus === 'Dispatched' ||
+      l.loadStatus === 'Booked' ||
+      l.loadStatus === 'Available'
+    );
+  });
+}
+
+/**
+ * Live driver status from synced trip/load state.
+ * Preserves Inactive / Suspended / On Break when the driver has no active trip.
+ */
+export function deriveDriverStatus(driver: Driver, loads: Load[]): DriverStatus {
+  if (driver.status === 'Inactive' || driver.status === 'Suspended') {
+    return driver.status;
+  }
+  const active = getActiveLoadsForDriver(loads, driver.id);
+  if (active.length > 0) {
+    const inTransit = active.some(
+      (l) =>
+        l.tripBucket === 'in_transit' ||
+        l.loadStatus === 'In Transit' ||
+        l.loadStatus === 'Dispatched',
+    );
+    return inTransit || active.length > 0 ? 'On Load' : 'Available';
+  }
+  if (driver.status === 'On Break') return 'On Break';
+  return 'Available';
+}
+
 /** Loads that count toward driver earnings (History tab + completed/delivered). */
 export function isEligibleLoad(load: Load): boolean {
   return (
@@ -18,6 +58,31 @@ export function isEligibleLoad(load: Load): boolean {
     load.loadStatus === 'Delivered' ||
     load.tripBucket === 'history'
   );
+}
+
+/** Weekly roster: each eligible load with driver + pay for Gross Board. */
+export function getWeeklyDriverLoadPay(
+  loads: Load[],
+  drivers: Driver[],
+  range: DateRange,
+): { driver: Driver | null; load: Load; pay: number }[] {
+  const byId = new Map(drivers.map((d) => [d.id, d]));
+  return getEligibleLoads(loads, undefined, range)
+    .map((load) => ({
+      driver: load.driverId ? byId.get(load.driverId) ?? null : null,
+      load,
+      pay: getLoadFinalGross(load),
+    }))
+    .sort((a, b) => {
+      const an = a.driver
+        ? `${a.driver.lastName} ${a.driver.firstName}`
+        : a.load.driverNameRaw || 'zzz';
+      const bn = b.driver
+        ? `${b.driver.lastName} ${b.driver.firstName}`
+        : b.load.driverNameRaw || 'zzz';
+      if (an !== bn) return an.localeCompare(bn);
+      return a.load.deliveryDate.localeCompare(b.load.deliveryDate);
+    });
 }
 
 export function getLoadFinalGross(load: Load): number {
