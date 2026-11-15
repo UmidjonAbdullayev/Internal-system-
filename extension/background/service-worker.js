@@ -801,13 +801,32 @@ async function ingestCollection(data) {
     for (const load of data.loads || []) {
       if (!load.load_id || !isValidRelayLoadId(load.load_id)) continue;
       const prev = pendingLoads[load.load_id] || {};
-      pendingLoads[load.load_id] = {
+      const merged = {
         ...prev,
         ...Object.fromEntries(
           Object.entries(load).filter(([, v]) => v != null && v !== ''),
         ),
         observed_at: new Date().toISOString(),
       };
+      // Keep prior good places when this pass still has Unknown / money scraps
+      const badPlace = (v) =>
+        !v ||
+        /^unknown\b/i.test(String(v)) ||
+        /^\$/.test(String(v)) ||
+        /\$\s*[\d,]/.test(String(v)) ||
+        /^[,.]/.test(String(v)) ||
+        /^[a-z]/.test(String(v));
+      if (badPlace(merged.pickup_location) && prev.pickup_location && !badPlace(prev.pickup_location)) {
+        merged.pickup_location = prev.pickup_location;
+      }
+      if (
+        badPlace(merged.delivery_location) &&
+        prev.delivery_location &&
+        !badPlace(prev.delivery_location)
+      ) {
+        merged.delivery_location = prev.delivery_location;
+      }
+      pendingLoads[load.load_id] = merged;
       collected += 1;
     }
     const sectionLoads = data.loads || [];

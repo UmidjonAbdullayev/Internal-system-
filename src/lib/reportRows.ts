@@ -31,6 +31,27 @@ export function computeRpm(amazonPaid: number, mile: string): number {
   return roundMoney(amazonPaid / miles);
 }
 
+/**
+ * Sheet columns "PU Date" / "Del date" are city/state places — never miles, $, RPM, or Unknown.
+ */
+export function sanitizeReportLocation(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const s = String(raw).replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  if (/^unknown\b/i.test(s)) return '';
+  if (/^\$/.test(s) || /\$\s*[\d,]/.test(s)) return '';
+  if (/^\d[\d,]*\.?\d*\s*(mi|miles)?\s*$/i.test(s)) return '';
+  if (/^\/?Live$/i.test(s)) return '';
+  if (/^[,.]/.test(s) || /^[a-z]/.test(s)) return ''; // truncated scrap from Relay ellipsis
+  if (/^(Drop|Pickup|PU|Del|Spot|Vendor)$/i.test(s)) return '';
+  if (s.length < 3) return '';
+  return s.slice(0, 120);
+}
+
+export function isBadReportLocation(raw: string | null | undefined): boolean {
+  return !sanitizeReportLocation(raw);
+}
+
 export function parseMileNumber(mile: string): number | null {
   if (!mile || mile.trim().toUpperCase() === 'TONU') return null;
   const cleaned = mile.replace(',', '.').replace(/[^\d.-]/g, '');
@@ -102,8 +123,9 @@ export function buildReportFromLoad(
     driverName: driverNameForLoad(load, drivers),
     pickupDate: load.pickupDate || null,
     deliveryDate: load.deliveryDate || null,
-    puLocation: load.pickupLocation || '',
-    delLocation: load.deliveryLocation || '',
+    // Map place fields only — never mile / rate_gross / RPM into PU/Del columns
+    puLocation: sanitizeReportLocation(load.pickupLocation),
+    delLocation: sanitizeReportLocation(load.deliveryLocation),
     mile,
     amazonPaid,
     driverPaid: amazonPaid,

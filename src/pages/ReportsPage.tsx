@@ -24,6 +24,7 @@ import {
   formatSheetDate,
   groupReportsByWeek,
   reportInDateRange,
+  sanitizeReportLocation,
   weekLabelFromDate,
 } from '@/lib/reportRows';
 import type { DatePreset, DateRange, LoadReport } from '@/types';
@@ -161,8 +162,12 @@ function GroupRows({
           <td className="border border-border/60 px-2 py-1.5 text-center tabular-nums whitespace-nowrap">
             {formatSheetDate(r.deliveryDate)}
           </td>
-          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.puLocation}</td>
-          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.delLocation}</td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">
+            {sanitizeReportLocation(r.puLocation)}
+          </td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">
+            {sanitizeReportLocation(r.delLocation)}
+          </td>
           <td className="border border-border/60 px-2 py-1.5 text-right tabular-nums whitespace-nowrap">
             {r.mile}
           </td>
@@ -335,8 +340,8 @@ export function ReportsPage() {
         r.driverName,
         formatSheetDate(r.pickupDate),
         formatSheetDate(r.deliveryDate),
-        r.puLocation,
-        r.delLocation,
+        sanitizeReportLocation(r.puLocation),
+        sanitizeReportLocation(r.delLocation),
         r.mile,
         r.amazonPaid,
         r.driverPaid,

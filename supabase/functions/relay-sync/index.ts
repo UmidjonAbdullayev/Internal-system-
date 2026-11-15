@@ -89,6 +89,27 @@ function isCompleteLoad(load: LoadIn) {
   );
 }
 
+/** True when scrape left a placeholder or numeric/money scrap instead of a place. */
+function isBadPlace(raw: unknown): boolean {
+  if (raw == null) return true;
+  const s = String(raw).replace(/\s+/g, " ").trim();
+  if (!s || s.length < 3) return true;
+  if (/^unknown\b/i.test(s)) return true;
+  if (/^\$/.test(s) || /\$\s*[\d,]/.test(s)) return true;
+  if (/^\d[\d,]*\.?\d*\s*(mi|miles)?\s*$/i.test(s)) return true;
+  if (/^\/?Live$/i.test(s)) return true;
+  if (/^[,.]/.test(s) || /^[a-z]/.test(s)) return true;
+  return false;
+}
+
+function preferPlace(incoming: unknown, existing: unknown, fallback: string): string {
+  const next = incoming == null ? "" : String(incoming).trim();
+  const prev = existing == null ? "" : String(existing).trim();
+  if (!isBadPlace(next)) return next.slice(0, 120);
+  if (!isBadPlace(prev)) return prev.slice(0, 120);
+  return fallback;
+}
+
 const TERMINAL_STATUSES = new Set(["Completed", "Delivered", "Cancelled", "Rejected"]);
 
 /** Keep trip_bucket + load_status consistent so History never sticks as active. */
@@ -397,8 +418,17 @@ Deno.serve(async (req: Request) => {
         driver_name_raw: load.driver_name_raw ?? null,
         load_status: load.load_status,
         payment_status: load.payment_status || existing?.payment_status || "Not Received",
-        pickup_location: load.pickup_location,
-        delivery_location: load.delivery_location,
+        // Never clobber a real city/state with Unknown / $ scraps from a collapsed scrape
+        pickup_location: preferPlace(
+          load.pickup_location,
+          existing?.pickup_location,
+          "Unknown origin",
+        ),
+        delivery_location: preferPlace(
+          load.delivery_location,
+          existing?.delivery_location,
+          "Unknown destination",
+        ),
         pickup_date: load.pickup_date,
         delivery_date: load.delivery_date,
         trailer_id: load.trailer_id ?? null,
