@@ -149,41 +149,82 @@
     return Number.isFinite(n) ? Math.round(n * 10) / 10 : null;
   }
 
+  function isPlausibleRelayDate(iso) {
+    if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return false;
+    const [y, m, d] = iso.split('-').map(Number);
+    if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) {
+      return false;
+    }
+    const now = new Date();
+    const min = new Date(Date.UTC(now.getUTCFullYear() - 1, 0, 1));
+    const max = new Date(Date.UTC(now.getUTCFullYear() + 1, 11, 31));
+    return dt >= min && dt <= max;
+  }
+
+  function formatYmd(year, monthIndex, day) {
+    const y = Number(year);
+    const m = Number(monthIndex);
+    const d = Number(day);
+    if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
+    if (y < 2000 || y > 2100 || m < 0 || m > 11 || d < 1 || d > 31) return null;
+    const iso = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    return isPlausibleRelayDate(iso) ? iso : null;
+  }
+
+  /**
+   * Parse Relay schedule strings only. Never fall back to bare `new Date(s)` —
+   * that produced Dec 31 / 2044-12-31 / year-0450 from money, "Stop 1", miles.
+   * Two-digit years (12/31/44) are rejected.
+   */
   function parseDate(raw) {
     if (!raw) return null;
     const s = String(raw).trim();
-    const iso = s.match(/(\d{4}-\d{2}-\d{2})/);
-    if (iso) return iso[1];
+    if (!s || s.length > 120) return null;
+    if (/^\$/.test(s) || /\bmi\b/i.test(s) || /^T-[A-Z0-9]/i.test(s)) return null;
+
+    const iso = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+    if (iso && isPlausibleRelayDate(iso[1])) return iso[1];
+
+    const hasWeekday = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(s);
+    const hasTime = /\b\d{1,2}:\d{2}\b/.test(s);
 
     // Fri, Nov 13, 04:01 PST  OR  Nov 13, 2026
     let m = s.match(
       /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+([A-Za-z]+)\s+(\d{1,2})(?:,?\s*(\d{4}))?/i,
     );
     if (!m) {
-      // 13 Nov, 03:02 PST
-      m = s.match(/\b(\d{1,2})\s+([A-Za-z]+)(?:,?\s*(\d{4}))?/i);
-      if (m) m = [m[0], m[2], m[1], m[3]];
+      const dmy = s.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})(?:,?\s*(\d{4}))?(?:\s|,|$)/i);
+      if (dmy && MONTHS[String(dmy[2]).toLowerCase()] != null) {
+        m = [dmy[0], dmy[2], dmy[1], dmy[3]];
+      }
     }
     if (!m) {
-      m = s.match(/\b([A-Za-z]+)\s+(\d{1,2})(?:,?\s*(\d{4}))?/i);
+      const md = s.match(/\b([A-Za-z]{3,9})\s+(\d{1,2})(?:,?\s*(\d{4}))?(?:\s|,|$)/i);
+      if (md && MONTHS[String(md[1]).toLowerCase()] != null) m = md;
     }
     if (m) {
       const mon = MONTHS[String(m[1]).toLowerCase()];
       if (mon != null) {
-        const year = m[3] ? Number(m[3]) : new Date().getFullYear();
-        const day = String(m[2]).padStart(2, '0');
-        const mm = String(mon + 1).padStart(2, '0');
-        return `${year}-${mm}-${day}`;
+        const year = m[3] ? Number(m[3]) : null;
+        // Bare "Nov 20" / "Dec 31" (week headers) need weekday, time, or explicit year
+        if (year == null && !hasWeekday && !hasTime) return null;
+        return formatYmd(year ?? new Date().getFullYear(), mon, Number(m[2]));
       }
     }
 
-    const mdy = s.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+    // 4-digit year only — "12/31/44" must not become 2044-12-31
+    const mdy = s.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
     if (mdy) {
-      const year = mdy[3].length === 2 ? `20${mdy[3]}` : mdy[3];
-      return `${year}-${mdy[1].padStart(2, '0')}-${mdy[2].padStart(2, '0')}`;
+      const month = Number(mdy[1]);
+      const day = Number(mdy[2]);
+      const year = Number(mdy[3]);
+      if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+        return formatYmd(year, month - 1, day);
+      }
     }
-    const d = new Date(s);
-    return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+    return null;
   }
 
   function mapLoadStatus(raw) {
@@ -440,18 +481,31 @@
     const dates = dateHits.length ? dateHits : altDates;
 
     function cleanLoc(s) {
-      return String(s || '')
+      const cleaned = String(s || '')
         .replace(/\s+/g, ' ')
         .replace(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*.*$/i, '')
+        .replace(/^\$[\d,.]+$/, '')
         .trim()
         .slice(0, 120);
+      if (!cleaned || /^\$/.test(cleaned) || /^\/?Live$/i.test(cleaned)) return null;
+      if (/^\d[\d,]*\.?\d*$/.test(cleaned)) return null;
+      if (cleaned.length < 3) return null;
+      return cleaned;
     }
-    const pickupLoc = arrow
-      ? cleanLoc(arrow[1])
-      : extractLabeledValue(block, ['Pickup', 'Origin', 'From']);
-    const deliveryLoc = arrow
-      ? cleanLoc(arrow[2])
-      : extractLabeledValue(block, ['Delivery', 'Destination', 'To', 'Drop']);
+    // Prefer facility codes (e.g. APC2 → SBD3) over money/dash noise
+    const facilityArrow = block.match(
+      /\b([A-Z]{2,4}\d{1,2}[A-Z0-9]?)\b[^\n]{0,30}?(?:→|->|–)\s*\b([A-Z]{2,4}\d{1,2}[A-Z0-9]?)\b/,
+    );
+    const pickupLoc = facilityArrow
+      ? facilityArrow[1]
+      : arrow
+        ? cleanLoc(arrow[1])
+        : extractLabeledValue(block, ['Pickup', 'Origin', 'From']);
+    const deliveryLoc = facilityArrow
+      ? facilityArrow[2]
+      : arrow
+        ? cleanLoc(arrow[2])
+        : extractLabeledValue(block, ['Delivery', 'Destination', 'To', 'Drop']);
 
     const tripBucket = extras.trip_bucket || detectTripBucket();
     let status = inferStatusFromText(block);
@@ -463,18 +517,30 @@
 
     const statusBar = extras.status_bar || { state: null, stopIndex: null };
 
+    // Prefer timed weekday dates; ignore lone "Week of Nov 20" style headers when
+    // a real schedule line exists. Never trust unlabeled numeric fragments.
+    const timedDates = dates.filter((d) => /\d{1,2}:\d{2}/.test(d));
+    const scheduleDates = timedDates.length ? timedDates : dates;
+    const pickupDate = parseDate(
+      scheduleDates[0] ||
+        extractLabeledValue(block, ['Pickup date', 'Start date', 'Depart']),
+    );
+    const deliveryDate = parseDate(
+      scheduleDates[1] ||
+        scheduleDates[0] ||
+        extractLabeledValue(block, ['Delivery date', 'End date', 'Arrive']),
+    );
+
     return {
       load_id: String(loadId).trim(),
       amazon_ref_id: legId && legId !== String(loadId) ? legId : tripId || legId || null,
       parent_trip_id: parentTripId && String(loadId).toUpperCase() !== parentTripId ? parentTripId : parentTripId,
       load_status: status,
       payment_status: null,
-      pickup_location: pickupLoc,
-      delivery_location: deliveryLoc,
-      pickup_date: parseDate(dates[0] || extractLabeledValue(block, ['Pickup date', 'Start date', 'Arrival'])),
-      delivery_date: parseDate(
-        dates[1] || dates[0] || extractLabeledValue(block, ['Delivery date', 'End date', 'Departure']),
-      ),
+      pickup_location: cleanLoc(pickupLoc) || pickupLoc,
+      delivery_location: cleanLoc(deliveryLoc) || deliveryLoc,
+      pickup_date: pickupDate,
+      delivery_date: deliveryDate,
       trailer_id: normalizeTrailer(trailerRaw),
       tractor_id: tractorRaw ? String(tractorRaw).replace(/\s+/g, ' ').trim().slice(0, 40) : null,
       trailer_type: equipment,
@@ -815,9 +881,11 @@
    */
   async function expandAndEnrichLoad(load, opts = {}) {
     const {
-      expandDelayMs = 500,
-      collapseDelayMs = 180,
+      expandDelayMs = 700,
+      collapseDelayMs = 280,
+      expandJitterMs = 350,
       allowExpand = true,
+      softYield = true,
     } = opts;
 
     if (detailIsRich(load) && load.notes && /Late:|Stops:/.test(load.notes)) {
@@ -877,7 +945,8 @@
       }
     }
 
-    await sleep(expandDelayMs);
+    if (softYield) await yieldToUi();
+    await sleep(expandDelayMs, expandJitterMs);
 
     // Detail often mounts on the card or next sibling panel
     const scopes = [cardRoot, cardRoot.nextElementSibling, cardRoot.parentElement].filter(Boolean);
@@ -891,7 +960,7 @@
       if (detailIsRich(load)) break;
     }
 
-    await sleep(collapseDelayMs);
+    await sleep(collapseDelayMs, Math.min(120, expandJitterMs));
     try {
       const collapse =
         cardRoot.querySelector('[aria-expanded="true"]') ||
@@ -908,9 +977,11 @@
 
   async function enrichLoadsWithAutoExpand(loads, expandOpts = {}) {
     const {
-      maxExpand = 20,
-      expandDelayMs = 500,
-      collapseDelayMs = 180,
+      maxExpand = 8,
+      expandDelayMs = 700,
+      collapseDelayMs = 280,
+      expandJitterMs = 350,
+      softYield = true,
       scrapedMap = null,
     } = expandOpts;
 
@@ -926,9 +997,12 @@
       const { load, method } = await expandAndEnrichLoad(raw, {
         expandDelayMs,
         collapseDelayMs,
+        expandJitterMs,
+        softYield,
         allowExpand,
       });
       if (method === 'click_expand') expandCount += 1;
+      if (softYield && expandCount > 0 && expandCount % 2 === 0) await yieldToUi();
       if (prior && (!load.trailer_id || !load.tractor_id || !load.notes)) {
         load.trailer_id = load.trailer_id || prior.trailer_id || null;
         load.tractor_id = load.tractor_id || prior.tractor_id || null;
@@ -1110,24 +1184,198 @@
     return { loads, expanded, trip_bucket: forcedBucket || detectTripBucket() };
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  function sleep(ms, jitterMs = 0) {
+    const extra = jitterMs > 0 ? Math.floor(Math.random() * jitterMs) : 0;
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms) + extra));
+  }
+
+  function yieldToUi() {
+    return new Promise((resolve) => {
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => setTimeout(resolve, 0));
+      } else {
+        setTimeout(resolve, 0);
+      }
+    });
+  }
+
+  /**
+   * History is date-grouped; default filter often shows only the current week.
+   * Controls we look for (documented for PR A):
+   * - Buttons / tabs / menuitems / options: "This week", "Last week", "Previous week",
+   *   "Last 7 days", "Last 14 days", "Past week"
+   * - Combobox / listbox / select labeled Week / Date / Filter / Time period
+   * - Native <select> options with the same labels
+   * We scrape current week then prior week (or Last 14 days when that single control exists).
+   */
+  function findHistoryWeekControls() {
+    const labels = [
+      { id: 'this_week', re: /^(this\s*week|current\s*week)$/i },
+      { id: 'last_week', re: /^(last\s*week|previous\s*week|past\s*week)$/i },
+      { id: 'last_7_days', re: /^last\s*7\s*days$/i },
+      { id: 'last_14_days', re: /^last\s*14\s*days$/i },
+    ];
+    const nodes = [
+      ...document.querySelectorAll(
+        'button, [role="tab"], [role="menuitem"], [role="option"], [role="radio"], label, a, select option',
+      ),
+    ];
+    const found = [];
+    for (const label of labels) {
+      const el = nodes.find((n) => label.re.test((n.innerText || n.textContent || '').trim()));
+      if (el) found.push({ id: label.id, el: el.tagName === 'OPTION' ? el.parentElement : el, option: el.tagName === 'OPTION' ? el : null });
+    }
+    // Native selects with week-ish options
+    for (const sel of document.querySelectorAll('select')) {
+      const opts = [...sel.options];
+      for (const label of labels) {
+        const opt = opts.find((o) => label.re.test((o.textContent || '').trim()));
+        if (opt && !found.some((f) => f.id === label.id)) {
+          found.push({ id: label.id, el: sel, option: opt });
+        }
+      }
+    }
+    return found;
+  }
+
+  async function applyHistoryWeekControl(control) {
+    if (!control?.el) return false;
+    try {
+      if (control.option && control.el.tagName === 'SELECT') {
+        control.el.value = control.option.value;
+        control.el.dispatchEvent(new Event('change', { bubbles: true }));
+        control.el.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }
+      control.el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      return true;
+    } catch {
+      try {
+        control.el.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  /**
+   * On History: cover at least prior week + current week via filter controls.
+   * Returns { loads, weeks, expanded }.
+   */
+  async function collectHistoryWithWeekFilters(expandOpts = {}) {
+    const settle = expandOpts.historyWeekSettleMs ?? 1400;
+    const jitter = expandOpts.tabSwitchJitterMs ?? 500;
+    const scrapedMap = expandOpts.scrapedMap || (await getDetailScrapedMap());
+    let remainingExpand = expandOpts.maxExpand ?? 8;
+    let rowsExpanded = 0;
+    let merged = [];
+    const weeks = [];
+
+    const controls = findHistoryWeekControls();
+    const last14 = controls.find((c) => c.id === 'last_14_days');
+    const thisWeek = controls.find((c) => c.id === 'this_week' || c.id === 'last_7_days');
+    const lastWeek = controls.find((c) => c.id === 'last_week');
+
+    const plan = [];
+    if (last14) {
+      plan.push(last14);
+    } else {
+      if (thisWeek) plan.push(thisWeek);
+      if (lastWeek) plan.push(lastWeek);
+    }
+    // Always scrape whatever is visible once; then re-scrape after each filter change
+    if (!plan.length) {
+      const result = await collectVisibleTrips('history', {
+        ...expandOpts,
+        maxExpand: remainingExpand,
+        scrapedMap,
+      });
+      weeks.push('visible_default');
+      return {
+        loads: result.loads.map((l) => ({ ...l, trip_bucket: 'history', history_week: 'visible_default' })),
+        weeks,
+        expanded: result.expanded || 0,
+        filters_found: controls.map((c) => c.id),
+      };
+    }
+
+    for (const control of plan) {
+      await applyHistoryWeekControl(control);
+      await sleep(settle, jitter);
+      await yieldToUi();
+      const result = await collectVisibleTrips('history', {
+        ...expandOpts,
+        maxExpand: remainingExpand,
+        scrapedMap,
+      });
+      const tagged = result.loads.map((l) => ({
+        ...l,
+        trip_bucket: 'history',
+        history_week: control.id,
+      }));
+      remainingExpand = Math.max(0, remainingExpand - (result.expanded || 0));
+      rowsExpanded += result.expanded || 0;
+      weeks.push(control.id);
+      merged = mergeLoads(merged, tagged);
+      for (const load of tagged) {
+        if (!detailIsRich(load)) continue;
+        scrapedMap[load.load_id] = {
+          at: Date.now(),
+          hasTrailer: Boolean(load.trailer_id),
+          hasTractor: Boolean(load.tractor_id),
+        };
+      }
+    }
+
+    // Restore current/this week so the user is not left on last week
+    if (thisWeek && plan.some((p) => p.id === 'last_week')) {
+      await applyHistoryWeekControl(thisWeek);
+      await sleep(400, 120);
+    }
+
+    return {
+      loads: merged,
+      weeks,
+      expanded: rowsExpanded,
+      filters_found: controls.map((c) => c.id),
+    };
   }
 
   /**
    * Prefer one Chrome tab: click Upcoming / In Transit / History in-page if Relay
    * loads list data on tab click. Falls back to current tab only when tabs missing.
-   * Auto-expands rows (rate-limited) for trailer/tractor/stop detail.
+   * History also walks week filters (prior + current). Soft yields between steps.
    */
   async function collectAllTripBuckets(expandOpts = {}) {
-    const maxExpand = expandOpts.maxExpand ?? 20;
+    const maxExpand = expandOpts.maxExpand ?? 8;
     const scrapedMap = expandOpts.scrapedMap || (await getDetailScrapedMap());
+    const tabDelay = expandOpts.tabSwitchDelayMs ?? 1100;
+    const tabJitter = expandOpts.tabSwitchJitterMs ?? 500;
+    const doHistoryWeeks = expandOpts.historyWeeks !== false;
     const tabs = findTripTabButtons();
     if (tabs.length < 2) {
+      const bucket = detectTripBucket();
+      if (bucket === 'history' && doHistoryWeeks) {
+        const hist = await collectHistoryWithWeekFilters({
+          ...expandOpts,
+          maxExpand,
+          scrapedMap,
+        });
+        return {
+          loads: hist.loads,
+          trip_buckets_scanned: ['history'],
+          history_weeks_scanned: hist.weeks,
+          history_filters_found: hist.filters_found,
+          auto_tab_switch: false,
+          rows_expanded: hist.expanded,
+        };
+      }
       const result = await collectVisibleTrips(null, { ...expandOpts, maxExpand, scrapedMap });
       return {
         loads: result.loads,
-        trip_buckets_scanned: [detectTripBucket()].filter(Boolean),
+        trip_buckets_scanned: [bucket].filter(Boolean),
+        history_weeks_scanned: [],
         auto_tab_switch: false,
         rows_expanded: result.expanded,
       };
@@ -1143,14 +1391,33 @@
     const scanned = [];
     let remainingExpand = maxExpand;
     let rowsExpanded = 0;
+    let historyWeeks = [];
+    let historyFilters = [];
 
     for (const tab of tabs) {
       try {
         tab.el.click();
-        await sleep(900);
+        await sleep(tabDelay, tabJitter);
+        await yieldToUi();
       } catch {
         /* continue with whatever is visible */
       }
+
+      if (tab.bucket === 'history' && doHistoryWeeks) {
+        const hist = await collectHistoryWithWeekFilters({
+          ...expandOpts,
+          maxExpand: remainingExpand,
+          scrapedMap,
+        });
+        remainingExpand = Math.max(0, remainingExpand - (hist.expanded || 0));
+        rowsExpanded += hist.expanded || 0;
+        scanned.push(tab.bucket);
+        historyWeeks = hist.weeks;
+        historyFilters = hist.filters_found || [];
+        merged = mergeLoads(merged, hist.loads);
+        continue;
+      }
+
       const result = await collectVisibleTrips(tab.bucket, {
         ...expandOpts,
         maxExpand: remainingExpand,
@@ -1177,7 +1444,7 @@
     if (activeEl) {
       try {
         activeEl.click();
-        await sleep(400);
+        await sleep(400, 120);
       } catch {
         /* ignore restore errors */
       }
@@ -1186,6 +1453,8 @@
     return {
       loads: merged,
       trip_buckets_scanned: scanned,
+      history_weeks_scanned: historyWeeks,
+      history_filters_found: historyFilters,
       auto_tab_switch: true,
       rows_expanded: rowsExpanded,
     };
@@ -1235,17 +1504,31 @@
     if (msg?.type === 'RELAY_COLLECT') {
       (async () => {
         try {
+          if (msg?.skipIfHidden !== false && document.hidden) {
+            sendResponse({ ok: false, skippedHidden: true, error: 'Tab hidden — soft skip' });
+            return;
+          }
+
           let section = detectSection();
           // Hard override: Trips board UI / URL must never stay stuck as load_detail
           if (section !== 'payments' && (isTripsBoardUrl() || isTripsBoardDom())) {
             section = 'tours';
           }
+
+          const expandOpts = {
+            maxExpand: msg?.maxExpand ?? 8,
+            expandDelayMs: msg?.expandDelayMs ?? 700,
+            collapseDelayMs: msg?.collapseDelayMs ?? 280,
+            expandJitterMs: msg?.expandJitterMs ?? 350,
+            tabSwitchDelayMs: msg?.tabSwitchDelayMs ?? 1100,
+            tabSwitchJitterMs: msg?.tabSwitchJitterMs ?? 500,
+            historyWeekSettleMs: msg?.historyWeekSettleMs ?? 1400,
+            historyWeeks: msg?.historyWeeks !== false,
+            softYield: msg?.softYield !== false,
+          };
+
           if (section === 'tours' && msg?.allTripTabs !== false) {
-            const multi = await collectAllTripBuckets({
-              maxExpand: msg?.maxExpand ?? 20,
-              expandDelayMs: msg?.expandDelayMs ?? 500,
-              collapseDelayMs: msg?.collapseDelayMs ?? 180,
-            });
+            const multi = await collectAllTripBuckets(expandOpts);
             sendResponse({
               ok: true,
               data: {
@@ -1253,6 +1536,8 @@
                 loads: multi.loads,
                 trip_bucket: detectTripBucket(),
                 trip_buckets_scanned: multi.trip_buckets_scanned,
+                history_weeks_scanned: multi.history_weeks_scanned || [],
+                history_filters_found: multi.history_filters_found || [],
                 auto_tab_switch: multi.auto_tab_switch,
                 rows_expanded: multi.rows_expanded || 0,
                 detail_detected: multi.loads.some((l) => l.trailer_id || l.tractor_id),
@@ -1265,11 +1550,7 @@
           }
           // Even on sync single-tab path, force board scrape when mislabeled
           if (section === 'load_detail' && (isTripsBoardUrl() || isTripsBoardDom())) {
-            const result = await collectVisibleTrips(null, {
-              maxExpand: msg?.maxExpand ?? 20,
-              expandDelayMs: msg?.expandDelayMs ?? 500,
-              collapseDelayMs: msg?.collapseDelayMs ?? 180,
-            });
+            const result = await collectVisibleTrips(null, expandOpts);
             sendResponse({
               ok: true,
               data: {

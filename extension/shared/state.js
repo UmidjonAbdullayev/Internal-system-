@@ -20,11 +20,26 @@ const DEFAULT_STATE = {
   detailScraped: {},
   extensionApiKey: '',
   clientId: null,
+  /** Soft-sync progress (popup only — never hijacks the Relay page). */
+  syncProgress: {
+    phase: 'idle',
+    detail: '',
+    percent: 0,
+    startedAt: null,
+    lastDurationMs: null,
+    typicalSeconds: '45–90',
+    historyWeeks: [],
+  },
+  lastPaymentsScanAt: null,
+  lastTripsScanAt: null,
+  scanInProgress: false,
 };
 
 export async function getState() {
   const stored = await chrome.storage.local.get(['relayState']);
-  return { ...DEFAULT_STATE, ...(stored.relayState || {}) };
+  const merged = { ...DEFAULT_STATE, ...(stored.relayState || {}) };
+  merged.syncProgress = { ...DEFAULT_STATE.syncProgress, ...(merged.syncProgress || {}) };
+  return merged;
 }
 
 export async function setState(patch) {
@@ -32,6 +47,9 @@ export async function setState(patch) {
   const next = { ...current, ...patch };
   if (patch.sections) {
     next.sections = { ...current.sections, ...patch.sections };
+  }
+  if (patch.syncProgress) {
+    next.syncProgress = { ...current.syncProgress, ...patch.syncProgress };
   }
   await chrome.storage.local.set({ relayState: next });
   return next;

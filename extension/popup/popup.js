@@ -28,6 +28,24 @@ function render(state) {
   $('inserted').textContent = String(state.recordsInserted || 0);
   $('errors').textContent = String((state.syncErrors || []).length);
 
+  const prog = state.syncProgress || {};
+  const phase = prog.phase || 'idle';
+  const pct = Math.max(0, Math.min(100, Number(prog.percent) || 0));
+  $('sync-phase').textContent = state.scanInProgress ? `${phase}…` : phase;
+  $('sync-bar-fill').style.width = `${state.scanInProgress || pct ? pct : 0}%`;
+  const durationNote =
+    prog.lastDurationMs != null
+      ? ` Last pass ${Math.round(prog.lastDurationMs / 1000)}s.`
+      : '';
+  const weeks = (prog.historyWeeks || []).length
+    ? ` History weeks: ${prog.historyWeeks.join(', ')}.`
+    : '';
+  $('sync-detail').textContent =
+    (prog.detail ||
+      `Typical full pass ${prog.typicalSeconds || '45–90'}s. Keep using Relay while sync runs.`) +
+    durationNote +
+    weeks;
+
   $('sections').innerHTML = SECTIONS.map((section) => {
     const st = state.sections?.[section.id]?.state || 'Not checked';
     return `<li><span>${section.label}</span><span class="badge ${badgeClass(st)}">${st}</span></li>`;
