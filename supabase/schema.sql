@@ -88,6 +88,35 @@ create index if not exists loads_trip_bucket_idx on public.loads(trip_bucket);
 create index if not exists loads_parent_trip_idx on public.loads(parent_trip_id);
 create index if not exists loads_tractor_idx on public.loads(tractor_id);
 
+-- load_reports (ops spreadsheet)
+create table if not exists public.load_reports (
+  id uuid primary key default gen_random_uuid(),
+  load_uuid uuid references public.loads(id) on delete set null,
+  broker text not null default 'Amazon',
+  trip text not null default '',
+  load_ids text not null default '',
+  driver_name text not null default '',
+  pickup_date date,
+  delivery_date date,
+  pu_location text not null default '',
+  del_location text not null default '',
+  mile text not null default '',
+  amazon_paid numeric(12,2) not null default 0,
+  driver_paid numeric(12,2) not null default 0,
+  rpm numeric(12,4) not null default 0,
+  comment text not null default '',
+  dispatch text not null default '',
+  source text not null default 'sync' check (source in ('sync', 'auto', 'manual')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create unique index if not exists load_reports_load_uuid_uidx
+  on public.load_reports (load_uuid)
+  where load_uuid is not null;
+create index if not exists load_reports_pickup_date_idx on public.load_reports(pickup_date);
+create index if not exists load_reports_delivery_date_idx on public.load_reports(delivery_date);
+
 -- driver_fees
 create table if not exists public.driver_fees (
   id uuid primary key default gen_random_uuid(),
@@ -273,6 +302,7 @@ create index if not exists telegram_notif_history_chat_idx
 alter table public.users enable row level security;
 alter table public.drivers enable row level security;
 alter table public.loads enable row level security;
+alter table public.load_reports enable row level security;
 alter table public.driver_fees enable row level security;
 alter table public.one_time_charges enable row level security;
 alter table public.settlements enable row level security;
@@ -289,6 +319,9 @@ do $$
 begin
   if not exists (select 1 from pg_policies where schemaname='public' and tablename='loads' and policyname='authenticated_read_loads') then
     create policy authenticated_read_loads on public.loads for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='load_reports' and policyname='authenticated_read_load_reports') then
+    create policy authenticated_read_load_reports on public.load_reports for select to authenticated using (true);
   end if;
   if not exists (select 1 from pg_policies where schemaname='public' and tablename='drivers' and policyname='authenticated_read_drivers') then
     create policy authenticated_read_drivers on public.drivers for select to authenticated using (true);

@@ -1,146 +1,371 @@
-import { useMemo, useState } from 'react';
-import { Download, FileSpreadsheet } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 import {
-  BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
-} from 'recharts';
-import { format, parseISO } from 'date-fns';
+  Download,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { DateRangeFilter } from '@/components/ui/DateRangeFilter';
-import { KpiCard } from '@/components/ui/KpiCard';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { Modal, ConfirmDialog } from '@/components/ui/Modal';
+import { Field, Input, Select } from '@/components/ui/Input';
 import {
-  getFleetGross,
-  getEligibleLoads,
-  dailyRevenueSeries,
-  topDriversByGross,
-  groupLoadsByStatus,
-  getMonthRange,
-} from '@/lib/calculations';
-import {
-  formatCurrency,
-  formatDate,
   downloadCSV,
+  formatCurrency,
   getDateRangeFromPreset,
-  getDriverFullName,
   todayISO,
 } from '@/lib/utils';
-import type { DatePreset, DateRange } from '@/types';
+import {
+  computeRpm,
+  formatSheetDate,
+  groupReportsByWeek,
+  reportInDateRange,
+  weekLabelFromDate,
+} from '@/lib/reportRows';
+import type { DatePreset, DateRange, LoadReport } from '@/types';
 import { toast } from 'sonner';
 
+const REPORT_HEADERS = [
+  'Broker',
+  'Trip',
+  'Load',
+  'Driver name',
+  'Pick up',
+  'Delivery',
+  'PU location',
+  'Del location',
+  'Mile',
+  'Amazon Paid',
+  'Driver Paid',
+  'RPM',
+  'Comment',
+  'Dispatch',
+] as const;
+
+type ReportForm = {
+  broker: string;
+  trip: string;
+  loadIds: string;
+  driverName: string;
+  pickupDate: string;
+  deliveryDate: string;
+  puLocation: string;
+  delLocation: string;
+  mile: string;
+  amazonPaid: string;
+  driverPaid: string;
+  rpm: string;
+  comment: string;
+  dispatch: string;
+};
+
+const emptyForm = (): ReportForm => ({
+  broker: 'Amazon',
+  trip: '',
+  loadIds: '',
+  driverName: '',
+  pickupDate: '',
+  deliveryDate: '',
+  puLocation: '',
+  delLocation: '',
+  mile: '',
+  amazonPaid: '',
+  driverPaid: '',
+  rpm: '',
+  comment: '',
+  dispatch: '',
+});
+
+function formFromReport(r: LoadReport): ReportForm {
+  return {
+    broker: r.broker,
+    trip: r.trip,
+    loadIds: r.loadIds,
+    driverName: r.driverName,
+    pickupDate: r.pickupDate || '',
+    deliveryDate: r.deliveryDate || '',
+    puLocation: r.puLocation,
+    delLocation: r.delLocation,
+    mile: r.mile,
+    amazonPaid: String(r.amazonPaid ?? ''),
+    driverPaid: String(r.driverPaid ?? ''),
+    rpm: String(r.rpm ?? ''),
+    comment: r.comment,
+    dispatch: r.dispatch,
+  };
+}
+
+function formToPatch(form: ReportForm): Omit<LoadReport, 'id' | 'createdAt' | 'updatedAt' | 'loadUuid' | 'source'> {
+  const amazonPaid = Number(form.amazonPaid) || 0;
+  const driverPaid = Number(form.driverPaid) || 0;
+  const mile = form.mile.trim();
+  const rpmRaw = form.rpm.trim();
+  const rpm = rpmRaw !== '' ? Number(rpmRaw) || 0 : computeRpm(amazonPaid, mile);
+  return {
+    broker: form.broker.trim() || 'Amazon',
+    trip: form.trip.trim(),
+    loadIds: form.loadIds.trim(),
+    driverName: form.driverName.trim(),
+    pickupDate: form.pickupDate || null,
+    deliveryDate: form.deliveryDate || null,
+    puLocation: form.puLocation.trim(),
+    delLocation: form.delLocation.trim(),
+    mile,
+    amazonPaid,
+    driverPaid,
+    rpm,
+    comment:
+      form.comment.trim() ||
+      weekLabelFromDate(form.pickupDate || form.deliveryDate),
+    dispatch: form.dispatch.trim(),
+  };
+}
+
+function GroupRows({
+  week,
+  rows,
+  onEdit,
+  onDelete,
+}: {
+  week: string;
+  rows: LoadReport[];
+  onEdit: (r: LoadReport) => void;
+  onDelete: (id: string) => void;
+}) {
+  return (
+    <>
+      <tr className="bg-secondary text-white">
+        <td
+          colSpan={REPORT_HEADERS.length + 1}
+          className="px-2 py-1.5 text-xs font-semibold tracking-wide"
+        >
+          {week}
+        </td>
+      </tr>
+      {rows.map((r) => (
+        <tr
+          key={r.id}
+          className="border-b border-border/80 hover:bg-bg/80 odd:bg-white even:bg-slate-50/60"
+        >
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.broker}</td>
+          <td className="border border-border/60 px-2 py-1.5 font-mono whitespace-nowrap">{r.trip}</td>
+          <td className="border border-border/60 px-2 py-1.5 font-mono whitespace-nowrap">{r.loadIds}</td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.driverName}</td>
+          <td className="border border-border/60 px-2 py-1.5 text-center tabular-nums whitespace-nowrap">
+            {formatSheetDate(r.pickupDate)}
+          </td>
+          <td className="border border-border/60 px-2 py-1.5 text-center tabular-nums whitespace-nowrap">
+            {formatSheetDate(r.deliveryDate)}
+          </td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.puLocation}</td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.delLocation}</td>
+          <td className="border border-border/60 px-2 py-1.5 text-right tabular-nums whitespace-nowrap">
+            {r.mile}
+          </td>
+          <td className="border border-border/60 px-2 py-1.5 text-right tabular-nums whitespace-nowrap">
+            {formatCurrency(r.amazonPaid)}
+          </td>
+          <td className="border border-border/60 px-2 py-1.5 text-right tabular-nums whitespace-nowrap">
+            {formatCurrency(r.driverPaid)}
+          </td>
+          <td className="border border-border/60 px-2 py-1.5 text-right tabular-nums whitespace-nowrap">
+            {formatCurrency(r.rpm)}
+          </td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.comment}</td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.dispatch}</td>
+          <td className="border border-border/60 px-1.5 py-1">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border bg-white text-text-secondary hover:border-primary hover:text-primary"
+                onClick={() => onEdit(r)}
+                aria-label="Edit row"
+                title="Edit"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border bg-white text-text-secondary hover:border-danger hover:text-danger"
+                onClick={() => onDelete(r.id)}
+                aria-label="Delete row"
+                title="Delete"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </td>
+        </tr>
+      ))}
+    </>
+  );
+}
+
 export function ReportsPage() {
-  const { loads, drivers, settlements, companySettings } = useData();
-  const [preset, setPreset] = useState<DatePreset>('this_month');
+  const {
+    loadReports,
+    drivers,
+    companySettings,
+    dataReady,
+    addLoadReport,
+    updateLoadReport,
+    deleteLoadReport,
+    syncLoadReportsForRange,
+  } = useData();
+
+  const tz = companySettings.timezone || 'America/Chicago';
+  const today = todayISO(tz);
+  const [preset, setPreset] = useState<DatePreset>('this_week');
   const [customRange, setCustomRange] = useState<DateRange>(() =>
-    getMonthRange(todayISO(companySettings.timezone || 'America/Chicago')),
+    getDateRangeFromPreset('this_week', undefined, today),
   );
-  const range = getDateRangeFromPreset(preset, customRange);
+  const range = getDateRangeFromPreset(preset, customRange, today);
 
-  const eligible = getEligibleLoads(loads, undefined, range);
-  const fleetGross = getFleetGross(loads, range);
-  const avgPerLoad = eligible.length ? fleetGross / eligible.length : 0;
-  const statusDist = groupLoadsByStatus(
-    loads.filter((l) => l.pickupDate >= range.start && l.pickupDate <= range.end)
-  );
-  const completionRate = (() => {
-    const total = Object.values(statusDist).reduce((a, b) => a + b, 0);
-    const completed = (statusDist['Completed'] ?? 0) + (statusDist['Delivered'] ?? 0);
-    return total ? (completed / total) * 100 : 0;
-  })();
+  const [syncing, setSyncing] = useState(false);
+  const [didAutoSync, setDidAutoSync] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editing, setEditing] = useState<LoadReport | null>(null);
+  const [form, setForm] = useState<ReportForm>(emptyForm);
+  const [deleteId, setDeleteId] = useState<string | null>(null);
 
-  const daily = dailyRevenueSeries(loads, range);
-  const topDrivers = topDriversByGross(drivers, loads, range, 10);
-
-  const periodSettlements = settlements.filter(
-    (s) => s.weekStart >= range.start && s.weekStart <= range.end
-  );
-  const totalDeductions = periodSettlements.reduce((s, x) => s + x.totalDeductions, 0);
-  const totalNet = periodSettlements.reduce((s, x) => s + x.netPayable, 0);
-  const outstanding = periodSettlements.reduce(
-    (s, x) => s + Math.max(0, x.netPayable - x.amountPaid),
-    0
-  );
-
-  const deductionByDriver = useMemo(() => {
-    const map = new Map<string, { name: string; deductions: number; net: number; gross: number }>();
-    for (const s of periodSettlements) {
-      const d = drivers.find((x) => x.id === s.driverId);
-      if (!d) continue;
-      const name = getDriverFullName(d.firstName, d.lastName);
-      const cur = map.get(s.driverId) ?? { name, deductions: 0, net: 0, gross: 0 };
-      cur.deductions += s.totalDeductions;
-      cur.net += s.netPayable;
-      cur.gross += s.weeklyGross;
-      map.set(s.driverId, cur);
+  const dispatchOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const r of loadReports) {
+      if (r.dispatch.trim()) set.add(r.dispatch.trim());
     }
-    return Array.from(map.values()).sort((a, b) => b.gross - a.gross);
-  }, [periodSettlements, drivers]);
+    for (const name of ['Khalid', 'David', 'Connor']) set.add(name);
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [loadReports]);
 
-  const exportFleet = () => {
-    downloadCSV(
-      'fleet-revenue-report.csv',
-      ['Date', 'Gross Revenue'],
-      daily.map((d) => [d.date, d.gross])
+  const rowsInRange = useMemo(
+    () =>
+      loadReports.filter((r) =>
+        reportInDateRange(r, range.start, range.end),
+      ),
+    [loadReports, range.end, range.start],
+  );
+
+  const groups = useMemo(() => groupReportsByWeek(rowsInRange), [rowsInRange]);
+
+  // Auto-sync missing loads into reports once data is ready for this week view
+  useEffect(() => {
+    if (!dataReady || didAutoSync) return;
+    setDidAutoSync(true);
+    setSyncing(true);
+    void syncLoadReportsForRange(range.start, range.end, { quiet: true }).finally(() =>
+      setSyncing(false),
     );
-    toast.success('Fleet revenue exported');
+    // only on first ready — user can Update manually afterward
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataReady]);
+
+  const openCreate = () => {
+    setEditing(null);
+    const base = emptyForm();
+    base.comment = weekLabelFromDate(range.start);
+    setForm(base);
+    setEditOpen(true);
   };
 
-  const exportDrivers = () => {
-    downloadCSV(
-      'driver-comparison.csv',
-      ['Driver', 'Gross', 'Loads', 'Avg/Load', 'Deductions', 'Net'],
-      topDrivers.map((t) => {
-        const ded = deductionByDriver.find((d) => d.name === getDriverFullName(t.driver.firstName, t.driver.lastName));
-        return [
-          getDriverFullName(t.driver.firstName, t.driver.lastName),
-          t.gross,
-          t.loads,
-          t.avg,
-          ded?.deductions ?? 0,
-          ded?.net ?? 0,
-        ];
-      })
-    );
-    toast.success('Driver comparison exported');
+  const openEdit = (row: LoadReport) => {
+    setEditing(row);
+    setForm(formFromReport(row));
+    setEditOpen(true);
   };
 
-  const exportPayments = () => {
+  const saveForm = () => {
+    const patch = formToPatch(form);
+    if (!patch.loadIds && !patch.trip) {
+      toast.error('Load or Trip is required');
+      return;
+    }
+    if (editing) {
+      updateLoadReport(editing.id, patch);
+    } else {
+      addLoadReport({
+        ...patch,
+        loadUuid: null,
+        source: 'manual',
+      });
+    }
+    setEditOpen(false);
+    setEditing(null);
+  };
+
+  const onAmazonOrMileChange = (next: Partial<ReportForm>) => {
+    setForm((prev) => {
+      const merged = { ...prev, ...next };
+      const amazon = Number(merged.amazonPaid) || 0;
+      if (next.amazonPaid != null || next.mile != null) {
+        merged.rpm = String(computeRpm(amazon, merged.mile) || '');
+        if (next.amazonPaid != null && !merged.driverPaid) {
+          merged.driverPaid = merged.amazonPaid;
+        }
+      }
+      return merged;
+    });
+  };
+
+  const handleUpdate = async () => {
+    setSyncing(true);
+    try {
+      await syncLoadReportsForRange(range.start, range.end);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleDownload = () => {
+    if (!rowsInRange.length) {
+      toast.error('No rows in this range to download');
+      return;
+    }
+    const sorted = groups.flatMap((g) => g.rows);
     downloadCSV(
-      'payment-history.csv',
-      ['Driver', 'Week Start', 'Gross', 'Deductions', 'Net', 'Paid', 'Balance', 'Status'],
-      periodSettlements.map((s) => {
-        const d = drivers.find((x) => x.id === s.driverId);
-        return [
-          d ? getDriverFullName(d.firstName, d.lastName) : s.driverId,
-          s.weekStart,
-          s.weeklyGross,
-          s.totalDeductions,
-          s.netPayable,
-          s.amountPaid,
-          s.netPayable - s.amountPaid,
-          s.status,
-        ];
-      })
+      `ops-report_${range.start}_${range.end}.csv`,
+      [...REPORT_HEADERS],
+      sorted.map((r) => [
+        r.broker,
+        r.trip,
+        r.loadIds,
+        r.driverName,
+        formatSheetDate(r.pickupDate),
+        formatSheetDate(r.deliveryDate),
+        r.puLocation,
+        r.delLocation,
+        r.mile,
+        r.amazonPaid,
+        r.driverPaid,
+        r.rpm,
+        r.comment,
+        r.dispatch,
+      ]),
     );
-    toast.success('Payment history exported');
+    toast.success('Report downloaded');
   };
 
   return (
     <div>
       <PageHeader
-        title="Reports & Analytics"
-        subtitle="Fleet revenue, driver comparisons, and payment analytics"
+        title="Reports"
+        subtitle={`Ops sheet · ${range.start} → ${range.end} (${tz})`}
         actions={
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={exportFleet}>
-              <Download className="h-4 w-4" /> Fleet CSV
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={handleUpdate} disabled={syncing}>
+              <RefreshCw className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} />
+              Update
             </Button>
-            <Button variant="outline" size="sm" onClick={exportDrivers}>
-              <FileSpreadsheet className="h-4 w-4" /> Drivers CSV
+            <Button variant="outline" size="sm" onClick={handleDownload}>
+              <Download className="h-4 w-4" />
+              Download
             </Button>
-            <Button variant="outline" size="sm" onClick={exportPayments}>
-              <Download className="h-4 w-4" /> Payments CSV
+            <Button size="sm" onClick={openCreate}>
+              <Plus className="h-4 w-4" />
+              Add row
             </Button>
           </div>
         }
@@ -151,139 +376,217 @@ export function ReportsPage() {
         onPresetChange={setPreset}
         customRange={customRange}
         onCustomRangeChange={setCustomRange}
-        className="mb-5"
+        className="mb-4"
       />
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6 mb-5">
-        <KpiCard title="Fleet Revenue" value={fleetGross} highlight />
-        <KpiCard title="Avg Revenue / Load" value={avgPerLoad} accent="info" />
-        <KpiCard title="Completed Loads" value={eligible.length} format="number" accent="success" />
-        <KpiCard title="Completion Rate" value={Math.round(completionRate)} format="number" subtitle={`${completionRate.toFixed(1)}%`} accent="success" />
-        <KpiCard title="Total Deductions" value={totalDeductions} accent="warning" />
-        <KpiCard title="Outstanding Balances" value={outstanding} accent="danger" />
+      <div className="mb-3 flex flex-wrap items-center gap-3 text-xs text-text-secondary">
+        <span>
+          <strong className="text-text">{rowsInRange.length}</strong> rows
+        </span>
+        <span>·</span>
+        <span>
+          Amazon{' '}
+          <strong className="text-text">
+            {formatCurrency(rowsInRange.reduce((s, r) => s + r.amazonPaid, 0))}
+          </strong>
+        </span>
+        <span>·</span>
+        <span>
+          Driver{' '}
+          <strong className="text-text">
+            {formatCurrency(rowsInRange.reduce((s, r) => s + r.driverPaid, 0))}
+          </strong>
+        </span>
+        <span className="text-text-secondary/80">
+          · {drivers.length} drivers synced
+        </span>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2 mb-5">
-        <Card>
-          <CardHeader>
-            <CardTitle>Daily Fleet Revenue</CardTitle>
-          </CardHeader>
-          <CardContent className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={daily}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
-                <XAxis dataKey="date" tickFormatter={(v) => format(parseISO(v), 'M/d')} tick={{ fontSize: 11 }} />
-                <YAxis tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`} tick={{ fontSize: 11 }} />
-                <Tooltip formatter={(v) => formatCurrency(Number(v ?? 0))} labelFormatter={(l) => formatDate(String(l))} />
-                <Line type="monotone" dataKey="gross" stroke="#174A8B" strokeWidth={2} name="Gross" />
-              </LineChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
+      {!rowsInRange.length ? (
+        <EmptyState
+          title="No report rows for this range"
+          description="Use Update to pull synced Relay tours, or Quick Add / Add row to create entries."
+          actionLabel={syncing ? 'Syncing…' : 'Sync from loads'}
+          onAction={() => {
+            if (!syncing) void handleUpdate();
+          }}
+        />
+      ) : (
+        <div className="overflow-x-auto rounded-lg border border-border bg-white shadow-sm">
+          <table className="min-w-[1200px] w-full border-collapse text-[11px] leading-tight">
+            <thead>
+              <tr className="bg-primary text-white">
+                {REPORT_HEADERS.map((h) => (
+                  <th
+                    key={h}
+                    className="whitespace-nowrap border border-primary-dark/40 px-2 py-2 text-left font-semibold"
+                  >
+                    {h}
+                  </th>
+                ))}
+                <th className="whitespace-nowrap border border-primary-dark/40 px-2 py-2 text-left font-semibold w-20">
+                  Actions
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {groups.map((group) => (
+                <GroupRows
+                  key={`week-${group.week}-${group.rows[0]?.id ?? 'x'}`}
+                  week={group.week}
+                  rows={group.rows}
+                  onEdit={openEdit}
+                  onDelete={setDeleteId}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Driver Gross Comparison</CardTitle>
-          </CardHeader>
-          <CardContent className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={topDrivers.map((t) => ({
-                name: t.driver.firstName,
-                gross: t.gross,
-              }))}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
-                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                <YAxis tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`} tick={{ fontSize: 11 }} />
-                <Tooltip formatter={(v) => formatCurrency(Number(v ?? 0))} />
-                <Bar dataKey="gross" fill="#2878D0" radius={[4, 4, 0, 0]} name="Gross" />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-      </div>
+      <Modal
+        open={editOpen}
+        onClose={() => setEditOpen(false)}
+        title={editing ? 'Edit report row' : 'Add report row'}
+        size="xl"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setEditOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={saveForm}>{editing ? 'Save' : 'Add'}</Button>
+          </>
+        }
+      >
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <Field label="Broker">
+            <Input
+              value={form.broker}
+              onChange={(e) => setForm({ ...form, broker: e.target.value })}
+            />
+          </Field>
+          <Field label="Trip">
+            <Input
+              value={form.trip}
+              onChange={(e) => setForm({ ...form, trip: e.target.value })}
+              placeholder="T-…"
+            />
+          </Field>
+          <Field label="Load">
+            <Input
+              value={form.loadIds}
+              onChange={(e) => setForm({ ...form, loadIds: e.target.value })}
+            />
+          </Field>
+          <Field label="Driver name">
+            <Input
+              value={form.driverName}
+              onChange={(e) => setForm({ ...form, driverName: e.target.value })}
+            />
+          </Field>
+          <Field label="Pick up">
+            <Input
+              type="date"
+              value={form.pickupDate}
+              onChange={(e) => setForm({ ...form, pickupDate: e.target.value })}
+            />
+          </Field>
+          <Field label="Delivery">
+            <Input
+              type="date"
+              value={form.deliveryDate}
+              onChange={(e) => setForm({ ...form, deliveryDate: e.target.value })}
+            />
+          </Field>
+          <Field label="PU location">
+            <Input
+              value={form.puLocation}
+              onChange={(e) => setForm({ ...form, puLocation: e.target.value })}
+            />
+          </Field>
+          <Field label="Del location">
+            <Input
+              value={form.delLocation}
+              onChange={(e) => setForm({ ...form, delLocation: e.target.value })}
+            />
+          </Field>
+          <Field label="Mile (or TONU)">
+            <Input
+              value={form.mile}
+              onChange={(e) => onAmazonOrMileChange({ mile: e.target.value })}
+            />
+          </Field>
+          <Field label="Amazon Paid">
+            <Input
+              type="number"
+              step="0.01"
+              value={form.amazonPaid}
+              onChange={(e) => onAmazonOrMileChange({ amazonPaid: e.target.value })}
+            />
+          </Field>
+          <Field label="Driver Paid">
+            <Input
+              type="number"
+              step="0.01"
+              value={form.driverPaid}
+              onChange={(e) => setForm({ ...form, driverPaid: e.target.value })}
+            />
+          </Field>
+          <Field label="RPM">
+            <Input
+              type="number"
+              step="0.01"
+              value={form.rpm}
+              onChange={(e) => setForm({ ...form, rpm: e.target.value })}
+            />
+          </Field>
+          <Field label="Comment / week">
+            <Input
+              value={form.comment}
+              onChange={(e) => setForm({ ...form, comment: e.target.value })}
+              placeholder="Week45"
+            />
+          </Field>
+          <Field label="Dispatch">
+            <Input
+              list="report-dispatch-list"
+              value={form.dispatch}
+              onChange={(e) => setForm({ ...form, dispatch: e.target.value })}
+            />
+            <datalist id="report-dispatch-list">
+              {dispatchOptions.map((d) => (
+                <option key={d} value={d} />
+              ))}
+            </datalist>
+          </Field>
+          <Field label="Or pick dispatch">
+            <Select
+              value={dispatchOptions.includes(form.dispatch) ? form.dispatch : ''}
+              onChange={(e) => setForm({ ...form, dispatch: e.target.value })}
+            >
+              <option value="">—</option>
+              {dispatchOptions.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+      </Modal>
 
-      <div className="grid gap-4 lg:grid-cols-2 mb-5">
-        <Card>
-          <CardHeader>
-            <CardTitle>Driver Deductions & Net Pay</CardTitle>
-          </CardHeader>
-          <CardContent className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={deductionByDriver.slice(0, 8).map((d) => ({
-                name: d.name.split(' ')[0],
-                deductions: d.deductions,
-                net: d.net,
-              }))}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
-                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                <YAxis tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`} tick={{ fontSize: 11 }} />
-                <Tooltip formatter={(v) => formatCurrency(Number(v ?? 0))} />
-                <Legend />
-                <Bar dataKey="deductions" fill="#F59E0B" name="Deductions" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="net" fill="#22C55E" name="Net Pay" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Payment History & Outstanding</CardTitle>
-          </CardHeader>
-          <CardContent className="p-0 max-h-72 overflow-y-auto">
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 bg-bg">
-                <tr className="border-b border-border">
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Driver</th>
-                  <th className="px-3 py-2 text-right text-xs font-semibold text-text-secondary">Net</th>
-                  <th className="px-3 py-2 text-right text-xs font-semibold text-text-secondary">Paid</th>
-                  <th className="px-3 py-2 text-right text-xs font-semibold text-text-secondary">Balance</th>
-                </tr>
-              </thead>
-              <tbody>
-                {periodSettlements.slice(0, 20).map((s) => {
-                  const d = drivers.find((x) => x.id === s.driverId);
-                  const bal = s.netPayable - s.amountPaid;
-                  return (
-                    <tr key={s.id} className="border-b border-border/60">
-                      <td className="px-3 py-2 text-xs">
-                        {d ? getDriverFullName(d.firstName, d.lastName) : '—'}
-                        <div className="text-text-secondary">{formatDate(s.weekStart, 'MMM d')}</div>
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums">{formatCurrency(s.netPayable)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums text-success">{formatCurrency(s.amountPaid)}</td>
-                      <td className={`px-3 py-2 text-right tabular-nums font-medium ${bal > 0 ? 'text-warning' : 'text-success'}`}>
-                        {formatCurrency(Math.max(0, bal))}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Load Completion Summary</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            {Object.entries(statusDist).map(([status, count]) => (
-              <div key={status} className="rounded-lg border border-border bg-bg p-3 text-center">
-                <p className="text-2xl font-bold font-display text-text">{count}</p>
-                <p className="text-xs text-text-secondary mt-1">{status}</p>
-              </div>
-            ))}
-          </div>
-          <p className="mt-4 text-sm text-text-secondary">
-            Net payments this period: <strong className="text-text">{formatCurrency(totalNet)}</strong>
-            {' · '}
-            Period: {formatDate(range.start)} – {formatDate(range.end)}
-          </p>
-        </CardContent>
-      </Card>
+      <ConfirmDialog
+        open={Boolean(deleteId)}
+        onClose={() => setDeleteId(null)}
+        onConfirm={() => {
+          if (deleteId) deleteLoadReport(deleteId);
+          setDeleteId(null);
+        }}
+        title="Delete report row?"
+        message="This removes the row from the Reports sheet. Synced Relay loads are not deleted."
+        confirmLabel="Delete"
+        danger
+      />
     </div>
   );
 }
