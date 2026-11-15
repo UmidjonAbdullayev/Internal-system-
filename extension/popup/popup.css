@@ -82,6 +82,39 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
 .k { display: block; font-size: 10px; color: var(--muted); }
 .v { font-size: 12px; font-weight: 600; }
 
+.sync-progress {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  background: rgba(0,0,0,0.18);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.sync-progress-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.sync-bar {
+  height: 4px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.sync-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--primary), #7ddea8);
+  transition: width 0.35s ease;
+}
+.sync-detail {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
 .sections { list-style: none; margin: 0; padding: 0; }
 .sections li {
   display: flex;

@@ -24,7 +24,7 @@ Set `SUPABASE_ANON_KEY` in `shared/config.js` from that project's Settings → A
 3. Login: username `admin` / password `qwerty`
 4. Paste `RELAY_EXTENSION_API_KEY` (must match the Supabase Edge Function secret)
 5. Click **GO LIVE**
-6. Open Relay **Trips** (Upcoming / In Transit / History) plus **Payments**. Checklist updates as pages are detected. **v1.2.0+** auto-expands trip/leg rows (rate-limited) for trailer, tractor, and stop arrival/departure/late — you no longer need to expand every row by hand. **v1.2.1+** uses trip `T-…` IDs only (never schedule dates) and Edge upserts on `loads.load_id`.
+6. Open Relay **Trips** (Upcoming / In Transit / History) plus **Payments**. Checklist updates as pages are detected. **v1.3.0** soft sync: keep using Relay while sync runs (popup progress; typical full pass **45–90s**). History walks **This week / Last week** (or Last 14 days) filters. Trips scan ~every 4–6 min with jitter; Payments on a longer cadence (~20–30 min). Delivery dates no longer invent Dec 31 / year-2044 junk. **v1.2.x** auto-expand + `T-…` upserts still apply.
 7. After updating this folder: `chrome://extensions` → **Reload** on Internal Sys — Amazon Relay Sync → refresh any open Relay tabs → **GO LIVE** (or Force scan).
 
 ## Security

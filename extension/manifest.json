@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.2.1",
-  "description": "Sync Amazon Relay Trips/Payments into Internal Sys CRM (auto-expands trip rows; upserts by T- load_id).",
+  "version": "1.3.0",
+  "description": "Soft Relay→CRM sync: non-blocking progress, History week filters, stealth pacing, lighter payments cadence, fixed delivery dates.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
   "host_permissions": [
     "https://relay.amazon.com/*",

@@ -57,39 +57,86 @@ const MONTHS = {
   dec: 11, december: 11,
 };
 
+/**
+ * Reject bogus parses: epoch leftovers (1969-12-31), 2-digit-year mdy (12/31/44 → 2044),
+ * and Date() coercions of non-dates ("Stop 1", "Distance 450").
+ */
+export function isPlausibleRelayDate(iso) {
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return false;
+  const [y, m, d] = iso.split('-').map(Number);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) {
+    return false;
+  }
+  const now = new Date();
+  const min = new Date(Date.UTC(now.getUTCFullYear() - 1, 0, 1));
+  const max = new Date(Date.UTC(now.getUTCFullYear() + 1, 11, 31));
+  return dt >= min && dt <= max;
+}
+
+function formatYmd(year, monthIndex, day) {
+  const y = Number(year);
+  const m = Number(monthIndex);
+  const d = Number(day);
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
+  if (y < 2000 || y > 2100 || m < 0 || m > 11 || d < 1 || d > 31) return null;
+  const iso = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  return isPlausibleRelayDate(iso) ? iso : null;
+}
+
+/**
+ * Parse Relay schedule strings only. Never falls back to bare `new Date(s)` —
+ * that produced Dec 31 / year-2044 / year-0450 garbage from money, stops, miles.
+ */
 export function parseDate(raw) {
   if (!raw) return null;
   const s = String(raw).trim();
-  const iso = s.match(/(\d{4}-\d{2}-\d{2})/);
-  if (iso) return iso[1];
+  if (!s || s.length > 120) return null;
+  // Reject money / miles / ids masquerading as dates
+  if (/^\$/.test(s) || /\bmi\b/i.test(s) || /^T-[A-Z0-9]/i.test(s)) return null;
+
+  const iso = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (iso && isPlausibleRelayDate(iso[1])) return iso[1];
+
+  const hasWeekday = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(s);
+  const hasTime = /\b\d{1,2}:\d{2}\b/.test(s);
 
   // Fri, Nov 13, 04:01 PST  |  13 Nov, 03:02 PST
   let m = s.match(
     /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+([A-Za-z]+)\s+(\d{1,2})(?:,?\s*(\d{4}))?/i,
   );
   if (!m) {
-    const dmy = s.match(/\b(\d{1,2})\s+([A-Za-z]+)(?:,?\s*(\d{4}))?/i);
-    if (dmy) m = [dmy[0], dmy[2], dmy[1], dmy[3]];
+    const dmy = s.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})(?:,?\s*(\d{4}))?(?:\s|,|$)/i);
+    if (dmy && MONTHS[String(dmy[2]).toLowerCase()] != null) {
+      m = [dmy[0], dmy[2], dmy[1], dmy[3]];
+    }
   }
-  if (!m) m = s.match(/\b([A-Za-z]+)\s+(\d{1,2})(?:,?\s*(\d{4}))?/i);
+  if (!m) {
+    const md = s.match(/\b([A-Za-z]{3,9})\s+(\d{1,2})(?:,?\s*(\d{4}))?(?:\s|,|$)/i);
+    if (md && MONTHS[String(md[1]).toLowerCase()] != null) {
+      m = md;
+    }
+  }
   if (m) {
     const mon = MONTHS[String(m[1]).toLowerCase()];
     if (mon != null) {
-      const year = m[3] ? Number(m[3]) : new Date().getFullYear();
-      return `${year}-${String(mon + 1).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
+      const year = m[3] ? Number(m[3]) : null;
+      // Bare "Nov 20" / "Dec 31" (week headers) need weekday, time, or explicit year
+      if (year == null && !hasWeekday && !hasTime) return null;
+      return formatYmd(year ?? new Date().getFullYear(), mon, Number(m[2]));
     }
   }
 
-  const mdy = s.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  // Require 4-digit year for numeric dates — "12/31/44" must not become 2044-12-31
+  const mdy = s.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
   if (mdy) {
-    const year = mdy[3].length === 2 ? `20${mdy[3]}` : mdy[3];
-    const mm = mdy[1].padStart(2, '0');
-    const dd = mdy[2].padStart(2, '0');
-    return `${year}-${mm}-${dd}`;
-  }
-  const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) {
-    return d.toISOString().slice(0, 10);
+    const month = Number(mdy[1]);
+    const day = Number(mdy[2]);
+    const year = Number(mdy[3]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return formatYmd(year, month - 1, day);
+    }
   }
   return null;
 }
@@ -142,6 +189,17 @@ export async function hashLoadPayload(load) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+function sanitizeLocation(raw) {
+  if (!raw) return null;
+  const s = String(raw).replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  if (/^\$/.test(s)) return null; // money mistaken for route
+  if (/^\d[\d,]*\.?\d*\s*$/.test(s)) return null;
+  if (/^\/?Live$/i.test(s)) return null;
+  if (s.length < 3) return null;
+  return s.slice(0, 120);
+}
+
 /**
  * Fill CRM-required gaps from Relay Trips cards so scrapes insert instead of
  * stalling forever when a date/location line was collapsed/hidden.
@@ -149,10 +207,17 @@ export async function hashLoadPayload(load) {
 export function finalizeLoadForSync(load) {
   if (!load?.load_id || !isValidRelayLoadId(load.load_id)) return null;
   const today = new Date().toISOString().slice(0, 10);
-  const pickup = load.pickup_location || load.delivery_location || 'Unknown origin';
-  const delivery = load.delivery_location || load.pickup_location || 'Unknown destination';
-  const pickupDate = load.pickup_date || load.delivery_date || today;
-  const deliveryDate = load.delivery_date || load.pickup_date || today;
+  const pickupLoc = sanitizeLocation(load.pickup_location);
+  const deliveryLoc = sanitizeLocation(load.delivery_location);
+  const pickup = pickupLoc || deliveryLoc || 'Unknown origin';
+  const delivery = deliveryLoc || pickupLoc || 'Unknown destination';
+
+  const pickupDateRaw = parseDate(load.pickup_date) || (isPlausibleRelayDate(load.pickup_date) ? load.pickup_date : null);
+  const deliveryDateRaw =
+    parseDate(load.delivery_date) || (isPlausibleRelayDate(load.delivery_date) ? load.delivery_date : null);
+  const pickupDate = pickupDateRaw || deliveryDateRaw || today;
+  const deliveryDate = deliveryDateRaw || pickupDateRaw || today;
+
   let status = load.load_status;
   if (!status) {
     if (load.trip_bucket === 'history') status = 'Completed';

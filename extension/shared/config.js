@@ -68,9 +68,29 @@ export function isTripsBoardUrl(url) {
 export const STALE_AFTER_MS = 36 * 60 * 60 * 1000;
 export const TAB_SCAN_ALARM = 'relay-tab-scan';
 export const SYNC_ALARM = 'relay-sync-flush';
+export const PAYMENTS_SCAN_ALARM = 'relay-payments-scan';
 
-/** Auto-expand Trips rows for trailer/tractor/stop detail */
-export const EXPAND_DELAY_MS = 500;
-export const EXPAND_COLLAPSE_DELAY_MS = 180;
-export const MAX_EXPAND_PER_SCAN = 20;
+/**
+ * Soft / stealth pacing (human-like, non-blocking).
+ * Trips scan ~every 4–6 min with jitter; payments ~every 20–30 min.
+ * Full Trips+History pass typically takes 45–90s depending on expand count.
+ */
+export const TRIPS_SCAN_BASE_MINUTES = 4;
+export const TRIPS_SCAN_JITTER_MINUTES = 2;
+export const PAYMENTS_SCAN_BASE_MINUTES = 20;
+export const PAYMENTS_SCAN_JITTER_MINUTES = 10;
+export const SYNC_FLUSH_MINUTES = 2;
+export const TYPICAL_FULL_SYNC_SECONDS = '45–90';
+
+/** Auto-expand Trips rows for trailer/tractor/stop detail — lighter than before */
+export const EXPAND_DELAY_MS = 700;
+export const EXPAND_COLLAPSE_DELAY_MS = 280;
+export const EXPAND_JITTER_MS = 350;
+export const MAX_EXPAND_PER_SCAN = 8;
 export const DETAIL_SCRAPE_TTL_MS = 6 * 60 * 60 * 1000;
+export const TAB_SWITCH_DELAY_MS = 1100;
+export const TAB_SWITCH_JITTER_MS = 500;
+export const HISTORY_WEEK_SETTLE_MS = 1400;
+
+/** Skip re-scraping payments if last collection was within this window (unless force). */
+export const PAYMENTS_MIN_INTERVAL_MS = 18 * 60 * 1000;
