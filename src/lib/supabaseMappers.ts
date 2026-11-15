@@ -13,6 +13,7 @@ import type {
   SettlementStatus,
   TrailerType,
 } from '@/types';
+import { sanitizeReportLocation } from '@/lib/reportRows';
 
 function str(v: unknown, fallback = ''): string {
   return v == null ? fallback : String(v);
@@ -57,8 +58,8 @@ export function mapLoad(row: Record<string, unknown>): Load {
     driverNameRaw: str(row.driver_name_raw),
     loadStatus: str(row.load_status, 'Available') as LoadStatus,
     paymentStatus: str(row.payment_status, 'Not Received') as PaymentStatus,
-    pickupLocation: str(row.pickup_location),
-    deliveryLocation: str(row.delivery_location),
+    pickupLocation: sanitizeReportLocation(str(row.pickup_location)),
+    deliveryLocation: sanitizeReportLocation(str(row.delivery_location)),
     pickupDate: str(row.pickup_date),
     deliveryDate: str(row.delivery_date),
     trailerId: str(row.trailer_id),
@@ -183,8 +184,8 @@ export function mapLoadReport(row: Record<string, unknown>): LoadReport {
     driverName: str(row.driver_name),
     pickupDate: row.pickup_date ? str(row.pickup_date) : null,
     deliveryDate: row.delivery_date ? str(row.delivery_date) : null,
-    puLocation: str(row.pu_location),
-    delLocation: str(row.del_location),
+    puLocation: sanitizeReportLocation(str(row.pu_location)),
+    delLocation: sanitizeReportLocation(str(row.del_location)),
     mile: str(row.mile),
     amazonPaid: num(row.amazon_paid),
     driverPaid: num(row.driver_paid),

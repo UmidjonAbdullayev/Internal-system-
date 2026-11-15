@@ -35,7 +35,12 @@ import {
   mapRelayPayment,
   mapSettlement,
 } from '@/lib/supabaseMappers';
-import { buildReportFromLoad, loadInDateRange } from '@/lib/reportRows';
+import {
+  buildReportFromLoad,
+  isBadReportLocation,
+  loadInDateRange,
+  sanitizeReportLocation,
+} from '@/lib/reportRows';
 import { toast } from 'sonner';
 
 interface CompanySettings {
@@ -567,40 +572,101 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   const syncLoadReportsForRange = useCallback(
     async (start: string, end: string, opts?: { quiet?: boolean }) => {
-      const linked = new Set(
-        loadReports.map((r) => r.loadUuid).filter((id): id is string => Boolean(id)),
+      const byUuid = new Map(
+        loadReports.filter((r) => r.loadUuid).map((r) => [r.loadUuid as string, r]),
       );
       const missing = loads.filter(
-        (l) => loadInDateRange(l, start, end) && !linked.has(l.id),
+        (l) => loadInDateRange(l, start, end) && !byUuid.has(l.id),
       );
-      if (!missing.length) {
+
+      // Refresh PU/Del when report still has Unknown / $ / scraps but load has a real place
+      const locationFixes: { id: string; puLocation: string; delLocation: string }[] = [];
+      for (const load of loads) {
+        if (!loadInDateRange(load, start, end)) continue;
+        const existing = byUuid.get(load.id);
+        if (!existing) continue;
+        const nextPu = sanitizeReportLocation(load.pickupLocation);
+        const nextDel = sanitizeReportLocation(load.deliveryLocation);
+        const fixPu = isBadReportLocation(existing.puLocation) && Boolean(nextPu);
+        const fixDel = isBadReportLocation(existing.delLocation) && Boolean(nextDel);
+        if (!fixPu && !fixDel) continue;
+        locationFixes.push({
+          id: existing.id,
+          puLocation: fixPu ? nextPu : sanitizeReportLocation(existing.puLocation),
+          delLocation: fixDel ? nextDel : sanitizeReportLocation(existing.delLocation),
+        });
+      }
+
+      if (!missing.length && !locationFixes.length) {
         if (!opts?.quiet) toast.message('Reports already up to date for this range');
         return 0;
       }
+
       const ts = now();
-      const rows: LoadReport[] = missing.map((load) => {
-        const base = buildReportFromLoad(load, drivers, '', 'sync');
-        return {
-          ...base,
-          id: crypto.randomUUID(),
-          createdAt: ts,
-          updatedAt: ts,
-        };
-      });
-      setLoadReports((prev) => [...prev, ...rows]);
-      const { error } = await supabase
-        .from('load_reports')
-        .insert(rows.map((r) => loadReportToRow(r)));
-      if (error) {
-        toast.error(`Sync failed: ${error.message}`);
-        await hydrate();
-        return 0;
+      let changed = 0;
+
+      if (missing.length) {
+        const rows: LoadReport[] = missing.map((load) => {
+          const base = buildReportFromLoad(load, drivers, '', 'sync');
+          return {
+            ...base,
+            id: crypto.randomUUID(),
+            createdAt: ts,
+            updatedAt: ts,
+          };
+        });
+        setLoadReports((prev) => [...prev, ...rows]);
+        const { error } = await supabase
+          .from('load_reports')
+          .insert(rows.map((r) => loadReportToRow(r)));
+        if (error) {
+          toast.error(`Sync failed: ${error.message}`);
+          await hydrate();
+          return 0;
+        }
+        changed += rows.length;
       }
+
+      if (locationFixes.length) {
+        setLoadReports((prev) =>
+          prev.map((r) => {
+            const fix = locationFixes.find((f) => f.id === r.id);
+            return fix
+              ? {
+                  ...r,
+                  puLocation: fix.puLocation,
+                  delLocation: fix.delLocation,
+                  updatedAt: ts,
+                }
+              : r;
+          }),
+        );
+        for (const fix of locationFixes) {
+          const { error } = await supabase
+            .from('load_reports')
+            .update({
+              pu_location: fix.puLocation,
+              del_location: fix.delLocation,
+              updated_at: ts,
+            })
+            .eq('id', fix.id);
+          if (error) {
+            toast.error(`Location refresh failed: ${error.message}`);
+            await hydrate();
+            return changed;
+          }
+        }
+        changed += locationFixes.length;
+      }
+
       if (!opts?.quiet) {
-        toast.success(`Synced ${rows.length} load${rows.length === 1 ? '' : 's'} into Reports`);
+        const bits = [];
+        if (missing.length) bits.push(`${missing.length} new`);
+        if (locationFixes.length) bits.push(`${locationFixes.length} locations refreshed`);
+        toast.success(`Synced Reports (${bits.join(', ')})`);
       }
       await hydrate();
-      return rows.length;
+      return changed;
     },
     [drivers, hydrate, loadReports, loads],
   );

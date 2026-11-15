@@ -189,15 +189,82 @@ export async function hashLoadPayload(load) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-function sanitizeLocation(raw) {
+const STATE_ABBREV = {
+  alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA',
+  colorado: 'CO', connecticut: 'CT', delaware: 'DE', florida: 'FL', georgia: 'GA',
+  hawaii: 'HI', idaho: 'ID', illinois: 'IL', indiana: 'IN', iowa: 'IA', kansas: 'KS',
+  kentucky: 'KY', louisiana: 'LA', maine: 'ME', maryland: 'MD', massachusetts: 'MA',
+  michigan: 'MI', minnesota: 'MN', mississippi: 'MS', missouri: 'MO', montana: 'MT',
+  nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
+  'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND',
+  ohio: 'OH', oklahoma: 'OK', oregon: 'OR', pennsylvania: 'PA', 'rhode island': 'RI',
+  'south carolina': 'SC', 'south dakota': 'SD', tennessee: 'TN', texas: 'TX',
+  utah: 'UT', vermont: 'VT', virginia: 'VA', washington: 'WA', 'west virginia': 'WV',
+  wisconsin: 'WI', wyoming: 'WY', 'district of columbia': 'DC',
+};
+
+/** Reject money, miles, truncated scraps, and Unknown placeholders. */
+export function sanitizeLocation(raw) {
   if (!raw) return null;
   const s = String(raw).replace(/\s+/g, ' ').trim();
   if (!s) return null;
-  if (/^\$/.test(s)) return null; // money mistaken for route
-  if (/^\d[\d,]*\.?\d*\s*$/.test(s)) return null;
+  if (/^unknown\b/i.test(s)) return null;
+  if (/^\$/.test(s) || /\$\s*[\d,]+/.test(s)) return null; // money mistaken for route
+  if (/^\d[\d,]*\.?\d*\s*(mi|miles)?\s*$/i.test(s)) return null;
   if (/^\/?Live$/i.test(s)) return null;
+  if (/^(Drop|Pickup|PU|Del|Spot|Vendor)$/i.test(s)) return null;
+  // Truncated mid-word scraps from collapsed ellipsis ("ckton, CA", ", CA 95835", "n 98444")
+  if (/^[,.]/.test(s) || /^[a-z]/.test(s)) return null;
+  if (/^Sch\./i.test(s)) return null; // schedule fragments
   if (s.length < 3) return null;
   return s.slice(0, 120);
+}
+
+export function isGoodLocation(raw) {
+  return Boolean(sanitizeLocation(raw));
+}
+
+/** City, ST from a street address or "FAC City, ST ZIP" tooltip/line. */
+export function placeFromAddressLine(raw) {
+  if (!raw) return null;
+  const s = String(raw).replace(/\s+/g, ' ').trim();
+  if (!s || s.length > 200) return null;
+
+  // …, City, ST 12345  OR  …, City, State 12345
+  let m = s.match(
+    /,\s*([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2}|[A-Za-z][A-Za-z ]{2,20})\s+\d{5}(?:-\d{4})?\b/,
+  );
+  if (m) {
+    const city = m[1].replace(/\s+/g, ' ').trim();
+    const stRaw = m[2].trim();
+    const st = stRaw.length === 2 ? stRaw.toUpperCase() : STATE_ABBREV[stRaw.toLowerCase()];
+    if (city && st && !/^(street|avenue|drive|road|way|blvd|lane)$/i.test(city)) {
+      return sanitizeLocation(`${titleCaseCity(city)}, ${st}`);
+    }
+  }
+
+  // FACCODE City, ST ZIP  (tooltip / collapsed route fragment)
+  m = s.match(
+    /\b(?:[A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]*)\s+([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\s*(?:\d{5})?\b/,
+  );
+  if (m) {
+    return sanitizeLocation(`${titleCaseCity(m[1])}, ${m[2].toUpperCase()}`);
+  }
+
+  // Bare City, ST
+  m = s.match(/\b([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\b(?!\s*[A-Za-z])/);
+  if (m && m[1].length >= 3) {
+    return sanitizeLocation(`${titleCaseCity(m[1])}, ${m[2].toUpperCase()}`);
+  }
+
+  return null;
+}
+
+function titleCaseCity(city) {
+  return String(city)
+    .toLowerCase()
+    .replace(/\b[a-z]/g, (c) => c.toUpperCase())
+    .replace(/\b(Of|And|The)\b/g, (w) => w.toLowerCase());
 }
 
 /**
@@ -207,10 +274,16 @@ function sanitizeLocation(raw) {
 export function finalizeLoadForSync(load) {
   if (!load?.load_id || !isValidRelayLoadId(load.load_id)) return null;
   const today = new Date().toISOString().slice(0, 10);
-  const pickupLoc = sanitizeLocation(load.pickup_location);
-  const deliveryLoc = sanitizeLocation(load.delivery_location);
-  const pickup = pickupLoc || deliveryLoc || 'Unknown origin';
-  const delivery = deliveryLoc || pickupLoc || 'Unknown destination';
+  const pickupLoc =
+    sanitizeLocation(load.pickup_location) ||
+    placeFromAddressLine(load.pickup_location) ||
+    placeFromAddressLine(load.pickup_address);
+  const deliveryLoc =
+    sanitizeLocation(load.delivery_location) ||
+    placeFromAddressLine(load.delivery_location) ||
+    placeFromAddressLine(load.delivery_address);
+  const pickup = pickupLoc || 'Unknown origin';
+  const delivery = deliveryLoc || 'Unknown destination';
 
   const pickupDateRaw = parseDate(load.pickup_date) || (isPlausibleRelayDate(load.pickup_date) ? load.pickup_date : null);
   const deliveryDateRaw =

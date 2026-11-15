@@ -268,6 +268,179 @@
     return null;
   }
 
+  const STATE_ABBREV = {
+    alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA',
+    colorado: 'CO', connecticut: 'CT', delaware: 'DE', florida: 'FL', georgia: 'GA',
+    hawaii: 'HI', idaho: 'ID', illinois: 'IL', indiana: 'IN', iowa: 'IA', kansas: 'KS',
+    kentucky: 'KY', louisiana: 'LA', maine: 'ME', maryland: 'MD', massachusetts: 'MA',
+    michigan: 'MI', minnesota: 'MN', mississippi: 'MS', missouri: 'MO', montana: 'MT',
+    nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
+    'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND',
+    ohio: 'OH', oklahoma: 'OK', oregon: 'OR', pennsylvania: 'PA', 'rhode island': 'RI',
+    'south carolina': 'SC', 'south dakota': 'SD', tennessee: 'TN', texas: 'TX',
+    utah: 'UT', vermont: 'VT', virginia: 'VA', washington: 'WA', 'west virginia': 'WV',
+    wisconsin: 'WI', wyoming: 'WY', 'district of columbia': 'DC',
+  };
+
+  function titleCaseCity(city) {
+    return String(city)
+      .toLowerCase()
+      .replace(/\b[a-z]/g, (c) => c.toUpperCase())
+      .replace(/\b(Of|And|The)\b/g, (w) => w.toLowerCase());
+  }
+
+  function cleanLoc(s) {
+    const cleaned = String(s || '')
+      .replace(/\s+/g, ' ')
+      .replace(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*.*$/i, '')
+      .replace(/\s*\$[\d,.]+.*$/i, '')
+      .replace(/\b\d[\d,.]*\s*mi\b.*$/i, '')
+      .trim()
+      .slice(0, 120);
+    if (!cleaned || /^\$/.test(cleaned) || /\$\s*[\d,]/.test(cleaned)) return null;
+    if (/^\/?Live$/i.test(cleaned)) return null;
+    if (/^\d[\d,]*\.?\d*\s*$/.test(cleaned)) return null;
+    if (/^unknown\b/i.test(cleaned)) return null;
+    if (/^(Drop|Pickup|PU|Del|Spot|Vendor)$/i.test(cleaned)) return null;
+    if (/^[,.]/.test(cleaned) || /^[a-z]/.test(cleaned)) return null; // truncated scrap
+    if (/^Sch\./i.test(cleaned)) return null;
+    if (cleaned.length < 3) return null;
+    return cleaned;
+  }
+
+  function placeFromAddressLine(raw) {
+    if (!raw) return null;
+    const s = String(raw).replace(/\s+/g, ' ').trim();
+    if (!s || s.length > 220) return null;
+
+    let m = s.match(
+      /,\s*([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2}|[A-Za-z][A-Za-z ]{2,20})\s+\d{5}(?:-\d{4})?\b/,
+    );
+    if (m) {
+      const city = m[1].replace(/\s+/g, ' ').trim();
+      const stRaw = m[2].trim();
+      const st = stRaw.length === 2 ? stRaw.toUpperCase() : STATE_ABBREV[stRaw.toLowerCase()];
+      if (city && st && !/^(street|avenue|drive|road|way|blvd|lane|dr|ave|rd)$/i.test(city)) {
+        return cleanLoc(`${titleCaseCity(city)}, ${st}`);
+      }
+    }
+
+    m = s.match(
+      /\b(?:[A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]*)\s+([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\s*(?:\d{5})?\b/,
+    );
+    if (m) return cleanLoc(`${titleCaseCity(m[1])}, ${m[2].toUpperCase()}`);
+
+    m = s.match(/\b([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\b(?!\s*[A-Za-z])/);
+    if (m && m[1].length >= 3) {
+      return cleanLoc(`${titleCaseCity(m[1])}, ${m[2].toUpperCase()}`);
+    }
+    return null;
+  }
+
+  function isGoodLocation(raw) {
+    return Boolean(cleanLoc(raw) || placeFromAddressLine(raw));
+  }
+
+  /**
+   * Prefer expanded stop addresses (city/state); then facility+city tooltips;
+   * then facility codes. Never keep money / truncated scraps.
+   */
+  function parsePlacesFromBlock(block) {
+    const text = String(block || '');
+    const addressPlaces = [];
+    const addrRe =
+      /\d{1,6}\s+[A-Za-z0-9][A-Za-z0-9 .'-]{2,60},\s*[A-Za-z][A-Za-z .'-]{1,40},\s*(?:[A-Z]{2}|[A-Za-z][A-Za-z ]{2,20})\s+\d{5}/g;
+    for (const hit of text.match(addrRe) || []) {
+      const place = placeFromAddressLine(hit);
+      if (place) addressPlaces.push(place);
+    }
+
+    // Stop N FAC… lines with city on same/next fragment
+    const stopCityRe =
+      /\b(?:Stop\s*)?\d+\s+([A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]*)\b[^\n]{0,80}?([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2}|California|Nevada|Texas|Arizona|Washington|Oregon|Utah|Colorado|Illinois)\b/gi;
+    const stopPlaces = [];
+    for (const m of text.matchAll(stopCityRe)) {
+      const stRaw = m[3];
+      const st = stRaw.length === 2 ? stRaw.toUpperCase() : STATE_ABBREV[stRaw.toLowerCase()];
+      const place = cleanLoc(st ? `${titleCaseCity(m[2])}, ${st}` : null);
+      if (place) stopPlaces.push(place);
+    }
+
+    const tooltipPlaces = [];
+    const tipRe =
+      /\b([A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]*)\s+([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\s*\d{5}/g;
+    for (const m of text.matchAll(tipRe)) {
+      const place = cleanLoc(`${titleCaseCity(m[2])}, ${m[3].toUpperCase()}`);
+      if (place) tooltipPlaces.push(place);
+    }
+
+    const labeledPickup =
+      placeFromAddressLine(extractLabeledValue(text, ['Pickup location', 'Origin', 'From'])) ||
+      cleanLoc(extractLabeledValue(text, ['Pickup location', 'Origin', 'From']));
+    const labeledDelivery =
+      placeFromAddressLine(extractLabeledValue(text, ['Delivery location', 'Destination', 'Dropoff', 'Drop-off', 'To'])) ||
+      cleanLoc(extractLabeledValue(text, ['Delivery location', 'Destination', 'Dropoff', 'Drop-off', 'To']));
+
+    // Facility codes only (APC2 → SBD3) — last resort, better than Unknown
+    const facilityArrow = text.match(
+      /\b([A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]{3,})\b[^\n]{0,40}?(?:→|->|–|—)\s*\b([A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]{3,})\b/,
+    );
+
+    // Route arrow with city fragments — do NOT use bare "-" (matches "Drop - $pay")
+    const routeArrow = text.match(
+      /([A-Z0-9_]{3,}[^\n→—–]{0,50}?)\s*(?:→|->|–|—)\s*([A-Z0-9_]{3,}[^\n]{0,50})/i,
+    );
+    let arrowPickup = null;
+    let arrowDelivery = null;
+    if (routeArrow) {
+      arrowPickup =
+        placeFromAddressLine(routeArrow[1]) ||
+        cleanLoc(
+          String(routeArrow[1])
+            .replace(/^\d+\s+/, '')
+            .replace(/\b(?:[A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]*)\s+/i, '')
+            .replace(/\.{2,}.*/, '')
+            .trim(),
+        );
+      arrowDelivery =
+        placeFromAddressLine(routeArrow[2]) ||
+        cleanLoc(
+          String(routeArrow[2])
+            .replace(/^\d+\s+/, '')
+            .replace(/\b(?:[A-Z]{2,4}\d{1,2}[A-Z0-9]?|MARS[A-Z0-9_]*)\s+/i, '')
+            .replace(/\.{2,}.*/, '')
+            .trim(),
+        );
+      // Reject if still looks like a facility-only code without city — keep code as place
+      if (!arrowPickup && facilityArrow) arrowPickup = cleanLoc(facilityArrow[1]);
+      if (!arrowDelivery && facilityArrow) arrowDelivery = cleanLoc(facilityArrow[2]);
+    }
+
+    const orderedPickup = [
+      addressPlaces[0],
+      stopPlaces[0],
+      tooltipPlaces[0],
+      labeledPickup,
+      arrowPickup,
+      facilityArrow ? cleanLoc(facilityArrow[1]) : null,
+    ].find((x) => isGoodLocation(x));
+
+    const orderedDelivery = [
+      addressPlaces[1] || (addressPlaces.length === 1 ? null : addressPlaces[addressPlaces.length - 1]),
+      stopPlaces[1] || (stopPlaces.length > 1 ? stopPlaces[stopPlaces.length - 1] : null),
+      tooltipPlaces[1] || (tooltipPlaces.length > 1 ? tooltipPlaces[tooltipPlaces.length - 1] : null),
+      labeledDelivery,
+      arrowDelivery,
+      facilityArrow ? cleanLoc(facilityArrow[2]) : null,
+    ].find((x) => isGoodLocation(x));
+
+    // If only one address found, don't invent the other from it
+    return {
+      pickup_location: orderedPickup || null,
+      delivery_location: orderedDelivery || null,
+    };
+  }
+
   function inferStatusFromText(text) {
     return (
       mapLoadStatus(text) ||
@@ -437,10 +610,6 @@
     const loadId = (tripId && isValidRelayLoadId(tripId) ? tripId : null) || legId;
     if (!loadId || !isValidRelayLoadId(loadId)) return null;
 
-    // Route: APC2 … → SBD3 …   or  APC2 → MARS...
-    const arrow = block.match(
-      /([A-Z0-9_]{3,}[^\n→\-]{0,40}?)\s*(?:→|->|–|-)\s*([A-Z0-9_]{3,}[^\n]{0,40})/i,
-    );
     const payout = parseMoney(
       (block.match(/\$\s*[\d,]+(?:\.\d{2})?/) || [])[0] ||
         extractLabeledValue(block, ['Payout', 'Rate', 'Total payout']),
@@ -480,32 +649,7 @@
     )].map((x) => x[0]);
     const dates = dateHits.length ? dateHits : altDates;
 
-    function cleanLoc(s) {
-      const cleaned = String(s || '')
-        .replace(/\s+/g, ' ')
-        .replace(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*.*$/i, '')
-        .replace(/^\$[\d,.]+$/, '')
-        .trim()
-        .slice(0, 120);
-      if (!cleaned || /^\$/.test(cleaned) || /^\/?Live$/i.test(cleaned)) return null;
-      if (/^\d[\d,]*\.?\d*$/.test(cleaned)) return null;
-      if (cleaned.length < 3) return null;
-      return cleaned;
-    }
-    // Prefer facility codes (e.g. APC2 → SBD3) over money/dash noise
-    const facilityArrow = block.match(
-      /\b([A-Z]{2,4}\d{1,2}[A-Z0-9]?)\b[^\n]{0,30}?(?:→|->|–)\s*\b([A-Z]{2,4}\d{1,2}[A-Z0-9]?)\b/,
-    );
-    const pickupLoc = facilityArrow
-      ? facilityArrow[1]
-      : arrow
-        ? cleanLoc(arrow[1])
-        : extractLabeledValue(block, ['Pickup', 'Origin', 'From']);
-    const deliveryLoc = facilityArrow
-      ? facilityArrow[2]
-      : arrow
-        ? cleanLoc(arrow[2])
-        : extractLabeledValue(block, ['Delivery', 'Destination', 'To', 'Drop']);
+    const places = parsePlacesFromBlock(block);
 
     const tripBucket = extras.trip_bucket || detectTripBucket();
     let status = inferStatusFromText(block);
@@ -537,8 +681,8 @@
       parent_trip_id: parentTripId && String(loadId).toUpperCase() !== parentTripId ? parentTripId : parentTripId,
       load_status: status,
       payment_status: null,
-      pickup_location: cleanLoc(pickupLoc) || pickupLoc,
-      delivery_location: cleanLoc(deliveryLoc) || deliveryLoc,
+      pickup_location: places.pickup_location,
+      delivery_location: places.delivery_location,
       pickup_date: pickupDate,
       delivery_date: deliveryDate,
       trailer_id: normalizeTrailer(trailerRaw),
@@ -663,8 +807,14 @@
           amazon_ref_id: refIdx >= 0 ? cells[refIdx] : null,
           load_status: mapLoadStatus(statusRaw) || statusRaw || inferStatusFromText(cells.join(' ')),
           payment_status: null,
-          pickup_location: pickupIdx >= 0 ? cells[pickupIdx] : null,
-          delivery_location: deliveryIdx >= 0 ? cells[deliveryIdx] : null,
+          pickup_location:
+            pickupIdx >= 0
+              ? placeFromAddressLine(cells[pickupIdx]) || cleanLoc(cells[pickupIdx])
+              : null,
+          delivery_location:
+            deliveryIdx >= 0
+              ? placeFromAddressLine(cells[deliveryIdx]) || cleanLoc(cells[deliveryIdx])
+              : null,
           pickup_date: pickupDateIdx >= 0 ? parseDate(cells[pickupDateIdx]) : null,
           delivery_date: deliveryDateIdx >= 0 ? parseDate(cells[deliveryDateIdx]) : null,
           trailer_id: trailerIdx >= 0 ? normalizeTrailer(cells[trailerIdx]) : null,
@@ -721,6 +871,15 @@
     return Boolean(load?.trailer_id || load?.tractor_id);
   }
 
+  function locationsAreGood(load) {
+    return isGoodLocation(load?.pickup_location) && isGoodLocation(load?.delivery_location);
+  }
+
+  /** Expand when equipment OR places are missing — places live under the stop dropdown. */
+  function needsExpand(load) {
+    return !detailIsRich(load) || !locationsAreGood(load);
+  }
+
   /** Prefer React fiber / props when Relay already hydrated expand data. */
   function readReactEquipment(el, depth = 0) {
     if (!el || depth > 5) return null;
@@ -770,15 +929,18 @@
 
   function findExpandControl(cardRoot) {
     if (!cardRoot) return null;
+    if (isCardExpanded(cardRoot)) return null;
     const selectors = [
       'button[aria-expanded="false"]',
       '[aria-expanded="false"]',
       'button[aria-label*="expand" i]',
+      'button[aria-label*="collapse" i]',
       'button[aria-label*="detail" i]',
       'button[aria-label*="chevron" i]',
       '[data-testid*="expand" i]',
       '[class*="chevron" i]',
       '[class*="Expand" i]',
+      '[class*="Caret" i]',
     ];
     for (const sel of selectors) {
       try {
@@ -788,10 +950,18 @@
         /* invalid selector in older Chromium — skip */
       }
     }
-    const buttons = [...cardRoot.querySelectorAll('button, [role="button"]')].filter((b) => {
-      const label = `${b.getAttribute('aria-label') || ''} ${b.className || ''}`;
-      return /expand|chevron|caret|detail|toggle|arrow/i.test(label) || b.querySelector('svg');
-    });
+    // Leg-row chevron: first small icon button near a load/trip id
+    const buttons = [...cardRoot.querySelectorAll('button, [role="button"], [tabindex="0"]')].filter(
+      (b) => {
+        const label = `${b.getAttribute('aria-label') || ''} ${b.className || ''} ${b.getAttribute('title') || ''}`;
+        if (/expand|chevron|caret|detail|toggle|arrow|collapse/i.test(label)) return true;
+        if (b.getAttribute('aria-expanded') === 'false') return true;
+        const svg = b.querySelector('svg');
+        if (!svg) return false;
+        const r = b.getBoundingClientRect?.();
+        return !r || (r.width > 0 && r.width <= 48 && r.height <= 48);
+      },
+    );
     return buttons[0] || null;
   }
 
@@ -799,7 +969,16 @@
     if (!cardRoot) return false;
     if (cardRoot.querySelector('[aria-expanded="true"]')) return true;
     const t = cardRoot.innerText || '';
-    return /\bTrailer\b/i.test(t) && /\bTractor\b/i.test(t);
+    if (/\bTrailer\b/i.test(t) && /\bTractor\b/i.test(t)) return true;
+    // Expanded stop table: street address + Arrival/Departure columns
+    if (
+      /\bArrival\b/i.test(t) &&
+      /\bDeparture\b/i.test(t) &&
+      /\d{1,6}\s+[A-Za-z].+,\s*[A-Za-z].+,\s*(?:[A-Z]{2}|[A-Za-z]{4,})\s+\d{5}/.test(t)
+    ) {
+      return true;
+    }
+    return false;
   }
 
   async function bgMessage(payload) {
@@ -831,23 +1010,34 @@
 
   function findCardRootForLoadId(loadId) {
     if (!loadId) return null;
-    const needle = String(loadId).trim();
+    const needle = String(loadId).trim().toUpperCase();
     const anchors = [...document.querySelectorAll('a, button, [role="link"], span, div')].filter(
-      (el) => (el.innerText || el.textContent || '').trim().toUpperCase() === needle.toUpperCase(),
+      (el) => (el.innerText || el.textContent || '').trim().toUpperCase() === needle,
     );
     for (const el of anchors) {
       let node = el;
-      for (let i = 0; i < 8 && node; i += 1) {
+      for (let i = 0; i < 10 && node; i += 1) {
         const text = (node.innerText || '').trim();
-        if (text.length > 80 && /mi\b|\$|→|->|driver|payout|spot|trailer|equipment/i.test(text)) {
+        if (
+          text.length > 60 &&
+          /mi\b|\$|→|->|–|driver|payout|spot|trailer|equipment|arrival|departure/i.test(text)
+        ) {
           return node;
         }
         node = node.parentElement;
       }
-      const fallback = el.closest('[class], section, article, li, tr') || el;
+      const fallback = el.closest('[class], section, article, li, tr, [role="row"]') || el;
       if (fallback) return fallback;
     }
     return null;
+  }
+
+  function findCardRootForLoad(load) {
+    return (
+      findCardRootForLoadId(load?.amazon_ref_id) ||
+      findCardRootForLoadId(load?.load_id) ||
+      findCardRootForLoadId(load?.parent_trip_id)
+    );
   }
 
   function parseDetailFromCard(cardRoot, forcedBucket, section = 'tours') {
@@ -875,9 +1065,23 @@
     return parsed;
   }
 
+  function mergeParsedOntoLoad(load, parsed) {
+    if (!parsed) return load;
+    const next = {
+      ...load,
+      ...Object.fromEntries(Object.entries(parsed).filter(([, v]) => v != null && v !== '')),
+    };
+    // Prefer newly parsed good places over prior Unknown / money scraps
+    if (isGoodLocation(parsed.pickup_location)) next.pickup_location = parsed.pickup_location;
+    if (isGoodLocation(parsed.delivery_location)) next.delivery_location = parsed.delivery_location;
+    if (!isGoodLocation(next.pickup_location)) next.pickup_location = null;
+    if (!isGoodLocation(next.delivery_location)) next.delivery_location = null;
+    return next;
+  }
+
   /**
-   * DOM/React first; click-expand when Trailer/Tractor not already visible.
-   * Rate-limited; collapses after scrape. Skips IDs already in chrome.storage.
+   * DOM/React first; click-expand when Trailer/Tractor or city/state places missing.
+   * Rate-limited; collapses after scrape. Skips IDs already in chrome.storage when rich.
    */
   async function expandAndEnrichLoad(load, opts = {}) {
     const {
@@ -888,39 +1092,36 @@
       softYield = true,
     } = opts;
 
-    if (detailIsRich(load) && load.notes && /Late:|Stops:/.test(load.notes)) {
+    if (
+      detailIsRich(load) &&
+      locationsAreGood(load) &&
+      load.notes &&
+      /Late:|Stops:/.test(load.notes)
+    ) {
       return { load, method: 'already_rich', expanded: false };
     }
 
-    const cardRoot = findCardRootForLoadId(load.load_id);
+    const cardRoot = findCardRootForLoad(load);
     if (!cardRoot) {
       return { load, method: 'no_card', expanded: false };
     }
 
     let enriched = parseDetailFromCard(cardRoot, load.trip_bucket, load.section || 'tours');
-    if (enriched) {
-      load = {
-        ...load,
-        ...Object.fromEntries(
-          Object.entries(enriched).filter(([, v]) => v != null && v !== ''),
-        ),
-      };
+    load = mergeParsedOntoLoad(load, enriched);
+
+    if (!needsExpand(load) || (isCardExpanded(cardRoot) && locationsAreGood(load) && detailIsRich(load))) {
+      load.detail_method =
+        load.detail_method || (detailIsRich(load) && locationsAreGood(load) ? 'dom' : 'open_partial');
+      return { load, method: load.detail_method, expanded: false };
     }
 
-    if (detailIsRich(load) || isCardExpanded(cardRoot)) {
-      if (isCardExpanded(cardRoot) && !detailIsRich(load)) {
-        enriched = parseDetailFromCard(cardRoot, load.trip_bucket, load.section || 'tours');
-        if (enriched) {
-          load = {
-            ...load,
-            ...Object.fromEntries(
-              Object.entries(enriched).filter(([, v]) => v != null && v !== ''),
-            ),
-          };
-        }
+    if (isCardExpanded(cardRoot)) {
+      enriched = parseDetailFromCard(cardRoot, load.trip_bucket, load.section || 'tours');
+      load = mergeParsedOntoLoad(load, enriched);
+      if (!needsExpand(load)) {
+        load.detail_method = load.detail_method || 'dom_expanded';
+        return { load, method: load.detail_method, expanded: false };
       }
-      load.detail_method = load.detail_method || (detailIsRich(load) ? 'dom' : 'open_no_equip');
-      return { load, method: load.detail_method, expanded: false };
     }
 
     if (!allowExpand) {
@@ -948,16 +1149,18 @@
     if (softYield) await yieldToUi();
     await sleep(expandDelayMs, expandJitterMs);
 
-    // Detail often mounts on the card or next sibling panel
-    const scopes = [cardRoot, cardRoot.nextElementSibling, cardRoot.parentElement].filter(Boolean);
+    // Detail often mounts on the card or next sibling panel (leg dropdown under trip)
+    const scopes = [
+      cardRoot,
+      cardRoot.nextElementSibling,
+      cardRoot.parentElement,
+      cardRoot.parentElement?.nextElementSibling,
+    ].filter(Boolean);
     for (const scope of scopes) {
       const parsed = parseDetailFromCard(scope, load.trip_bucket, load.section || 'tours');
       if (!parsed) continue;
-      load = {
-        ...load,
-        ...Object.fromEntries(Object.entries(parsed).filter(([, v]) => v != null && v !== '')),
-      };
-      if (detailIsRich(load)) break;
+      load = mergeParsedOntoLoad(load, parsed);
+      if (detailIsRich(load) && locationsAreGood(load)) break;
     }
 
     await sleep(collapseDelayMs, Math.min(120, expandJitterMs));
@@ -1019,9 +1222,11 @@
       }
 
       const prior = already[raw.load_id];
-      const skipExpand = Boolean(prior?.hasTrailer || prior?.hasTractor) || Boolean(histSkip?.skipExpand);
-      // Still refresh DOM/React without clicking when cached
-      const allowExpand = !skipExpand && expandCount < maxExpand && !detailIsRich(raw);
+      const cachedEquip = Boolean(prior?.hasTrailer || prior?.hasTractor);
+      // Still expand when places are Unknown/money even if equipment was cached
+      const skipExpand =
+        (cachedEquip && locationsAreGood(raw)) || Boolean(histSkip?.skipExpand);
+      const allowExpand = !skipExpand && expandCount < maxExpand && needsExpand(raw);
       const { load, method } = await expandAndEnrichLoad(raw, {
         expandDelayMs,
         collapseDelayMs,
@@ -1037,6 +1242,8 @@
         if (!load.notes && prior.notes) load.notes = prior.notes;
         if (skipExpand) load.detail_method = load.detail_method || 'cache_skip_expand';
       }
+      if (!isGoodLocation(load.pickup_location)) load.pickup_location = null;
+      if (!isGoodLocation(load.delivery_location)) load.delivery_location = null;
       out.push(load);
     }
 
@@ -1101,8 +1308,13 @@
         amazon_ref_id: extractLabeledValue(text, ['Amazon reference', 'Reference', 'Confirmation']),
         load_status: mapLoadStatus(statusRaw) || statusRaw || inferStatusFromText(text),
         payment_status: null,
-        pickup_location: extractLabeledValue(text, ['Pickup', 'Origin', 'From']),
-        delivery_location: extractLabeledValue(text, ['Delivery', 'Destination', 'To']),
+        ...(() => {
+          const places = parsePlacesFromBlock(text);
+          return {
+            pickup_location: places.pickup_location,
+            delivery_location: places.delivery_location,
+          };
+        })(),
         pickup_date: parseDate(extractLabeledValue(text, ['Pickup date', 'Start date', 'Depart'])),
         delivery_date: parseDate(extractLabeledValue(text, ['Delivery date', 'End date', 'Arrive'])),
         trailer_id: normalizeTrailer(extractLabeledValue(text, ['Trailer', 'Trailer ID'])),
@@ -1733,7 +1945,7 @@
       return loads
         .map(
           (l) =>
-            `${l.load_id}|${l.status || ''}|${l.status_bar_state || ''}|${l.driver_name || ''}|${l.trailer_id || ''}`,
+            `${l.load_id}|${l.load_status || ''}|${l.status_bar_state || ''}|${l.driver_name_raw || ''}|${l.trailer_id || ''}|${l.pickup_location || ''}|${l.delivery_location || ''}`,
         )
         .sort()
         .join(';');
@@ -1755,10 +1967,18 @@
         if (now - lastSentAt < MIN_INTERVAL) return;
 
         const bucket = detectTripBucket();
-        const loads = collectVisibleTripsSync(bucket);
+        // Expand changed rows so PU/drop city-state + trailer/load id are visible
+        const result = await collectVisibleTrips(bucket, {
+          maxExpand: 3,
+          expandDelayMs: 700,
+          collapseDelayMs: 280,
+          expandJitterMs: 350,
+          softYield: true,
+        });
+        const loads = (result.loads || []).filter((l) => !l.history_skip);
         if (!loads.length) return;
         const fp = fingerprintLoads(loads);
-        if (fp === lastFingerprint) return;
+        if (fp === lastFingerprint && !loads.some((l) => !locationsAreGood(l))) return;
 
         lastFingerprint = fp;
         lastSentAt = now;
@@ -1766,6 +1986,7 @@
           type: 'NEAR_LIVE_TRIPS',
           loads,
           trip_bucket: bucket,
+          rows_expanded: result.expanded || 0,
           url: location.href,
           hidden: document.hidden,
           reason,
