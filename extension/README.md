@@ -27,6 +27,13 @@ Set `SUPABASE_ANON_KEY` in `shared/config.js` from that project's Settings → A
 6. Open Relay **Trips** (Upcoming / In Transit / History) plus **Payments**. Checklist updates as pages are detected. **v1.3.0** soft sync: keep using Relay while sync runs (popup progress; typical full pass **45–90s**). History walks **This week / Last week** (or Last 14 days) filters. Trips scan ~every 4–6 min with jitter; Payments on a longer cadence (~20–30 min). Delivery dates no longer invent Dec 31 / year-2044 junk. **v1.2.x** auto-expand + `T-…` upserts still apply.
 7. After updating this folder: `chrome://extensions` → **Reload** on Internal Sys — Amazon Relay Sync → refresh any open Relay tabs → **GO LIVE** (or Force scan).
 
+## v1.3.1 notes
+
+- **Near-live Trips**: on Upcoming / In Transit, DOM + network hooks debounce an incremental sync (seconds), without waiting for the 4–6 min soft alarm. History + Payments stay on the slower cadence.
+- **Unstick busy**: separate Trips vs Payments locks, hard timeouts on collect/flush, in-memory mutex + stale recovery so a hung Payments scrape cannot freeze Trips forever.
+- **Active vs History**: completed/cancelled loads always map to History; a full Upcoming+In Transit soft pass reconciles CRM so leftover “active” rows drop to History when they leave Relay’s active set.
+- **History skip**: already-synced History trips are skipped (no re-expand / re-upsert) unless status or pay changed.
+
 ## Security
 
 - No Supabase service-role key in the extension

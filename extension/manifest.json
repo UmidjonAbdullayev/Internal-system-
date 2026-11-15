@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.3.0",
-  "description": "Soft Relay→CRM sync: non-blocking progress, History week filters, stealth pacing, lighter payments cadence, fixed delivery dates.",
+  "version": "1.3.1",
+  "description": "Near-live Trips + soft sync: stuck-busy fix, separate Trips/Payments locks, hard timeouts, History week filters, stealth pacing.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
   "host_permissions": [
     "https://relay.amazon.com/*",
