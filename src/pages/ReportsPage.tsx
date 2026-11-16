@@ -212,6 +212,7 @@ function GroupRows({
 
 export function ReportsPage() {
   const {
+    loads,
     loadReports,
     drivers,
     companySettings,
@@ -410,7 +411,13 @@ export function ReportsPage() {
       {!rowsInRange.length ? (
         <EmptyState
           title="No report rows for this range"
-          description="Use Update to pull synced Relay tours, or Quick Add / Add row to create entries."
+          description={
+            loadReports.length > 0
+              ? `${loadReports.length} report row(s) exist outside this week’s filter — widen the date preset or click Sync from loads.`
+              : loads.length > 0
+                ? `${loads.length} synced load(s) in CRM — click Sync from loads to pull this week into Reports.`
+                : 'Use Update to pull synced Relay tours, or Quick Add / Add row to create entries.'
+          }
           actionLabel={syncing ? 'Syncing…' : 'Sync from loads'}
           onAction={() => {
             if (!syncing) void handleUpdate();

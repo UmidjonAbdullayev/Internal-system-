@@ -271,11 +271,18 @@ Deno.serve(async (req: Request) => {
     const loads: LoadIn[] = Array.isArray(body.loads) ? body.loads : [];
     const payments: PaymentIn[] = Array.isArray(body.payments) ? body.payments : [];
     const clientId = typeof body.client_id === "string" ? body.client_id : null;
-    /** When set (full Upcoming+In Transit pass), demote other active amazon_relay rows to History. */
+    /**
+     * When set (full Upcoming+In Transit pass), demote other active amazon_relay rows to History.
+     * Empty array must NOT reconcile — JS treats [] as truthy and previously demoted the entire
+     * active fleet whenever a soft pass found zero upcoming/in_transit ids (hidden tab, tab-switch
+     * miss, or history-only scrape). Require at least one observed active id.
+     */
     const reconcileActiveIds: string[] | null = Array.isArray(body.reconcile_active_ids)
       ? body.reconcile_active_ids.filter((id: unknown) => isValidRelayLoadId(id)).map(String)
       : null;
     const now = new Date().toISOString();
+    /** Load ids upserted this request as non-terminal — never demote in the same pass. */
+    const upsertedActiveIds = new Set<string>();
 
     const { data: run, error: runErr } = await sb
       .from("relay_sync_runs")
@@ -465,6 +472,13 @@ Deno.serve(async (req: Request) => {
         }
         loadsInserted += 1;
         syncedLoadIds.push(load.load_id);
+        if (
+          row.trip_bucket === "upcoming" ||
+          row.trip_bucket === "in_transit" ||
+          !TERMINAL_STATUSES.has(String(row.load_status))
+        ) {
+          upsertedActiveIds.add(String(load.load_id).toUpperCase());
+        }
         await sb.from("activity_logs").insert({
           type: "load",
           action: "created",
@@ -481,6 +495,13 @@ Deno.serve(async (req: Request) => {
         else {
           syncedLoadIds.push(load.load_id);
           loadsUpdated += 1;
+          if (
+            row.trip_bucket === "upcoming" ||
+            row.trip_bucket === "in_transit" ||
+            !TERMINAL_STATUSES.has(String(row.load_status))
+          ) {
+            upsertedActiveIds.add(String(load.load_id).toUpperCase());
+          }
         }
       } else {
         const { error } = await sb
@@ -495,6 +516,13 @@ Deno.serve(async (req: Request) => {
         }
         loadsUpdated += 1;
         syncedLoadIds.push(load.load_id);
+        if (
+          row.trip_bucket === "upcoming" ||
+          row.trip_bucket === "in_transit" ||
+          !TERMINAL_STATUSES.has(String(row.load_status))
+        ) {
+          upsertedActiveIds.add(String(load.load_id).toUpperCase());
+        }
         if (existing.payment_status !== row.payment_status) {
           notifications.push({
             event_type: "payment_change",
@@ -624,8 +652,12 @@ Deno.serve(async (req: Request) => {
 
     // Full active pass: anything still upcoming/in_transit but not in Relay's active set → History
     let loadsReconciled = 0;
-    if (reconcileActiveIds) {
-      const activeSet = new Set(reconcileActiveIds.map((id) => id.toUpperCase()));
+    // Skip empty reconcile sets — they wipe the active fleet (see comment above).
+    if (reconcileActiveIds && reconcileActiveIds.length > 0) {
+      const activeSet = new Set([
+        ...reconcileActiveIds.map((id) => id.toUpperCase()),
+        ...upsertedActiveIds,
+      ]);
       const { data: activeRows, error: activeErr } = await sb
         .from("loads")
         .select("id, load_id, load_status, trip_bucket, status_history")
