@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.3.4",
-  "description": "Scroll-all In Transit expand/flush; arrival scrape + facility Telegram alerts.",
+  "version": "1.3.5",
+  "description": "Click trip row to expand legs; scrape trailer/tractor/Arrival/Sch. into CRM.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
   "host_permissions": [
     "https://relay.amazon.com/*",

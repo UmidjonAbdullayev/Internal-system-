@@ -462,9 +462,10 @@ Deno.serve(async (req: Request) => {
         ),
         pickup_date: load.pickup_date,
         delivery_date: load.delivery_date,
-        trailer_id: load.trailer_id ?? null,
-        trailer_type: load.trailer_type ?? null,
-        tractor_id: load.tractor_id ?? null,
+        // Keep prior equipment when a collapsed scrape omits Trailer/Tractor
+        trailer_id: load.trailer_id ?? existing?.trailer_id ?? null,
+        trailer_type: load.trailer_type ?? existing?.trailer_type ?? null,
+        tractor_id: load.tractor_id ?? existing?.tractor_id ?? null,
         parent_trip_id: load.parent_trip_id ?? null,
         trip_bucket: load.trip_bucket ?? null,
         status_bar_state: load.status_bar_state ?? null,
