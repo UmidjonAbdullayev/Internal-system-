@@ -104,6 +104,7 @@ export function LoadsPage() {
   const [tab, setTab] = useState<LoadsTab>(
     urlTab && TRIP_TABS.some((x) => x.id === urlTab) ? urlTab : 'in_transit',
   );
+  const [tabAutoPicked, setTabAutoPicked] = useState(Boolean(urlTab));
   const [search, setSearch] = useState(params.get('q') ?? '');
   const [statusFilter, setStatusFilter] = useState(params.get('status') ?? '');
   const [paymentFilter, setPaymentFilter] = useState(params.get('paymentStatus') ?? '');
@@ -127,7 +128,10 @@ export function LoadsPage() {
       setParams(params, { replace: true });
     }
     const t = params.get('tab') as LoadsTab | null;
-    if (t && TRIP_TABS.some((x) => x.id === t)) setTab(t);
+    if (t && TRIP_TABS.some((x) => x.id === t)) {
+      setTab(t);
+      setTabAutoPicked(true);
+    }
   }, [params, setParams]);
 
   const driverMap = useMemo(
@@ -148,6 +152,21 @@ export function LoadsPage() {
     }
     return counts;
   }, [loads]);
+
+  // When synced data exists but default In Transit is empty, land on a tab that has rows.
+  useEffect(() => {
+    if (tabAutoPicked || !loads.length) return;
+    const preferred: LoadsTab[] = ['in_transit', 'upcoming', 'history', 'all'];
+    const next =
+      preferred.find((t) => (t === 'all' ? loads.length > 0 : tabCounts[t] > 0)) || 'all';
+    if (next !== tab) {
+      setTab(next);
+      const nextParams = new URLSearchParams(params);
+      nextParams.set('tab', next);
+      setParams(nextParams, { replace: true });
+    }
+    setTabAutoPicked(true);
+  }, [loads.length, tabCounts, tabAutoPicked, tab, params, setParams]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
@@ -186,6 +205,12 @@ export function LoadsPage() {
       return true;
     });
   }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, datesActive, driverMap]);
+
+  /** Rows in the current tab before date/search filters — used for “hidden by filter” UX. */
+  const inTabCount = useMemo(() => {
+    if (tab === 'all') return loads.length;
+    return loads.filter((l) => inferTripBucket(l) === tab).length;
+  }, [loads, tab]);
 
   const sorted = useSort(filtered, sortKey, sortDir, {
     loadId: (l) => l.loadId,
@@ -422,6 +447,53 @@ export function LoadsPage() {
             </p>
           )}
         </div>
+        {inTabCount > 0 &&
+          filtered.length === 0 &&
+          ((datesActive && (dateFrom || dateTo)) ||
+            search ||
+            statusFilter ||
+            paymentFilter ||
+            driverFilter) && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+            <span>
+              {inTabCount} trip{inTabCount === 1 ? '' : 's'} in this tab, but filters hide them
+              {datesActive && (dateFrom || dateTo)
+                ? ` (dates ${dateFrom || '…'} → ${dateTo || '…'})`
+                : ''}
+              .
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              type="button"
+              onClick={() => {
+                if (datesActive) {
+                  setDateFrom('');
+                  setDateTo('');
+                }
+                setSearch('');
+                setStatusFilter('');
+                setPaymentFilter('');
+                setDriverFilter('');
+              }}
+            >
+              Clear filters
+            </Button>
+            {datesActive && (
+              <Button
+                variant="ghost"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom(week.start);
+                  setDateTo(week.end);
+                }}
+              >
+                Use this week
+              </Button>
+            )}
+          </div>
+        )}
       </Card>
 
       <Card className="overflow-hidden">
@@ -512,31 +584,48 @@ export function LoadsPage() {
               title={
                 loads.length === 0
                   ? 'No trips synced yet'
-                  : tab === 'in_transit'
-                    ? 'No In Transit trips'
-                    : tab === 'upcoming'
-                      ? 'No Upcoming trips'
-                      : tab === 'history'
-                        ? 'No History trips in this date range'
-                        : 'No trips in this tab'
+                  : inTabCount > 0
+                    ? 'Filters hide synced trips'
+                    : tab === 'in_transit'
+                      ? 'No In Transit trips'
+                      : tab === 'upcoming'
+                        ? 'No Upcoming trips'
+                        : tab === 'history'
+                          ? 'No History trips in this date range'
+                          : 'No trips in this tab'
               }
               description={
                 loads.length === 0
-                  ? 'Open Amazon Relay Trips with the extension live (GO LIVE), then refresh.'
-                  : tab === 'history' && (dateFrom || dateTo)
-                    ? 'Widen the History date range (This week / All dates), or sync Relay History.'
-                    : tab === 'in_transit' && tabCounts.history > 0
-                      ? `${tabCounts.history} trip(s) are under History. Switch tabs, or Force scan with Upcoming/In Transit open.`
-                      : 'Open Amazon Relay Trips with the extension live, or add a load manually.'
+                  ? 'Open Amazon Relay Trips with the extension live (GO LIVE), then refresh. Extension “Synced” can mean the page was scraped with nothing new to upsert — check CRM Errors and Supabase loads.'
+                  : inTabCount > 0 && datesActive && (dateFrom || dateTo)
+                    ? `This History tab has ${inTabCount} synced trip(s). Widen the date range (This week / All dates).`
+                    : inTabCount > 0
+                      ? `This tab has ${inTabCount} synced trip(s). Clear search/status/payment/driver filters.`
+                      : tab === 'in_transit' && tabCounts.history > 0
+                        ? `${tabCounts.history} trip(s) are under History. Switch tabs, or Force scan with Upcoming/In Transit open so active trips stay active.`
+                        : 'Open Amazon Relay Trips with the extension live, or add a load manually.'
               }
-              actionLabel={tab === 'history' && (dateFrom || dateTo) ? 'All dates' : 'Add Load'}
+              actionLabel={
+                inTabCount > 0 && datesActive && (dateFrom || dateTo)
+                  ? 'All dates'
+                  : inTabCount > 0
+                    ? 'Clear filters'
+                    : 'Add Load'
+              }
               onAction={
-                tab === 'history' && (dateFrom || dateTo)
+                inTabCount > 0 && datesActive && (dateFrom || dateTo)
                   ? () => {
                       setDateFrom('');
                       setDateTo('');
                     }
-                  : openCreate
+                  : inTabCount > 0
+                    ? () => {
+                        setSearch('');
+                        setStatusFilter('');
+                        setPaymentFilter('');
+                        setDriverFilter('');
+                      }
+                    : openCreate
               }
             />
           )}

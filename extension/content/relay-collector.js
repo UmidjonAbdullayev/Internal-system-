@@ -1392,10 +1392,22 @@
     for (const load of [...primary, ...secondary]) {
       if (!load?.load_id) continue;
       const prev = map.get(load.load_id) || {};
-      map.set(load.load_id, {
+      const next = {
         ...prev,
         ...Object.fromEntries(Object.entries(load).filter(([, v]) => v != null && v !== '')),
-      });
+      };
+      // Prefer Upcoming/In Transit over History when the same id is seen on both boards
+      // (failed tab switch can re-tag active cards as history).
+      const prevBucket = prev.trip_bucket;
+      const nextBucket = load.trip_bucket;
+      if (
+        (prevBucket === 'upcoming' || prevBucket === 'in_transit') &&
+        nextBucket === 'history'
+      ) {
+        next.trip_bucket = prevBucket;
+        if (prev.load_status) next.load_status = prev.load_status;
+      }
+      map.set(load.load_id, next);
     }
     return [...map.values()];
   }
