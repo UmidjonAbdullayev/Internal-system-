@@ -62,6 +62,9 @@ create table if not exists public.loads (
   trip_bucket text check (trip_bucket is null or trip_bucket in ('upcoming','in_transit','history')),
   status_bar_state text,
   status_stop_index integer,
+  arrival_actual text,
+  arrival_scheduled text,
+  arrival_address text,
   job_type text,
   distance_miles numeric(10,1) default 0,
   rate_gross numeric(12,2) not null default 0,
@@ -298,6 +301,19 @@ create table if not exists public.telegram_notification_history (
 create index if not exists telegram_notif_history_chat_idx
   on public.telegram_notification_history(telegram_chat_id, created_at desc);
 
+-- Private-chat admin sessions (password + DRV gate for bot DM menus)
+create table if not exists public.telegram_admin_sessions (
+  telegram_user_id bigint primary key,
+  authenticated_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  selected_driver_id uuid references public.drivers(id) on delete set null,
+  selected_driver_code text,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists telegram_admin_sessions_expires_idx
+  on public.telegram_admin_sessions(expires_at);
+
 -- RLS: extension writes via Edge Functions (service role); authenticated CRM can read
 alter table public.users enable row level security;
 alter table public.drivers enable row level security;
@@ -314,6 +330,7 @@ alter table public.relay_sync_runs enable row level security;
 alter table public.relay_notification_dedupe enable row level security;
 alter table public.driver_telegram_groups enable row level security;
 alter table public.telegram_notification_history enable row level security;
+alter table public.telegram_admin_sessions enable row level security;
 
 do $$
 begin

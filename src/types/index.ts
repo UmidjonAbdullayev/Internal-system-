@@ -98,6 +98,9 @@ export interface Load {
   tripBucket?: TripBucket | null;
   statusBarState?: StatusBarState | null;
   statusStopIndex?: number | null;
+  arrivalActual?: string | null;
+  arrivalScheduled?: string | null;
+  arrivalAddress?: string | null;
   jobType?: string | null;
   distanceMiles: number;
   rateGross: number;

@@ -24,6 +24,9 @@ type LoadIn = {
   trip_bucket?: string | null;
   status_bar_state?: string | null;
   status_stop_index?: number | null;
+  arrival_actual?: string | null;
+  arrival_scheduled?: string | null;
+  arrival_address?: string | null;
   job_type?: string | null;
   distance_miles?: number | null;
   rate_gross?: number | null;
@@ -301,6 +304,7 @@ Deno.serve(async (req: Request) => {
       message: string;
       driver_id?: string | null;
       trailer_id?: string | null;
+      tractor_id?: string | null;
       load_id?: string | null;
     }> = [];
 
@@ -325,7 +329,7 @@ Deno.serve(async (req: Request) => {
       const { data: existing, error: findErr } = await sb
         .from("loads")
         .select(
-          "id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, tractor_id, driver_id, status_bar_state, status_stop_index, trip_bucket, parent_trip_id, driver_name_raw, pickup_location, delivery_location, rate_gross",
+          "id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, tractor_id, driver_id, status_bar_state, status_stop_index, arrival_actual, arrival_scheduled, arrival_address, trip_bucket, parent_trip_id, driver_name_raw, pickup_location, delivery_location, rate_gross",
         )
         .eq("load_id", load.load_id)
         .maybeSingle();
@@ -347,68 +351,51 @@ Deno.serve(async (req: Request) => {
           timestamp: now,
           note: "Observed from Amazon Relay page",
         });
-        if (existing && existing.load_status !== load.load_status) {
-          notifications.push({
-            event_type: "load_status_change",
-            dedupe_key: `load_status:${load.load_id}:${load.load_status}`,
-            message: `Load ${load.load_id} status: ${existing.load_status} → ${load.load_status}`,
-            driver_id: driverId || existing.driver_id,
-            trailer_id: load.trailer_id ?? existing.trailer_id,
-            load_id: load.load_id,
-          });
-        }
+        // Groups only receive facility-arrival alerts (no load_status / payment spam).
       }
 
-      if (
-        existing &&
-        load.trailer_id &&
-        existing.trailer_id &&
-        load.trailer_id !== existing.trailer_id
-      ) {
-        notifications.push({
-          event_type: "trailer_change",
-          dedupe_key: `trailer:${load.load_id}:${load.trailer_id}`,
-          message: `Load ${load.load_id} trailer: ${existing.trailer_id} → ${load.trailer_id}`,
-          driver_id: driverId || existing.driver_id,
-          trailer_id: load.trailer_id,
-          load_id: load.load_id,
-        });
-      }
+      // Trailer changes are synced to CRM but not pushed to Telegram groups.
 
       const nextBar = load.status_bar_state || null;
       const prevBar = existing?.status_bar_state || null;
-      if (nextBar && nextBar !== prevBar) {
+      if (nextBar && nextBar !== prevBar && nextBar === "arrived") {
         const stop = load.status_stop_index ?? existing?.status_stop_index ?? 1;
         const trip = load.parent_trip_id || existing?.parent_trip_id || load.load_id;
         const driverLabel = load.driver_name_raw || existing?.driver_name_raw || "driver";
-        if (nextBar === "arrived") {
-          notifications.push({
-            event_type: "facility_arrived",
-            dedupe_key: `arrived:${load.load_id}:stop:${stop}`,
-            message:
-              `Arrived facility (stop ${stop})\n` +
-              `Trip ${trip} · Load ${load.load_id}\n` +
-              `Driver: ${driverLabel}\n` +
-              `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}\n` +
-              `Pay: $${load.rate_gross ?? existing?.rate_gross ?? 0}`,
-            driver_id: driverId || existing?.driver_id,
-            trailer_id: load.trailer_id ?? existing?.trailer_id,
-            load_id: load.load_id,
-          });
-        } else if (nextBar === "loaded_enroute") {
-          notifications.push({
-            event_type: "loaded_enroute",
-            dedupe_key: `enroute:${load.load_id}:stop:${stop}`,
-            message:
-              `Loaded & on the way (stop ${stop})\n` +
-              `Trip ${trip} · Load ${load.load_id}\n` +
-              `Driver: ${driverLabel}\n` +
-              `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}`,
-            driver_id: driverId || existing?.driver_id,
-            trailer_id: load.trailer_id ?? existing?.trailer_id,
-            load_id: load.load_id,
-          });
-        }
+        const trailer = load.trailer_id ?? existing?.trailer_id ?? "—";
+        const tractor = load.tractor_id ?? existing?.tractor_id ?? "—";
+        const arrivedAt =
+          load.arrival_actual || existing?.arrival_actual || "—";
+        const scheduledAt =
+          load.arrival_scheduled || existing?.arrival_scheduled || "—";
+        const address =
+          load.arrival_address ||
+          existing?.arrival_address ||
+          load.pickup_location ||
+          existing?.pickup_location ||
+          load.delivery_location ||
+          existing?.delivery_location ||
+          "—";
+        const route =
+          `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}`;
+        notifications.push({
+          event_type: "facility_arrived",
+          dedupe_key: `arrived:${load.load_id}:stop:${stop}`,
+          message:
+            `Facility arrival (stop ${stop})\n` +
+            `Trip ${trip} · Load ${load.load_id}\n` +
+            `Driver: ${driverLabel}\n` +
+            `Trailer: ${trailer}\n` +
+            `Tractor: ${tractor}\n` +
+            `Address: ${address}\n` +
+            `Arrived: ${arrivedAt}\n` +
+            `Sch.: ${scheduledAt}\n` +
+            `Route: ${route}`,
+          driver_id: driverId || existing?.driver_id,
+          trailer_id: load.trailer_id ?? existing?.trailer_id,
+          tractor_id: load.tractor_id ?? existing?.tractor_id,
+          load_id: load.load_id,
+        });
       }
 
       const row = {
@@ -438,6 +425,9 @@ Deno.serve(async (req: Request) => {
         trip_bucket: load.trip_bucket ?? null,
         status_bar_state: load.status_bar_state ?? null,
         status_stop_index: load.status_stop_index ?? null,
+        arrival_actual: load.arrival_actual ?? existing?.arrival_actual ?? null,
+        arrival_scheduled: load.arrival_scheduled ?? existing?.arrival_scheduled ?? null,
+        arrival_address: load.arrival_address ?? existing?.arrival_address ?? null,
         job_type: load.job_type ?? null,
         distance_miles: load.distance_miles ?? 0,
         rate_gross: load.rate_gross ?? 0,
@@ -495,16 +485,7 @@ Deno.serve(async (req: Request) => {
         }
         loadsUpdated += 1;
         syncedLoadIds.push(load.load_id);
-        if (existing.payment_status !== row.payment_status) {
-          notifications.push({
-            event_type: "payment_change",
-            dedupe_key: `pay_status:${load.load_id}:${row.payment_status}`,
-            message: `Load ${load.load_id} payment: ${existing.payment_status} → ${row.payment_status}`,
-            driver_id: driverId || existing.driver_id,
-            trailer_id: row.trailer_id,
-            load_id: load.load_id,
-          });
-        }
+        // Payment status still upserts to CRM; Telegram no longer notifies payments.
       }
     }
 
@@ -533,11 +514,6 @@ Deno.serve(async (req: Request) => {
             })
             .eq("id", loadRow.id);
           loadsPaymentUpdated += 1;
-          notifications.push({
-            event_type: "payment_change",
-            dedupe_key: `pay_status:${payment.load_id}:${payment.payment_status}`,
-            message: `Load ${payment.load_id} payment: ${loadRow.payment_status} → ${payment.payment_status}`,
-          });
         }
       }
 
@@ -583,11 +559,6 @@ Deno.serve(async (req: Request) => {
         else {
           paymentsUpserted += 1;
           syncedPaymentRefs.push(ref);
-          notifications.push({
-            event_type: "payment_change",
-            dedupe_key: `pay_new:${ref}`,
-            message: `New Relay payment ${ref}: $${payment.amount}`,
-          });
         }
       } else if (existingPay.content_hash !== payRow.content_hash) {
         const { error } = await sb
@@ -598,11 +569,6 @@ Deno.serve(async (req: Request) => {
         else {
           paymentsUpserted += 1;
           syncedPaymentRefs.push(ref);
-          notifications.push({
-            event_type: "payment_change",
-            dedupe_key: `pay_upd:${ref}:${payRow.content_hash}`,
-            message: `Relay payment updated ${ref}: $${payment.amount}`,
-          });
         }
       } else {
         await sb
@@ -672,15 +638,7 @@ Deno.serve(async (req: Request) => {
             })
             .eq("id", row.id);
           if (error) errors.push(`Reconcile ${row.load_id}: ${error.message}`);
-          else {
-            loadsReconciled += 1;
-            notifications.push({
-              event_type: "load_status_change",
-              dedupe_key: `reconcile_history:${row.load_id}:${nextStatus}`,
-              message: `Load ${row.load_id} moved to History (no longer on Relay active trips)`,
-              load_id: row.load_id,
-            });
-          }
+          else loadsReconciled += 1;
         }
       }
 
