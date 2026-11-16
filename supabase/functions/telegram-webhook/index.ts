@@ -26,7 +26,8 @@ const BOT_COMMANDS_PRIVATE = [
 ];
 
 const ACTIVE_LOAD_EXCLUDE = '("Completed","Cancelled","Rejected","Delivered")';
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+/** Long-lived unlock after one password; refreshed on activity (sliding). */
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 let commandsEnsured = false;
 
@@ -181,13 +182,24 @@ async function getSession(
   return data as AdminSession;
 }
 
+async function touchSession(sb: SupabaseClient, userId: number) {
+  const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  await sb
+    .from("telegram_admin_sessions")
+    .update({ expires_at: expires, updated_at: new Date().toISOString() })
+    .eq("telegram_user_id", userId);
+}
+
 async function upsertAuthSession(sb: SupabaseClient, userId: number) {
   const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  const existing = await getSession(sb, userId);
   await sb.from("telegram_admin_sessions").upsert(
     {
       telegram_user_id: userId,
       authenticated_at: new Date().toISOString(),
       expires_at: expires,
+      selected_driver_id: existing?.selected_driver_id ?? null,
+      selected_driver_code: existing?.selected_driver_code ?? null,
       updated_at: new Date().toISOString(),
     },
     { onConflict: "telegram_user_id" },
@@ -212,6 +224,16 @@ async function selectDriverSession(
     },
     { onConflict: "telegram_user_id" },
   );
+}
+
+function askPasswordOnceText(): string {
+  return [
+    "Welcome to Amazon Relay Intelligence.",
+    "",
+    "Send the admin password once to unlock this chat.",
+    "After that you stay unlocked — no password on every command.",
+    "When you look up a driver, send DRV-xxxx (or /driver DRV-xxxx).",
+  ].join("\n");
 }
 
 function adminPasswordConfigured(): string | null {
@@ -410,18 +432,24 @@ async function buildTourText(
   return lines.join("\n");
 }
 
-function helpText(): string {
+function helpText(session?: AdminSession | null): string {
+  if (!session) {
+    return askPasswordOnceText() +
+      "\n\n/logout — clear session\n/help — this message\n\nDriver groups: no slash menu; facility-arrival alerts only.\nLink a group with /link DRV-xxxx inside that group.";
+  }
+  const driverLine = session.selected_driver_code
+    ? `Selected driver: ${session.selected_driver_code}`
+    : "No driver selected yet — send DRV-xxxx when you need a lookup.";
   return [
-    "Amazon Relay Intelligence — private bot menu:",
-    "1) Send the admin password (Edge secret TELEGRAM_ADMIN_PASSWORD)",
-    "2) Send DRV-xxxx (or /driver DRV-xxxx) to select a driver",
-    "3) Use /menu /status /updates /tour",
+    "Unlocked — password not needed again until /logout.",
+    driverLine,
     "",
-    "/logout — clear session",
-    "/help — this message",
+    "/menu — open buttons",
+    "/status /updates /tour — driver lookups (need DRV selected)",
+    "/driver DRV-xxxx — select / switch driver",
+    "/logout — lock again",
     "",
-    "Driver groups: no slash menu. They only get facility-arrival alerts.",
-    "Link a group by typing /link DRV-xxxx inside that group.",
+    "Driver groups: no slash menu; facility-arrival alerts only.",
   ].join("\n");
 }
 
@@ -447,18 +475,16 @@ async function requirePrivateAdmin(
   }
   const session = await getSession(sb, userId);
   if (!session) {
-    await reply(
-      botToken,
-      chatId,
-      "Locked. Send the admin password first, then DRV-xxxx to select a driver.",
-    );
+    await reply(botToken, chatId, askPasswordOnceText());
     return null;
   }
+  // Sliding unlock — stay unlocked while they keep using the bot.
+  await touchSession(sb, userId);
   if (needDriver && !session.selected_driver_id) {
     await reply(
       botToken,
       chatId,
-      "Authenticated. Send DRV-xxxx (or /driver DRV-xxxx) to select a driver, then open /menu.",
+      "Unlocked. Send DRV-xxxx (or /driver DRV-xxxx) to look up a driver.",
     );
     return null;
   }
@@ -499,7 +525,13 @@ async function handleCallback(
     return;
   }
   if (data === "menu:help") {
-    await reply(botToken, chatId, helpText(), mainMenuKeyboard());
+    const session = userId != null ? await getSession(sb, userId) : null;
+    await reply(
+      botToken,
+      chatId,
+      helpText(session),
+      session ? mainMenuKeyboard() : undefined,
+    );
     return;
   }
   if (data === "menu:updates") {
@@ -552,12 +584,27 @@ async function tryAuthPassword(
   if (!password) return false;
   const candidate = text.replace(/^\/auth(?:@\w+)?\s+/i, "").trim();
   if (!candidate || !timingSafeEqual(candidate, password)) return false;
+  const prior = await getSession(sb, userId);
   await upsertAuthSession(sb, userId);
-  await reply(
-    botToken,
-    chatId,
-    "Admin unlocked (12h). Send DRV-xxxx (or /driver DRV-xxxx) to select a driver, then /menu.",
-  );
+  const after = await getSession(sb, userId);
+  if (prior && after?.selected_driver_id) {
+    await reply(
+      botToken,
+      chatId,
+      `Still unlocked. Driver ${after.selected_driver_code} is selected — use /menu freely.`,
+      mainMenuKeyboard(),
+    );
+  } else {
+    await reply(
+      botToken,
+      chatId,
+      [
+        "Unlocked. You stay unlocked — no password on every command.",
+        "Send DRV-xxxx (or /driver DRV-xxxx) when you want driver data, then /menu.",
+      ].join("\n"),
+      mainMenuKeyboard(),
+    );
+  }
   return true;
 }
 
@@ -735,34 +782,54 @@ Deno.serve(async (req: Request) => {
     }
 
     if (cmdBase === "/help") {
-      await reply(botToken, chatId, helpText());
+      const session = await getSession(sb, userId);
+      await reply(botToken, chatId, helpText(session), session ? mainMenuKeyboard() : undefined);
       return json({ success: true });
     }
 
     if (cmdBase === "/start") {
-      await reply(botToken, chatId, helpText());
-      return json({ success: true, start: true });
+      const session = await getSession(sb, userId);
+      if (!session) {
+        await reply(botToken, chatId, askPasswordOnceText());
+        return json({ success: true, start: true, locked: true });
+      }
+      await touchSession(sb, userId);
+      if (!session.selected_driver_id) {
+        await reply(
+          botToken,
+          chatId,
+          "Unlocked. Send DRV-xxxx (or /driver DRV-xxxx) to look up a driver, or open /menu.",
+          mainMenuKeyboard(),
+        );
+        return json({ success: true, start: true, unlocked: true });
+      }
+      await reply(
+        botToken,
+        chatId,
+        `Welcome back — still unlocked. Menu for ${session.selected_driver_code}:`,
+        mainMenuKeyboard(),
+      );
+      return json({ success: true, start: true, menu: true });
     }
 
-    // Plain password or /auth <password>
+    // Plain password or /auth <password> — unlock once
     if (await tryAuthPassword(botToken, sb, chatId, userId, text)) {
       return json({ success: true, authenticated: true });
     }
 
-    // DRV-xxxx or /driver DRV-xxxx
+    // DRV-xxxx or /driver DRV-xxxx — required for driver lookups
     if (await trySelectDriver(botToken, sb, chatId, userId, text)) {
       return json({ success: true, driver_selected: true });
     }
 
     if (cmdBase === "/menu") {
-      const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
-      if (!session?.selected_driver_id) return json({ success: true });
-      await reply(
-        botToken,
-        chatId,
-        `Menu for ${session.selected_driver_code || "driver"} — pick an option:`,
-        mainMenuKeyboard(),
-      );
+      // Menus freely after unlock; DRV only when a lookup button needs it.
+      const session = await requirePrivateAdmin(botToken, sb, chatId, userId, false);
+      if (!session) return json({ success: true });
+      const label = session.selected_driver_code
+        ? `Menu for ${session.selected_driver_code}`
+        : "Menu (send DRV-xxxx before status / updates / tour)";
+      await reply(botToken, chatId, `${label} — pick an option:`, mainMenuKeyboard());
       return json({ success: true, menu: true });
     }
 
