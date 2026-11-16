@@ -1116,9 +1116,178 @@
     return null;
   }
 
-  function findExpandControl(cardRoot) {
-    if (!cardRoot) return null;
-    if (isCardExpanded(cardRoot)) return null;
+  /** Assign Driver / Available drivers / driver links / dropdowns — never click. */
+  function isDriverAssignControl(el) {
+    if (!el) return false;
+    const label = `${el.getAttribute?.('aria-label') || ''} ${el.getAttribute?.('title') || ''} ${
+      el.className || ''
+    } ${(el.innerText || '').slice(0, 120)}`;
+    if (/assign\s*driver|available\s*drivers?|select\s*driver|change\s*driver|unassign/i.test(label)) {
+      return true;
+    }
+    const role = el.getAttribute?.('role') || '';
+    if (/listbox|combobox|option/i.test(role)) return true;
+    if (el.tagName === 'SELECT' || el.tagName === 'OPTION') return true;
+    if (el.closest?.('[role="listbox"], [role="combobox"], select, [aria-haspopup="listbox"]')) {
+      return true;
+    }
+    // Driver name as a link / button ("B. Baikulov", "Suhrab Rostayee")
+    const text = (el.innerText || el.textContent || '').trim();
+    if (
+      (el.tagName === 'A' || role === 'link' || el.tagName === 'BUTTON') &&
+      sanitizeDriverName(text) &&
+      text.length < 48
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function isUnsafeExpandTarget(el) {
+    if (!el) return true;
+    if (isDriverAssignControl(el)) return true;
+    if (el.closest && isDriverAssignControl(el.closest('a, button, [role="button"], [role="link"]'))) {
+      return true;
+    }
+    const label = `${el.getAttribute?.('aria-label') || ''} ${el.getAttribute?.('title') || ''} ${
+      el.className || ''
+    }`;
+    if (/menu|more|overflow|share|copy|delete|cancel|reject|filter|search|close|ask a question|report delay/i.test(label)) {
+      return true;
+    }
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return true;
+    // Never treat the whole trip/leg row as the expand control
+    const text = (el.innerText || '').trim();
+    if (text.length > 80 && /mi\b|\$|→|->/i.test(text)) return true;
+    return false;
+  }
+
+  function isBlueishColor(color) {
+    const m = String(color || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (!m) return false;
+    const r = Number(m[1]);
+    const g = Number(m[2]);
+    const b = Number(m[3]);
+    // Relay chevrons are blue (#0x / amazon blue); exclude gray/black arrows
+    return b >= 140 && b > r + 25 && b >= g && r <= 120;
+  }
+
+  function elementLooksBlue(el) {
+    if (!el) return false;
+    const nodes = [el, ...(el.querySelectorAll?.('svg, path, use, span, i') || [])];
+    for (const node of nodes) {
+      try {
+        const cs = getComputedStyle(node);
+        if (
+          isBlueishColor(cs.color) ||
+          isBlueishColor(cs.fill) ||
+          isBlueishColor(cs.stroke) ||
+          isBlueishColor(cs.backgroundColor)
+        ) {
+          return true;
+        }
+      } catch {
+        /* ignore */
+      }
+      const attrFill = node.getAttribute?.('fill');
+      const attrStroke = node.getAttribute?.('stroke');
+      if (attrFill && attrFill !== 'none' && /#(?:0{0,2}[0-9a-f]{2}|007|06c|2196|147|008)/i.test(attrFill)) {
+        return true;
+      }
+      if (attrStroke && attrStroke !== 'none' && /#(?:0{0,2}[0-9a-f]{2}|007|06c|2196|147|008)/i.test(attrStroke)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function controlLabel(el) {
+    return `${el?.getAttribute?.('aria-label') || ''} ${el?.getAttribute?.('title') || ''} ${
+      el?.className || ''
+    } ${el?.getAttribute?.('data-testid') || ''}`;
+  }
+
+  function findIdAnchorInScope(scope, id) {
+    if (!scope || !id) return null;
+    const needle = String(id).trim().toUpperCase();
+    return (
+      [...scope.querySelectorAll('a, button, [role="link"], span, div, td, li')].find((el) => {
+        const t = (el.innerText || el.textContent || '').trim().toUpperCase();
+        return t === needle;
+      }) || null
+    );
+  }
+
+  /**
+   * Blue chevron (>) beside a shipment / trip id. Small control only —
+   * never the Assign Driver dropdown arrows or the whole row.
+   */
+  function findBlueChevronNearId(rowRoot, id) {
+    if (!rowRoot) return null;
+    const idEl = findIdAnchorInScope(rowRoot, id);
+    const searchRoot =
+      (idEl &&
+        (idEl.closest('[role="row"], tr, li, [class*="row" i], [class*="leg" i], [class*="shipment" i]') ||
+          idEl.parentElement?.parentElement ||
+          idEl.parentElement)) ||
+      rowRoot;
+    const idRect = idEl?.getBoundingClientRect?.() || null;
+
+    const candidates = [
+      ...searchRoot.querySelectorAll(
+        'button, [role="button"], [aria-expanded], [tabindex="0"], [class*="chevron" i], [class*="Caret" i], [class*="expand" i], [data-testid*="expand" i]',
+      ),
+    ];
+
+    const scored = [];
+    for (const raw of candidates) {
+      const el =
+        raw.closest?.('button, [role="button"], [aria-expanded], [tabindex="0"]') || raw;
+      if (!el || isUnsafeExpandTarget(el)) continue;
+      if (idEl && (el === idEl || (el.contains?.(idEl) && (el.innerText || '').trim().length > 24))) {
+        continue;
+      }
+      const r = el.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+      if (r.width > 56 || r.height > 56) continue;
+
+      const label = controlLabel(el);
+      const hasSvg = Boolean(el.querySelector?.('svg') || el.tagName === 'svg');
+      const ariaExp = el.getAttribute?.('aria-expanded');
+      const looksToggle =
+        /expand|collapse|chevron|caret|toggle|detail|show|hide/i.test(label) ||
+        ariaExp != null ||
+        hasSvg;
+      const blue = elementLooksBlue(el);
+      if (!looksToggle && !blue) continue;
+      // Assign-driver steppers are rarely blue; require blue OR explicit expand label/aria
+      if (!blue && !/expand|collapse|chevron|caret|toggle|detail/i.test(label) && ariaExp == null) {
+        continue;
+      }
+
+      let score = 0;
+      if (blue) score += 55;
+      if (/expand|collapse|chevron|caret/i.test(label)) score += 40;
+      if (ariaExp != null) score += 35;
+      if (hasSvg) score += 10;
+      if (idRect && r.right <= idRect.left + 12) score += 30;
+      if (idRect && Math.abs((r.top + r.bottom) / 2 - (idRect.top + idRect.bottom) / 2) < 28) {
+        score += 20;
+      }
+      scored.push({ el, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    // Confidence gate — skip when mechanism is unclear
+    return scored[0]?.score >= 50 ? scored[0].el : null;
+  }
+
+  /**
+   * Dedicated parent (T-…) expansion toggle. Never the whole parent row.
+   */
+  function findParentExpandToggle(parentRoot, parentId) {
+    if (!parentRoot || isCardExpanded(parentRoot)) return null;
+    if (parentHasInternalRows(parentRoot)) return null;
+
     const selectors = [
       'button[aria-expanded="false"]',
       '[aria-expanded="false"]',
@@ -1133,77 +1302,68 @@
     ];
     for (const sel of selectors) {
       try {
-        const el = cardRoot.querySelector(sel);
-        if (el) return el.closest('button, [role="button"], a') || el;
+        const el = parentRoot.querySelector(sel);
+        if (!el) continue;
+        const target = el.closest('button, [role="button"], [aria-expanded]') || el;
+        if (isUnsafeExpandTarget(target)) continue;
+        const r = target.getBoundingClientRect?.();
+        if (r && (r.width > 64 || r.height > 64)) continue;
+        return target;
       } catch {
-        /* invalid selector in older Chromium — skip */
+        /* invalid selector */
       }
     }
-    // Leg-row chevron: first small icon button near a load/trip id
-    const buttons = [...cardRoot.querySelectorAll('button, [role="button"], [tabindex="0"]')].filter(
-      (b) => {
-        const label = `${b.getAttribute('aria-label') || ''} ${b.className || ''} ${b.getAttribute('title') || ''}`;
-        if (/expand|chevron|caret|detail|toggle|arrow|collapse/i.test(label)) return true;
-        if (b.getAttribute('aria-expanded') === 'false') return true;
-        const svg = b.querySelector('svg');
-        if (!svg) return false;
-        const r = b.getBoundingClientRect?.();
-        return !r || (r.width > 0 && r.width <= 48 && r.height <= 48);
-      },
-    );
-    return buttons[0] || null;
+
+    const byId = parentId ? findBlueChevronNearId(parentRoot, parentId) : null;
+    if (byId) return byId;
+
+    // Last resort: small left-edge toggle with aria-expanded / blue chevron look
+    const buttons = [...parentRoot.querySelectorAll('button, [role="button"], [aria-expanded], [tabindex="0"]')];
+    for (const b of buttons) {
+      if (isUnsafeExpandTarget(b)) continue;
+      const r = b.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.width > 48 || r.height > 48) continue;
+      const label = controlLabel(b);
+      if (
+        b.getAttribute('aria-expanded') === 'false' ||
+        /expand|chevron|caret|toggle|detail/i.test(label) ||
+        elementLooksBlue(b)
+      ) {
+        return b;
+      }
+    }
+    return null;
   }
 
-  /**
-   * Relay Trips expands legs when the user clicks *anywhere on the trip row*
-   * (not only a chevron). Prefer a non-navigating cell inside the card.
-   */
-  function findRowClickTarget(cardRoot) {
-    if (!cardRoot) return null;
-    const isNavLink = (el) => {
-      if (!el || el === cardRoot) return false;
-      if (el.tagName === 'A' && el.getAttribute('href')) return true;
-      const role = el.getAttribute?.('role') || '';
-      if (role === 'link') return true;
-      return false;
-    };
-    const isDangerousControl = (el) => {
-      if (!el || el === cardRoot) return false;
-      const label = `${el.getAttribute?.('aria-label') || ''} ${el.getAttribute?.('title') || ''} ${el.className || ''}`;
-      if (/menu|more|overflow|share|copy|delete|cancel|reject|filter|search|close/i.test(label)) {
+  function listInternalShipmentIds(parentRoot) {
+    if (!parentRoot) return [];
+    const ids = new Set();
+    for (const scope of expandDetailScopes(parentRoot)) {
+      const t = scope.innerText || '';
+      for (const m of t.matchAll(/\b([0-9]{2,3}[A-Z0-9]{5,})\b/g)) {
+        if (isValidRelayLoadId(m[1])) ids.add(String(m[1]).toUpperCase());
+      }
+    }
+    return [...ids];
+  }
+
+  function parentHasInternalRows(parentRoot) {
+    return listInternalShipmentIds(parentRoot).length > 0;
+  }
+
+  async function waitForInternalRows(parentRoot, timeoutMs = 2200) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (parentHasInternalRows(parentRoot) || scopesHaveLegDetail(expandDetailScopes(parentRoot))) {
         return true;
       }
-      if (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') return true;
-      return false;
-    };
-
-    // Prefer a wide text cell (route / payout / miles) — same surface a human clicks
-    const candidates = [
-      ...cardRoot.querySelectorAll('[role="row"], [role="button"], [class*="row" i], [class*="card" i], [class*="Trip" i]'),
-      cardRoot,
-    ];
-    for (const el of candidates) {
-      if (!el || isNavLink(el) || isDangerousControl(el)) continue;
-      const r = el.getBoundingClientRect?.();
-      if (r && (r.width < 80 || r.height < 18)) continue;
-      const text = (el.innerText || '').trim();
-      if (text.length < 12) continue;
-      return el;
+      await sleep(140);
     }
-
-    // Click a text node parent that is not the load-id <a>
-    const spans = [...cardRoot.querySelectorAll('div, span, p, td, li')].filter((el) => {
-      if (isNavLink(el) || el.closest('a[href]')) return false;
-      if (isDangerousControl(el) || el.closest('button')) return false;
-      const t = (el.innerText || '').trim();
-      return t.length >= 8 && t.length < 400;
-    });
-    if (spans[0]) return spans[0];
-    return cardRoot;
+    return parentHasInternalRows(parentRoot) || scopesHaveLegDetail(expandDetailScopes(parentRoot));
   }
 
   function fireHumanClick(el) {
-    if (!el) return false;
+    if (!el || isUnsafeExpandTarget(el)) return false;
     const opts = { bubbles: true, cancelable: true, view: window, buttons: 1 };
     try {
       if (typeof PointerEvent === 'function') {
@@ -1262,6 +1422,26 @@
       await sleep(140);
     }
     return isCardExpanded(cardRoot) || scopesHaveLegDetail(expandDetailScopes(cardRoot));
+  }
+
+  function scrapeScopesOntoLoad(load, roots) {
+    let next = load;
+    for (const root of roots || []) {
+      if (!root) continue;
+      for (const scope of expandDetailScopes(root)) {
+        const parsed = parseDetailFromCard(scope, next.trip_bucket, next.section || 'tours');
+        if (!parsed) continue;
+        next = mergeParsedOntoLoad(next, parsed);
+        if (
+          detailIsRich(next) &&
+          locationsAreGood(next) &&
+          (!needsExpand(next) || arrivalIsRich(next))
+        ) {
+          return next;
+        }
+      }
+    }
+    return next;
   }
 
   async function bgMessage(payload) {
@@ -1369,10 +1549,11 @@
   }
 
   /**
-   * DOM/React first; then click *the trip row* (anywhere) to expand legs.
-   * Relay does not require a chevron — 1.3.4 hunted buttons and often got
-   * no_control / wrong control, so trailer / Arrival / Sch. never appeared.
-   * Waits for leg content, scrapes, then collapses via the same row click.
+   * Safe two-level expand (1.3.6+):
+   *  1) Parent T-… — dedicated toggle only (never whole-row click / Assign Driver)
+   *  2) Internal shipment — blue chevron (>) beside the leg id only
+   * Skip when the toggle/chevron cannot be identified. Do not collapse rows that
+   * were already expanded. Collapse only via the same toggle/chevron we clicked.
    */
   async function expandAndEnrichLoad(load, opts = {}) {
     const {
@@ -1418,11 +1599,9 @@
       return { load, method: load.detail_method, expanded: false };
     }
 
-    if (isCardExpanded(cardRoot)) {
-      for (const scope of expandDetailScopes(cardRoot)) {
-        enriched = parseDetailFromCard(scope, load.trip_bucket, load.section || 'tours');
-        load = mergeParsedOntoLoad(load, enriched);
-      }
+    const alreadyHadDetail = isCardExpanded(cardRoot);
+    if (alreadyHadDetail) {
+      load = scrapeScopesOntoLoad(load, [cardRoot]);
       if (!needsExpand(load)) {
         load.detail_method = load.detail_method || 'dom_expanded';
         return { load, method: load.detail_method, expanded: false };
@@ -1441,69 +1620,162 @@
     }
     if (softYield) await yieldToUi();
 
-    const rowTarget = findRowClickTarget(cardRoot);
-    const chevron = findExpandControl(cardRoot);
-    // Primary: click the row (user-confirmed Relay behavior). Chevron is fallback only.
-    const clickTargets = [rowTarget, chevron, cardRoot].filter(
-      (el, i, arr) => el && arr.indexOf(el) === i,
-    );
+    const parentId =
+      (load.parent_trip_id && String(load.parent_trip_id).toUpperCase()) ||
+      (/^T-[A-Z0-9]{5,}$/i.test(String(load.load_id || ''))
+        ? String(load.load_id).toUpperCase()
+        : null);
+    const parentRoot =
+      (parentId && findCardRootForLoadId(parentId)) || cardRoot;
 
-    let clicked = false;
-    let usedTarget = null;
-    for (const target of clickTargets) {
-      if (fireHumanClick(target)) {
-        clicked = true;
-        usedTarget = target;
-        break;
+    const togglesWeOpened = [];
+    let didWork = false;
+
+    // ── LEVEL 1: parent shipments (T-…) ──────────────────────────────────
+    const internalsBefore = listInternalShipmentIds(parentRoot);
+    if (parentId && internalsBefore.length === 0 && !scopesHaveLegDetail(expandDetailScopes(parentRoot))) {
+      const parentToggle = findParentExpandToggle(parentRoot, parentId);
+      if (!parentToggle) {
+        // No safe parent toggle — try level-2 on this card if it is already a leg row
+        const maybeLeg =
+          load.amazon_ref_id ||
+          (/^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(String(load.load_id || '')) ? load.load_id : null);
+        if (!maybeLeg) {
+          load.detail_method = 'no_safe_control';
+          return { load, method: 'no_safe_control', expanded: false };
+        }
+      } else if (fireHumanClick(parentToggle)) {
+        togglesWeOpened.push(parentToggle);
+        didWork = true;
+        if (softYield) await yieldToUi();
+        await sleep(Math.min(expandDelayMs, 400), Math.min(expandJitterMs, 180));
+        await waitForInternalRows(
+          parentRoot,
+          Math.max(1600, expandDelayMs + expandJitterMs + 800),
+        );
+      } else {
+        load.detail_method = 'click_failed';
+        return { load, method: 'click_failed', expanded: false };
       }
     }
-    if (!clicked) {
-      load.detail_method = 'click_failed';
-      return { load, method: 'click_failed', expanded: false };
+
+    load = scrapeScopesOntoLoad(load, [parentRoot, cardRoot]);
+    if (!needsExpand(load)) {
+      // Collapse only toggles we opened; leave pre-expanded parents alone
+      await sleep(collapseDelayMs, Math.min(120, expandJitterMs));
+      for (let i = togglesWeOpened.length - 1; i >= 0; i -= 1) {
+        try {
+          fireHumanClick(togglesWeOpened[i]);
+        } catch {
+          /* leave open */
+        }
+      }
+      load.detail_method = didWork ? 'click_expand' : load.detail_method || 'dom_expanded';
+      return { load, method: load.detail_method, expanded: didWork };
     }
 
-    if (softYield) await yieldToUi();
-    // Fixed delay + poll until Trailer/Tractor/Arrival/Sch. mount
-    await sleep(Math.min(expandDelayMs, 400), Math.min(expandJitterMs, 180));
-    const opened = await waitForExpandedDetail(
-      cardRoot,
-      Math.max(1600, expandDelayMs + expandJitterMs + 800),
-    );
+    // ── LEVEL 2: internal shipments — blue chevron only ──────────────────
+    const internalIds = listInternalShipmentIds(parentRoot);
+    const legCandidates = [];
+    if (load.amazon_ref_id && /^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(String(load.amazon_ref_id))) {
+      legCandidates.push(String(load.amazon_ref_id).toUpperCase());
+    }
+    if (/^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(String(load.load_id || ''))) {
+      legCandidates.push(String(load.load_id).toUpperCase());
+    }
+    for (const id of internalIds) {
+      if (!legCandidates.includes(id)) legCandidates.push(id);
+    }
 
-    // If row click did nothing, retry once with chevron (legacy)
-    if (!opened && chevron && chevron !== usedTarget) {
-      fireHumanClick(chevron);
+    let openedDetail = scopesHaveLegDetail(expandDetailScopes(parentRoot));
+    let chevronClicks = 0;
+
+    for (const legId of legCandidates.slice(0, 6)) {
+      if (!needsExpand(load) && openedDetail) break;
+
+      const legRow = findCardRootForLoadId(legId) || parentRoot;
+      if (!legRow) continue;
+
+      // Already showing Arrival/Sch/trailer under this leg — do not re-click
+      if (scopesHaveLegDetail(expandDetailScopes(legRow))) {
+        load = scrapeScopesOntoLoad(load, [legRow, parentRoot]);
+        openedDetail = true;
+        continue;
+      }
+
+      const chevron = findBlueChevronNearId(legRow, legId);
+      if (!chevron) continue; // unclear → skip this leg, never fall back to row click
+
+      try {
+        chevron.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+      } catch {
+        /* ignore */
+      }
       if (softYield) await yieldToUi();
-      await sleep(300, 120);
-      await waitForExpandedDetail(cardRoot, 1600);
-    }
 
-    // Detail mounts on the card or sibling panel under the trip row
-    for (const scope of expandDetailScopes(cardRoot)) {
-      const parsed = parseDetailFromCard(scope, load.trip_bucket, load.section || 'tours');
-      if (!parsed) continue;
-      load = mergeParsedOntoLoad(load, parsed);
+      if (!fireHumanClick(chevron)) continue;
+      togglesWeOpened.push(chevron);
+      chevronClicks += 1;
+      didWork = true;
+
+      if (softYield) await yieldToUi();
+      await sleep(Math.min(expandDelayMs, 400), Math.min(expandJitterMs, 180));
+      const ok = await waitForExpandedDetail(
+        legRow,
+        Math.max(1600, expandDelayMs + expandJitterMs + 800),
+      );
+      if (ok) openedDetail = true;
+
+      load = scrapeScopesOntoLoad(load, [legRow, parentRoot, cardRoot]);
       if (detailIsRich(load) && locationsAreGood(load) && (!needsExpand(load) || arrivalIsRich(load))) {
         break;
       }
     }
 
-    await sleep(collapseDelayMs, Math.min(120, expandJitterMs));
-    try {
-      // Collapse the same way a user would: click the row again
-      const collapseTarget =
-        findRowClickTarget(cardRoot) ||
-        cardRoot.querySelector('[aria-expanded="true"]') ||
-        usedTarget ||
-        chevron ||
-        cardRoot;
-      fireHumanClick(collapseTarget);
-    } catch {
-      /* leave open if collapse fails */
+    // Single-level card (no internals): blue chevron / dedicated toggle on the card itself
+    if (!didWork && !openedDetail && needsExpand(load)) {
+      const selfId = load.load_id || load.amazon_ref_id || parentId;
+      const chevron =
+        findBlueChevronNearId(cardRoot, selfId) || findParentExpandToggle(cardRoot, selfId);
+      if (!chevron) {
+        load.detail_method = 'no_safe_control';
+        return { load, method: 'no_safe_control', expanded: false };
+      }
+      if (fireHumanClick(chevron)) {
+        togglesWeOpened.push(chevron);
+        didWork = true;
+        if (softYield) await yieldToUi();
+        await sleep(Math.min(expandDelayMs, 400), Math.min(expandJitterMs, 180));
+        openedDetail = await waitForExpandedDetail(
+          cardRoot,
+          Math.max(1600, expandDelayMs + expandJitterMs + 800),
+        );
+        load = scrapeScopesOntoLoad(load, [cardRoot]);
+      }
     }
 
-    load.detail_method = opened || detailIsRich(load) || arrivalIsRich(load) ? 'click_row' : 'click_row_empty';
-    return { load, method: load.detail_method, expanded: true };
+    if (!didWork && !openedDetail) {
+      load.detail_method = 'no_safe_control';
+      return { load, method: 'no_safe_control', expanded: false };
+    }
+
+    await sleep(collapseDelayMs, Math.min(120, expandJitterMs));
+    // Collapse only controls we opened (never whole-row / Assign Driver)
+    for (let i = togglesWeOpened.length - 1; i >= 0; i -= 1) {
+      try {
+        fireHumanClick(togglesWeOpened[i]);
+      } catch {
+        /* leave open if collapse fails */
+      }
+    }
+
+    const success = openedDetail || detailIsRich(load) || arrivalIsRich(load);
+    load.detail_method = success
+      ? chevronClicks > 0 || didWork
+        ? 'click_expand'
+        : 'dom_expanded'
+      : 'click_expand_empty';
+    return { load, method: load.detail_method, expanded: didWork };
   }
 
   function historySkipUnchanged(load, expandOpts = {}) {
@@ -1576,7 +1848,12 @@
         softYield,
         allowExpand,
       });
-      if (method === 'click_expand' || method === 'click_row' || method === 'click_row_empty') {
+      if (
+        method === 'click_expand' ||
+        method === 'click_expand_empty' ||
+        method === 'click_row' ||
+        method === 'click_row_empty'
+      ) {
         expandCount += 1;
       }
       if (softYield && expandCount > 0 && expandCount % 2 === 0) await yieldToUi();
