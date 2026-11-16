@@ -529,6 +529,68 @@
     return (m ? m[0] : s).slice(0, 40);
   }
 
+  /**
+   * Relay Arrival section (actual vs Sch.) — used for facility-arrival Telegram alerts.
+   * Example:
+   *   Arrival
+   *   15 Nov, 13:45 PST   Y+
+   *   Sch. 15 Nov, 14:45 PST
+   */
+  function scrapeArrivalSection(text) {
+    const src = String(text || '');
+    if (!/\bArrival\b/i.test(src)) {
+      return { arrival_actual: null, arrival_scheduled: null, arrival_address: null };
+    }
+
+    const timeRe =
+      /(\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+[A-Za-z]+\s+\d{1,2}(?:,?\s*\d{4})?(?:\s*,?\s*\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?)?)/i;
+
+    let arrival_actual = null;
+    let arrival_scheduled = null;
+
+    const block =
+      (src.match(
+        /Arrival\s*[\r\n]+([\s\S]{0,280}?)(?:Report delay|Departure|Trailer|Tractor|Stop\s*\d|$)/i,
+      ) || [])[1] || '';
+    const schLine = (block.match(/Sch\.?\s*([^\r\n]+)/i) || src.match(/Sch\.?\s*([^\r\n]+)/i) || [])[1];
+    if (schLine) {
+      const schHit = schLine.match(timeRe);
+      arrival_scheduled = (schHit ? schHit[1] : schLine).replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+    const actualLine = block
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l && !/^Sch\.?/i.test(l) && !/^Arrival$/i.test(l) && !/^Report/i.test(l));
+    if (actualLine) {
+      const actHit = actualLine.replace(/\bY\+?\b/g, '').match(timeRe);
+      if (actHit) arrival_actual = actHit[1].replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+    if (!arrival_actual) {
+      const inline = src.match(
+        /Arrival\s+([^\n]{0,80}?\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?)/i,
+      );
+      if (inline) arrival_actual = inline[1].replace(/\bY\+?\b/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+
+    // Prefer a street-like address near Arrival / current stop
+    let arrival_address = null;
+    const addrHit = src.match(
+      /(\d{1,6}\s+[A-Za-z0-9][A-Za-z0-9 .'#-]{3,60},\s*[A-Za-z .'-]+,\s*(?:[A-Z]{2}|[A-Za-z]{4,})\s+\d{5}(?:-\d{4})?)/,
+    );
+    if (addrHit) arrival_address = addrHit[1].replace(/\s+/g, ' ').trim().slice(0, 160);
+
+    return { arrival_actual, arrival_scheduled, arrival_address };
+  }
+
+  function applyArrivalFields(target, text) {
+    if (!target) return target;
+    const arr = scrapeArrivalSection(text);
+    if (arr.arrival_actual) target.arrival_actual = arr.arrival_actual;
+    if (arr.arrival_scheduled) target.arrival_scheduled = arr.arrival_scheduled;
+    if (arr.arrival_address) target.arrival_address = arr.arrival_address;
+    return target;
+  }
+
   /** Reject schedule dates mistaken for trip/leg IDs (e.g. "Sep 29, 2026"). */
   function isValidRelayLoadId(id) {
     if (id == null) return false;
@@ -742,6 +804,7 @@
         extractLabeledValue(block, ['Delivery date', 'End date', 'Arrive']),
     );
 
+    const arrival = scrapeArrivalSection(block);
     return {
       load_id: String(loadId).trim(),
       amazon_ref_id: legId && legId !== String(loadId) ? legId : tripId || legId || null,
@@ -759,6 +822,9 @@
       trip_bucket: tripBucket,
       status_bar_state: statusBar.state,
       status_stop_index: statusBar.stopIndex,
+      arrival_actual: arrival.arrival_actual,
+      arrival_scheduled: arrival.arrival_scheduled,
+      arrival_address: arrival.arrival_address,
       distance_miles: miles,
       rate_gross: payout,
       additional_charges: null,
@@ -942,9 +1008,16 @@
     return isGoodLocation(load?.pickup_location) && isGoodLocation(load?.delivery_location);
   }
 
-  /** Expand when equipment OR places are missing — places live under the stop dropdown. */
+  function arrivalIsRich(load) {
+    return Boolean(load?.arrival_actual || load?.arrival_scheduled);
+  }
+
+  /** Expand when equipment, places, or Arrival section fields are missing. */
   function needsExpand(load) {
-    return !detailIsRich(load) || !locationsAreGood(load);
+    const needsArrival =
+      (load?.trip_bucket === 'in_transit' || load?.status_bar_state === 'arrived') &&
+      !arrivalIsRich(load);
+    return !detailIsRich(load) || !locationsAreGood(load) || needsArrival;
   }
 
   /** Prefer React fiber / props when Relay already hydrated expand data. */
@@ -1116,6 +1189,7 @@
       status_bar: statusBar,
     });
     if (!parsed) return null;
+    applyArrivalFields(parsed, block);
     const stopNotes = extractStopAndLateNotes(block);
     if (stopNotes) {
       parsed.notes = [parsed.notes, stopNotes].filter(Boolean).join('\n').slice(0, 2000);
@@ -1361,6 +1435,7 @@
       extractLabeledValue(block, ['Tractor ID', 'Tractor']) ||
       (block.match(/Tractor(?:\s*ID)?\s*[:\s]*([A-Z0-9][A-Z0-9\s-]{2,20})/i) || [])[1];
     if (tractor) parsed.tractor_id = String(tractor).replace(/\s+/g, ' ').trim().slice(0, 40);
+    applyArrivalFields(parsed, block);
     const stopNotes = extractStopAndLateNotes(block);
     if (stopNotes) parsed.notes = stopNotes;
     parsed.section = 'load_detail';

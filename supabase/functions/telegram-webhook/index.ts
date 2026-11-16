@@ -2,11 +2,9 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 /**
- * Telegram Bot webhook for per-driver groups.
- * Slash menu (setMyCommands) + on-demand status:
- *   /menu /status /updates /tour /help /link /unlink
- * Inline keyboards for Updates vs Tour/load subchoices.
- * Auth: Telegram secret token header OR ?secret= matching TELEGRAM_WEBHOOK_SECRET
+ * Telegram Bot webhook — slash/menu ONLY in private DM with the bot.
+ * Groups: no menus; /link /unlink only (typed). Facility-arrival pushes come from relay-telegram.
+ * Security: TELEGRAM_ADMIN_PASSWORD (Edge secret) + DRV-xxxx driver selection.
  * TELEGRAM_BOT_TOKEN from Edge secrets only.
  */
 
@@ -17,17 +15,19 @@ const corsHeaders = {
     "Content-Type, Authorization, X-Telegram-Bot-Api-Secret-Token",
 };
 
-const BOT_COMMANDS = [
+const BOT_COMMANDS_PRIVATE = [
   { command: "menu", description: "Open status menu" },
   { command: "status", description: "Driver status + active loads" },
-  { command: "updates", description: "Recent alerts & changes" },
+  { command: "updates", description: "Recent facility arrivals" },
   { command: "tour", description: "Tour / load info" },
+  { command: "driver", description: "Select driver: /driver DRV-xxxx" },
+  { command: "logout", description: "Clear admin session" },
   { command: "help", description: "List commands" },
-  { command: "link", description: "Link group: /link DRV-xxxx" },
-  { command: "unlink", description: "Unlink this group" },
 ];
 
 const ACTIVE_LOAD_EXCLUDE = '("Completed","Cancelled","Rejected","Delivered")';
+/** Long-lived unlock after one password; refreshed on activity (sliding). */
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 let commandsEnsured = false;
 
@@ -75,8 +75,18 @@ async function answerCallback(botToken: string, callbackQueryId: string, text?: 
 
 async function ensureBotMenu(botToken: string) {
   if (commandsEnsured) return;
-  await tg(botToken, "setMyCommands", { commands: BOT_COMMANDS });
-  // Ensure callback buttons work (webhook may have been registered without callback_query)
+  // Clear default + group scopes so groups do not expose slash menus.
+  await tg(botToken, "deleteMyCommands", { scope: { type: "default" } });
+  await tg(botToken, "deleteMyCommands", { scope: { type: "all_group_chats" } });
+  await tg(botToken, "deleteMyCommands", {
+    scope: { type: "all_chat_administrators" },
+  });
+  // Menus only in private DM with the bot.
+  await tg(botToken, "setMyCommands", {
+    commands: BOT_COMMANDS_PRIVATE,
+    scope: { type: "all_private_chats" },
+  });
+
   const infoRes = await fetch(`https://api.telegram.org/bot${botToken}/getWebhookInfo`);
   const info = await infoRes.json().catch(() => ({}));
   const url = info?.result?.url as string | undefined;
@@ -113,11 +123,10 @@ function updatesMenuKeyboard() {
     inline_keyboard: [
       [
         { text: "All (48h)", callback_data: "upd:all" },
-        { text: "Load status", callback_data: "upd:load" },
+        { text: "Arrivals", callback_data: "upd:load" },
       ],
       [
-        { text: "Payments", callback_data: "upd:pay" },
-        { text: "Trailer / dispatch", callback_data: "upd:dispatch" },
+        { text: "Trailer / link", callback_data: "upd:dispatch" },
       ],
       [{ text: "« Menu", callback_data: "menu:home" }],
     ],
@@ -140,32 +149,103 @@ function tourMenuKeyboard() {
   };
 }
 
-type LinkedGroup = { driver_id: string; active: boolean };
-
-async function getLinkedGroup(
-  sb: SupabaseClient,
-  chatId: string,
-): Promise<LinkedGroup | null> {
-  const { data: group } = await sb
-    .from("driver_telegram_groups")
-    .select("driver_id, active")
-    .eq("telegram_chat_id", chatId)
-    .maybeSingle();
-  if (!group?.driver_id || !group.active) return null;
-  return group as LinkedGroup;
+function isPrivateChat(chat: { type?: string } | undefined): boolean {
+  return chat?.type === "private";
 }
 
-async function requireLinked(
-  botToken: string,
+function isGroupChat(chat: { type?: string } | undefined): boolean {
+  const t = chat?.type || "";
+  return t === "group" || t === "supergroup";
+}
+
+type AdminSession = {
+  telegram_user_id: number;
+  selected_driver_id: string | null;
+  selected_driver_code: string | null;
+  expires_at: string;
+};
+
+async function getSession(
   sb: SupabaseClient,
-  chatId: string,
-): Promise<LinkedGroup | null> {
-  const group = await getLinkedGroup(sb, chatId);
-  if (!group) {
-    await reply(botToken, chatId, "This group is not linked. Use /link DRV-xxxx");
+  userId: number,
+): Promise<AdminSession | null> {
+  const { data } = await sb
+    .from("telegram_admin_sessions")
+    .select("telegram_user_id, selected_driver_id, selected_driver_code, expires_at")
+    .eq("telegram_user_id", userId)
+    .maybeSingle();
+  if (!data) return null;
+  if (new Date(data.expires_at).getTime() < Date.now()) {
+    await sb.from("telegram_admin_sessions").delete().eq("telegram_user_id", userId);
     return null;
   }
-  return group;
+  return data as AdminSession;
+}
+
+async function touchSession(sb: SupabaseClient, userId: number) {
+  const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  await sb
+    .from("telegram_admin_sessions")
+    .update({ expires_at: expires, updated_at: new Date().toISOString() })
+    .eq("telegram_user_id", userId);
+}
+
+async function upsertAuthSession(sb: SupabaseClient, userId: number) {
+  const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  const existing = await getSession(sb, userId);
+  await sb.from("telegram_admin_sessions").upsert(
+    {
+      telegram_user_id: userId,
+      authenticated_at: new Date().toISOString(),
+      expires_at: expires,
+      selected_driver_id: existing?.selected_driver_id ?? null,
+      selected_driver_code: existing?.selected_driver_code ?? null,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "telegram_user_id" },
+  );
+}
+
+async function selectDriverSession(
+  sb: SupabaseClient,
+  userId: number,
+  driverUuid: string,
+  driverCode: string,
+) {
+  const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  await sb.from("telegram_admin_sessions").upsert(
+    {
+      telegram_user_id: userId,
+      authenticated_at: new Date().toISOString(),
+      expires_at: expires,
+      selected_driver_id: driverUuid,
+      selected_driver_code: driverCode,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "telegram_user_id" },
+  );
+}
+
+function askPasswordOnceText(): string {
+  return [
+    "Welcome to Amazon Relay Intelligence.",
+    "",
+    "Send the admin password once to unlock this chat.",
+    "After that you stay unlocked — no password on every command.",
+    "When you look up a driver, send DRV-xxxx (or /driver DRV-xxxx).",
+  ].join("\n");
+}
+
+function adminPasswordConfigured(): string | null {
+  const p = Deno.env.get("TELEGRAM_ADMIN_PASSWORD");
+  return p && p.length > 0 ? p : null;
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i += 1) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return out === 0;
 }
 
 function fmtWhen(iso: string | null | undefined): string {
@@ -186,7 +266,7 @@ async function buildStatusText(sb: SupabaseClient, driverUuid: string): Promise<
   const { data: loads } = await sb
     .from("loads")
     .select(
-      "load_id, load_status, trailer_id, pickup_location, delivery_location, pickup_date, delivery_date, trip_bucket, parent_trip_id, status_bar_state",
+      "load_id, load_status, trailer_id, tractor_id, pickup_location, delivery_location, pickup_date, delivery_date, trip_bucket, parent_trip_id, status_bar_state, arrival_actual, arrival_scheduled, arrival_address",
     )
     .eq("driver_id", driverUuid)
     .not("load_status", "in", ACTIVE_LOAD_EXCLUDE)
@@ -203,37 +283,23 @@ async function buildStatusText(sb: SupabaseClient, driverUuid: string): Promise<
   for (const l of loads || []) {
     const trip = l.parent_trip_id || l.trip_bucket || "";
     const bar = l.status_bar_state ? ` bar=${l.status_bar_state}` : "";
+    const arr = l.arrival_actual ? ` arr=${l.arrival_actual}` : "";
+    const sch = l.arrival_scheduled ? ` sch=${l.arrival_scheduled}` : "";
     lines.push(
-      `• ${l.load_id} [${l.load_status}] trailer=${l.trailer_id || "—"} ${l.pickup_location || "—"} → ${l.delivery_location || "—"} (del ${l.delivery_date || "—"})${trip ? ` trip=${trip}` : ""}${bar}`,
+      `• ${l.load_id} [${l.load_status}] trailer=${l.trailer_id || "—"} tractor=${l.tractor_id || "—"} ${l.pickup_location || "—"} → ${l.delivery_location || "—"} (del ${l.delivery_date || "—"})${trip ? ` trip=${trip}` : ""}${bar}${arr}${sch}`,
     );
   }
   return lines.join("\n");
 }
 
-type UpdateFilter = "all" | "load" | "pay" | "dispatch";
+type UpdateFilter = "all" | "load" | "dispatch";
 
 function updateEventFilter(filter: UpdateFilter): string[] | null {
   if (filter === "all") return null;
   if (filter === "load") {
-    return [
-      "load_status_change",
-      "loaded_enroute",
-      "facility_arrived",
-      "status_digest",
-      "driver_status",
-    ];
+    return ["facility_arrived", "loaded_enroute", "load_status_change", "status_digest"];
   }
-  if (filter === "pay") {
-    return ["payment_status_change", "payment_received", "pay_status"];
-  }
-  return [
-    "trailer_change",
-    "dispatch",
-    "missing_page",
-    "sync_error",
-    "loaded_enroute",
-    "facility_arrived",
-  ];
+  return ["trailer_change", "dispatch", "facility_arrived", "missing_page", "sync_error"];
 }
 
 async function buildUpdatesText(
@@ -256,7 +322,6 @@ async function buildUpdatesText(
   if (types) q = q.in("event_type", types);
 
   const { data: rows } = await q;
-  // Also include chat-scoped rows (ops-style) when filter is all/dispatch
   let chatRows: typeof rows = [];
   if (filter === "all" || filter === "dispatch") {
     const { data } = await sb
@@ -270,6 +335,7 @@ async function buildUpdatesText(
   }
 
   const merged = [...(rows || []), ...(chatRows || [])]
+    .filter((r) => r.event_type !== "payment_change")
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
     .filter((r, i, arr) => {
       const key = `${r.created_at}|${r.event_type}|${r.message}`;
@@ -279,9 +345,8 @@ async function buildUpdatesText(
 
   const labels: Record<UpdateFilter, string> = {
     all: "All updates (48h)",
-    load: "Load status updates (48h)",
-    pay: "Payment updates (48h)",
-    dispatch: "Trailer / dispatch (48h)",
+    load: "Facility arrivals (48h)",
+    dispatch: "Trailer / link (48h)",
   };
 
   if (!merged.length) {
@@ -315,7 +380,7 @@ async function buildTourText(
   let query = sb
     .from("loads")
     .select(
-      "load_id, load_status, payment_status, trailer_id, pickup_location, delivery_location, pickup_date, delivery_date, trip_bucket, parent_trip_id, rate_gross, status_bar_state, last_observed",
+      "load_id, load_status, trailer_id, tractor_id, pickup_location, delivery_location, pickup_date, delivery_date, trip_bucket, parent_trip_id, status_bar_state, arrival_actual, arrival_scheduled, arrival_address, last_observed",
     )
     .eq("driver_id", driverUuid);
 
@@ -354,30 +419,76 @@ async function buildTourText(
 
   for (const l of loads || []) {
     const trip = l.parent_trip_id || l.trip_bucket || "—";
-    const rate = l.rate_gross != null ? ` $${l.rate_gross}` : "";
     const bar = l.status_bar_state ? ` | ${l.status_bar_state}` : "";
+    const arr = l.arrival_actual ? `\n  Arrived: ${l.arrival_actual}` : "";
+    const sch = l.arrival_scheduled ? `\n  Sch.: ${l.arrival_scheduled}` : "";
+    const addr = l.arrival_address ? `\n  Addr: ${l.arrival_address}` : "";
     lines.push(
-      `• ${l.load_id} [${l.load_status}] pay=${l.payment_status || "—"}`,
+      `• ${l.load_id} [${l.load_status}] trailer=${l.trailer_id || "—"} tractor=${l.tractor_id || "—"}`,
       `  ${l.pickup_location || "—"} → ${l.delivery_location || "—"}`,
-      `  pick ${l.pickup_date || "—"} · del ${l.delivery_date || "—"} · trip ${trip}${rate}${bar}`,
+      `  pick ${l.pickup_date || "—"} · del ${l.delivery_date || "—"} · trip ${trip}${bar}${arr}${sch}${addr}`,
     );
   }
   return lines.join("\n");
 }
 
-function helpText(): string {
+function helpText(session?: AdminSession | null): string {
+  if (!session) {
+    return askPasswordOnceText() +
+      "\n\n/logout — clear session\n/help — this message\n\nDriver groups: no slash menu; facility-arrival alerts only.\nLink a group with /link DRV-xxxx inside that group.";
+  }
+  const driverLine = session.selected_driver_code
+    ? `Selected driver: ${session.selected_driver_code}`
+    : "No driver selected yet — send DRV-xxxx when you need a lookup.";
   return [
-    "Amazon Relay Intelligence — slash commands:",
-    "/menu — open status menu (buttons)",
-    "/status — driver + active loads (incl. trailer)",
-    "/updates — recent alerts; opens filter menu",
-    "/tour — tour/load info; opens load menu",
-    "/link DRV-xxxx — associate this group with a CRM driver",
-    "/unlink — deactivate this group link",
-    "/help — this message",
+    "Unlocked — password not needed again until /logout.",
+    driverLine,
     "",
-    "Tip: type / in Telegram to see the command menu.",
+    "/menu — open buttons",
+    "/status /updates /tour — driver lookups (need DRV selected)",
+    "/driver DRV-xxxx — select / switch driver",
+    "/logout — lock again",
+    "",
+    "Driver groups: no slash menu; facility-arrival alerts only.",
   ].join("\n");
+}
+
+async function requirePrivateAdmin(
+  botToken: string,
+  sb: SupabaseClient,
+  chatId: string,
+  userId: number | null,
+  needDriver: boolean,
+): Promise<AdminSession | null> {
+  const password = adminPasswordConfigured();
+  if (!password) {
+    await reply(
+      botToken,
+      chatId,
+      "TELEGRAM_ADMIN_PASSWORD is not set on Edge secrets. Ask an admin to configure it in the Supabase Dashboard.",
+    );
+    return null;
+  }
+  if (!userId) {
+    await reply(botToken, chatId, "Cannot identify Telegram user.");
+    return null;
+  }
+  const session = await getSession(sb, userId);
+  if (!session) {
+    await reply(botToken, chatId, askPasswordOnceText());
+    return null;
+  }
+  // Sliding unlock — stay unlocked while they keep using the bot.
+  await touchSession(sb, userId);
+  if (needDriver && !session.selected_driver_id) {
+    await reply(
+      botToken,
+      chatId,
+      "Unlocked. Send DRV-xxxx (or /driver DRV-xxxx) to look up a driver.",
+    );
+    return null;
+  }
+  return session;
 }
 
 async function handleCallback(
@@ -386,11 +497,14 @@ async function handleCallback(
   cq: {
     id: string;
     data?: string;
-    message?: { chat?: { id?: number | string }; message_id?: number };
+    from?: { id?: number };
+    message?: { chat?: { id?: number | string; type?: string }; message_id?: number };
   },
 ) {
-  const chatId = String(cq.message?.chat?.id ?? "");
+  const chat = cq.message?.chat;
+  const chatId = String(chat?.id ?? "");
   const data = String(cq.data || "");
+  const userId = cq.from?.id ?? null;
   if (!chatId || !data) {
     await answerCallback(botToken, cq.id);
     return;
@@ -398,36 +512,54 @@ async function handleCallback(
 
   await answerCallback(botToken, cq.id);
 
+  // Menus only in private chat
+  if (!isPrivateChat(chat)) {
+    await reply(botToken, chatId, "Menus are only available in a private chat with the bot.");
+    return;
+  }
+
   if (data === "menu:home") {
+    const session = await requirePrivateAdmin(botToken, sb, chatId, userId, false);
+    if (!session) return;
     await reply(botToken, chatId, "Choose an option:", mainMenuKeyboard());
     return;
   }
   if (data === "menu:help") {
-    await reply(botToken, chatId, helpText(), mainMenuKeyboard());
+    const session = userId != null ? await getSession(sb, userId) : null;
+    await reply(
+      botToken,
+      chatId,
+      helpText(session),
+      session ? mainMenuKeyboard() : undefined,
+    );
     return;
   }
   if (data === "menu:updates") {
+    const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
+    if (!session?.selected_driver_id) return;
     await reply(botToken, chatId, "Updates — pick a filter:", updatesMenuKeyboard());
     return;
   }
   if (data === "menu:tour") {
+    const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
+    if (!session?.selected_driver_id) return;
     await reply(botToken, chatId, "Tour / loads — pick a view:", tourMenuKeyboard());
     return;
   }
 
-  const group = await requireLinked(botToken, sb, chatId);
-  if (!group) return;
+  const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
+  if (!session?.selected_driver_id) return;
 
   if (data === "menu:status") {
-    const text = await buildStatusText(sb, group.driver_id);
+    const text = await buildStatusText(sb, session.selected_driver_id);
     await reply(botToken, chatId, text, mainMenuKeyboard());
     return;
   }
 
   if (data.startsWith("upd:")) {
     const filter = data.slice(4) as UpdateFilter;
-    if (!["all", "load", "pay", "dispatch"].includes(filter)) return;
-    const text = await buildUpdatesText(sb, chatId, group.driver_id, filter);
+    if (!["all", "load", "dispatch"].includes(filter)) return;
+    const text = await buildUpdatesText(sb, chatId, session.selected_driver_id, filter);
     await reply(botToken, chatId, text, updatesMenuKeyboard());
     return;
   }
@@ -435,10 +567,81 @@ async function handleCallback(
   if (data.startsWith("tour:")) {
     const view = data.slice(5) as TourView;
     if (!["active", "today", "transit", "done"].includes(view)) return;
-    const text = await buildTourText(sb, group.driver_id, view);
+    const text = await buildTourText(sb, session.selected_driver_id, view);
     await reply(botToken, chatId, text, tourMenuKeyboard());
     return;
   }
+}
+
+async function tryAuthPassword(
+  botToken: string,
+  sb: SupabaseClient,
+  chatId: string,
+  userId: number,
+  text: string,
+): Promise<boolean> {
+  const password = adminPasswordConfigured();
+  if (!password) return false;
+  const candidate = text.replace(/^\/auth(?:@\w+)?\s+/i, "").trim();
+  if (!candidate || !timingSafeEqual(candidate, password)) return false;
+  const prior = await getSession(sb, userId);
+  await upsertAuthSession(sb, userId);
+  const after = await getSession(sb, userId);
+  if (prior && after?.selected_driver_id) {
+    await reply(
+      botToken,
+      chatId,
+      `Still unlocked. Driver ${after.selected_driver_code} is selected — use /menu freely.`,
+      mainMenuKeyboard(),
+    );
+  } else {
+    await reply(
+      botToken,
+      chatId,
+      [
+        "Unlocked. You stay unlocked — no password on every command.",
+        "Send DRV-xxxx (or /driver DRV-xxxx) when you want driver data, then /menu.",
+      ].join("\n"),
+      mainMenuKeyboard(),
+    );
+  }
+  return true;
+}
+
+async function trySelectDriver(
+  botToken: string,
+  sb: SupabaseClient,
+  chatId: string,
+  userId: number,
+  text: string,
+): Promise<boolean> {
+  const m =
+    text.match(/^\/driver(?:@\w+)?\s+(DRV-\S+)/i) ||
+    text.match(/^(DRV-\S+)$/i);
+  if (!m) return false;
+  const session = await getSession(sb, userId);
+  if (!session) {
+    await reply(botToken, chatId, "Send the admin password first.");
+    return true;
+  }
+  const driverCode = m[1].trim().toUpperCase();
+  const { data: driver } = await sb
+    .from("drivers")
+    .select("id, driver_id, first_name, last_name")
+    .eq("driver_id", driverCode)
+    .maybeSingle();
+  if (!driver) {
+    await reply(botToken, chatId, `No CRM driver found for \`${driverCode}\`.`);
+    return true;
+  }
+  await selectDriverSession(sb, userId, driver.id, driver.driver_id);
+  await reply(
+    botToken,
+    chatId,
+    `Selected ${driver.driver_id} (${driver.first_name} ${driver.last_name}). Open /menu.`,
+    mainMenuKeyboard(),
+  );
+  return true;
 }
 
 Deno.serve(async (req: Request) => {
@@ -470,7 +673,6 @@ Deno.serve(async (req: Request) => {
 
     const update = await req.json();
 
-    // Inline button presses
     if (update.callback_query) {
       await handleCallback(botToken, sb, update.callback_query);
       return json({ success: true, callback: true });
@@ -479,114 +681,191 @@ Deno.serve(async (req: Request) => {
     const msg = update.message || update.edited_message || update.channel_post;
     if (!msg?.chat?.id) return json({ success: true, ignored: true });
 
-    const chatId = String(msg.chat.id);
-    const chatTitle = msg.chat.title || msg.chat.username || null;
+    const chat = msg.chat;
+    const chatId = String(chat.id);
+    const chatTitle = chat.title || chat.username || null;
+    const userId = msg.from?.id != null ? Number(msg.from.id) : null;
     const text = String(msg.text || msg.caption || "").trim();
     if (!text) return json({ success: true, ignored: true });
 
-    // Strip bot mention for command matching: /status@inter_sysbot
     const cmd = text.split(/\s+/)[0] || "";
     const cmdBase = cmd.replace(/@\w+$/i, "").toLowerCase();
 
-    // /link DRV-1024
-    const link = text.match(/^\/link(?:@\w+)?\s+(\S+)/i);
-    if (link) {
-      const driverCode = link[1].trim();
-      const { data: driver } = await sb
-        .from("drivers")
-        .select("id, driver_id, first_name, last_name, status, trailer_id, assigned_truck")
-        .eq("driver_id", driverCode)
-        .maybeSingle();
-      if (!driver) {
-        await reply(botToken, chatId, `No CRM driver found for code \`${driverCode}\`.`);
-        return json({ success: true, linked: false });
+    // ——— Groups: no menus; only /link /unlink ———
+    if (isGroupChat(chat)) {
+      const link = text.match(/^\/link(?:@\w+)?\s+(\S+)/i);
+      if (link) {
+        const driverCode = link[1].trim();
+        const { data: driver } = await sb
+          .from("drivers")
+          .select("id, driver_id, first_name, last_name")
+          .eq("driver_id", driverCode)
+          .maybeSingle();
+        if (!driver) {
+          await reply(botToken, chatId, `No CRM driver found for code \`${driverCode}\`.`);
+          return json({ success: true, linked: false });
+        }
+        const { error } = await sb.from("driver_telegram_groups").upsert(
+          {
+            telegram_chat_id: chatId,
+            driver_id: driver.id,
+            group_title: chatTitle,
+            active: true,
+            bot_can_post: true,
+            last_error: null,
+            last_error_at: null,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "telegram_chat_id" },
+        );
+        if (error) {
+          await reply(botToken, chatId, `Link failed: ${error.message}`);
+          return json({ success: false, error: error.message }, 500);
+        }
+        await reply(
+          botToken,
+          chatId,
+          `Linked to ${driver.driver_id} (${driver.first_name} ${driver.last_name}).\nThis group only receives facility-arrival alerts (no slash menu). Use the bot DM for status menus.`,
+        );
+        return json({ success: true, linked: true, driver_id: driver.id });
       }
 
-      const { error } = await sb.from("driver_telegram_groups").upsert(
-        {
-          telegram_chat_id: chatId,
-          driver_id: driver.id,
-          group_title: chatTitle,
-          active: true,
-          bot_can_post: true,
-          last_error: null,
-          last_error_at: null,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "telegram_chat_id" },
-      );
-      if (error) {
-        await reply(botToken, chatId, `Link failed: ${error.message}`);
-        return json({ success: false, error: error.message }, 500);
+      if (cmdBase === "/unlink") {
+        await sb
+          .from("driver_telegram_groups")
+          .update({ active: false, updated_at: new Date().toISOString() })
+          .eq("telegram_chat_id", chatId);
+        await reply(botToken, chatId, "Group unlinked (set inactive). Type /link DRV-xxxx to re-link.");
+        return json({ success: true, unlinked: true });
       }
-      await reply(
-        botToken,
-        chatId,
-        `Linked this group to driver ${driver.driver_id} (${driver.first_name} ${driver.last_name}).\nAlerts for this driver will post here only.\n\nUse /menu for on-demand status.`,
-        mainMenuKeyboard(),
-      );
-      return json({ success: true, linked: true, driver_id: driver.id });
-    }
 
-    if (cmdBase === "/unlink") {
+      if (
+        cmdBase === "/menu" ||
+        cmdBase === "/start" ||
+        cmdBase === "/status" ||
+        cmdBase === "/updates" ||
+        cmdBase === "/tour" ||
+        cmdBase === "/loads" ||
+        cmdBase === "/help"
+      ) {
+        await reply(
+          botToken,
+          chatId,
+          "Menus are disabled in groups. Open a private chat with @inter_sysbot, unlock with the admin password, then send DRV-xxxx.",
+        );
+        return json({ success: true, redirected: "dm_only" });
+      }
+
+      // Keep title fresh if linked
       await sb
         .from("driver_telegram_groups")
-        .update({ active: false, updated_at: new Date().toISOString() })
+        .update({
+          group_title: chatTitle,
+          updated_at: new Date().toISOString(),
+          bot_can_post: true,
+          last_error: null,
+        })
         .eq("telegram_chat_id", chatId);
-      await reply(botToken, chatId, "Group unlinked (set inactive). Use /link DRV-xxxx to re-link.");
-      return json({ success: true, unlinked: true });
+
+      return json({ success: true, processed: false, group: true });
     }
 
-    if (cmdBase === "/start" || cmdBase === "/menu") {
-      await reply(
-        botToken,
-        chatId,
-        "Amazon Relay Intelligence — pick a status option (or type / for commands):",
-        mainMenuKeyboard(),
-      );
-      return json({ success: true, menu: true });
+    // ——— Private DM: password + DRV gate ———
+    if (!isPrivateChat(chat) || userId == null) {
+      return json({ success: true, ignored: true });
+    }
+
+    if (cmdBase === "/logout") {
+      await sb.from("telegram_admin_sessions").delete().eq("telegram_user_id", userId);
+      await reply(botToken, chatId, "Session cleared. Send the admin password to unlock again.");
+      return json({ success: true, logout: true });
     }
 
     if (cmdBase === "/help") {
-      await reply(botToken, chatId, helpText(), mainMenuKeyboard());
+      const session = await getSession(sb, userId);
+      await reply(botToken, chatId, helpText(session), session ? mainMenuKeyboard() : undefined);
       return json({ success: true });
     }
 
+    if (cmdBase === "/start") {
+      const session = await getSession(sb, userId);
+      if (!session) {
+        await reply(botToken, chatId, askPasswordOnceText());
+        return json({ success: true, start: true, locked: true });
+      }
+      await touchSession(sb, userId);
+      if (!session.selected_driver_id) {
+        await reply(
+          botToken,
+          chatId,
+          "Unlocked. Send DRV-xxxx (or /driver DRV-xxxx) to look up a driver, or open /menu.",
+          mainMenuKeyboard(),
+        );
+        return json({ success: true, start: true, unlocked: true });
+      }
+      await reply(
+        botToken,
+        chatId,
+        `Welcome back — still unlocked. Menu for ${session.selected_driver_code}:`,
+        mainMenuKeyboard(),
+      );
+      return json({ success: true, start: true, menu: true });
+    }
+
+    // Plain password or /auth <password> — unlock once
+    if (await tryAuthPassword(botToken, sb, chatId, userId, text)) {
+      return json({ success: true, authenticated: true });
+    }
+
+    // DRV-xxxx or /driver DRV-xxxx — required for driver lookups
+    if (await trySelectDriver(botToken, sb, chatId, userId, text)) {
+      return json({ success: true, driver_selected: true });
+    }
+
+    if (cmdBase === "/menu") {
+      // Menus freely after unlock; DRV only when a lookup button needs it.
+      const session = await requirePrivateAdmin(botToken, sb, chatId, userId, false);
+      if (!session) return json({ success: true });
+      const label = session.selected_driver_code
+        ? `Menu for ${session.selected_driver_code}`
+        : "Menu (send DRV-xxxx before status / updates / tour)";
+      await reply(botToken, chatId, `${label} — pick an option:`, mainMenuKeyboard());
+      return json({ success: true, menu: true });
+    }
+
     if (cmdBase === "/status") {
-      const group = await requireLinked(botToken, sb, chatId);
-      if (!group) return json({ success: true });
-      const statusText = await buildStatusText(sb, group.driver_id);
+      const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
+      if (!session?.selected_driver_id) return json({ success: true });
+      const statusText = await buildStatusText(sb, session.selected_driver_id);
       await reply(botToken, chatId, statusText, mainMenuKeyboard());
       return json({ success: true, status: true });
     }
 
     if (cmdBase === "/updates") {
-      const group = await requireLinked(botToken, sb, chatId);
-      if (!group) return json({ success: true });
-      // Show filter menu + a default "all" snapshot
-      const snap = await buildUpdatesText(sb, chatId, group.driver_id, "all");
+      const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
+      if (!session?.selected_driver_id) return json({ success: true });
+      const snap = await buildUpdatesText(sb, chatId, session.selected_driver_id, "all");
       await reply(botToken, chatId, snap + "\n\nFilter:", updatesMenuKeyboard());
       return json({ success: true, updates: true });
     }
 
     if (cmdBase === "/tour" || cmdBase === "/loads") {
-      const group = await requireLinked(botToken, sb, chatId);
-      if (!group) return json({ success: true });
-      const snap = await buildTourText(sb, group.driver_id, "active");
+      const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
+      if (!session?.selected_driver_id) return json({ success: true });
+      const snap = await buildTourText(sb, session.selected_driver_id, "active");
       await reply(botToken, chatId, snap + "\n\nMore views:", tourMenuKeyboard());
       return json({ success: true, tour: true });
     }
 
-    // Refresh title if linked
-    await sb
-      .from("driver_telegram_groups")
-      .update({
-        group_title: chatTitle,
-        updated_at: new Date().toISOString(),
-        bot_can_post: true,
-        last_error: null,
-      })
-      .eq("telegram_chat_id", chatId);
+    // Reject /link in DM — linking is group-scoped
+    if (cmdBase === "/link" || cmdBase === "/unlink") {
+      await reply(
+        botToken,
+        chatId,
+        "Use /link DRV-xxxx inside the driver Telegram group (not in this DM).",
+      );
+      return json({ success: true });
+    }
 
     return json({ success: true, processed: false });
   } catch (err) {
