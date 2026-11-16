@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
   "version": "1.3.3",
-  "description": "Scrape Arrival actual/Sch. for facility alerts; Telegram groups arrival-only; DM admin menu.",
+  "description": "Arrival scrape + facility Telegram alerts; empty-reconcile fix; DM admin menu unlock.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
   "host_permissions": [
     "https://relay.amazon.com/*",

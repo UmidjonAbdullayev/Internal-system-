@@ -12,12 +12,15 @@ import { Modal, ConfirmDialog } from '@/components/ui/Modal';
 import { Drawer } from '@/components/ui/Drawer';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { SortHeader, useSort, type SortDir } from '@/components/shared/SortHeader';
+import { TripStatusIcon } from '@/components/shared/TripStatusIcon';
 import { getLoadFinalGross } from '@/lib/calculations';
+import { resolveTripStatus, tripStatusTooltip } from '@/lib/loadStatusDisplay';
 import {
   formatCurrency,
   formatDate,
   downloadCSV,
   getDriverFullName,
+  getWeekRange,
   todayISO,
 } from '@/lib/utils';
 import type { Load, LoadStatus, PaymentStatus, TrailerType, TripBucket } from '@/types';
@@ -66,12 +69,9 @@ function driverDisplayName(
   return load.driverNameRaw || 'Unassigned';
 }
 
-function statusBarLabel(load: Load): string {
-  if (load.statusBarState === 'arrived') return `Arrived · stop ${load.statusStopIndex ?? 1}`;
-  if (load.statusBarState === 'loaded_enroute') return `Loaded / en route · stop ${load.statusStopIndex ?? 1}`;
-  if (load.statusBarState === 'cancelled') return 'Cancelled stop';
-  if (load.statusBarState) return String(load.statusBarState);
-  return load.loadStatus;
+/** Date range only applies on History — live boards show all matching rows. */
+function tabUsesDateFilter(tab: LoadsTab): boolean {
+  return tab === 'history';
 }
 
 const emptyForm = {
@@ -99,14 +99,20 @@ export function LoadsPage() {
     useData();
   const [params, setParams] = useSearchParams();
   const today = todayISO(companySettings.timezone || 'America/Chicago');
-  const [tab, setTab] = useState<LoadsTab>((params.get('tab') as LoadsTab) || 'in_transit');
+  const week = getWeekRange(today);
+  const urlTab = params.get('tab') as LoadsTab | null;
+  const [tab, setTab] = useState<LoadsTab>(
+    urlTab && TRIP_TABS.some((x) => x.id === urlTab) ? urlTab : 'in_transit',
+  );
+  const [tabAutoPicked, setTabAutoPicked] = useState(Boolean(urlTab));
   const [search, setSearch] = useState(params.get('q') ?? '');
   const [statusFilter, setStatusFilter] = useState(params.get('status') ?? '');
   const [paymentFilter, setPaymentFilter] = useState(params.get('paymentStatus') ?? '');
   const [driverFilter, setDriverFilter] = useState('');
-  /** Default = current ops date (America/Chicago unless Settings override). */
+  /** History-only date range (day / week / custom). Live tabs ignore these. */
   const [dateFrom, setDateFrom] = useState(params.get('from') || today);
   const [dateTo, setDateTo] = useState(params.get('to') || today);
+  const datesActive = tabUsesDateFilter(tab);
   const [sortKey, setSortKey] = useState('deliveryDate');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [formOpen, setFormOpen] = useState(false);
@@ -122,7 +128,10 @@ export function LoadsPage() {
       setParams(params, { replace: true });
     }
     const t = params.get('tab') as LoadsTab | null;
-    if (t && TRIP_TABS.some((x) => x.id === t)) setTab(t);
+    if (t && TRIP_TABS.some((x) => x.id === t)) {
+      setTab(t);
+      setTabAutoPicked(true);
+    }
   }, [params, setParams]);
 
   const driverMap = useMemo(
@@ -144,6 +153,21 @@ export function LoadsPage() {
     return counts;
   }, [loads]);
 
+  // When synced data exists but default In Transit is empty, land on a tab that has rows.
+  useEffect(() => {
+    if (tabAutoPicked || !loads.length) return;
+    const preferred: LoadsTab[] = ['in_transit', 'upcoming', 'history', 'all'];
+    const next =
+      preferred.find((t) => (t === 'all' ? loads.length > 0 : tabCounts[t] > 0)) || 'all';
+    if (next !== tab) {
+      setTab(next);
+      const nextParams = new URLSearchParams(params);
+      nextParams.set('tab', next);
+      setParams(nextParams, { replace: true });
+    }
+    setTabAutoPicked(true);
+  }, [loads.length, tabCounts, tabAutoPicked, tab, params, setParams]);
+
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
     return loads.filter((l) => {
@@ -152,7 +176,8 @@ export function LoadsPage() {
       if (statusFilter && l.loadStatus !== statusFilter) return false;
       if (paymentFilter && l.paymentStatus !== paymentFilter) return false;
       if (driverFilter && l.driverId !== driverFilter) return false;
-      if (dateFrom || dateTo) {
+      // Upcoming / In Transit / All: no date filter — live boards show every matching row.
+      if (datesActive && (dateFrom || dateTo)) {
         const inRange = (d: string) => {
           if (!d) return false;
           if (dateFrom && d < dateFrom) return false;
@@ -179,7 +204,13 @@ export function LoadsPage() {
       }
       return true;
     });
-  }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, driverMap]);
+  }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, datesActive, driverMap]);
+
+  /** Rows in the current tab before date/search filters — used for “hidden by filter” UX. */
+  const inTabCount = useMemo(() => {
+    if (tab === 'all') return loads.length;
+    return loads.filter((l) => inferTripBucket(l) === tab).length;
+  }, [loads, tab]);
 
   const sorted = useSort(filtered, sortKey, sortDir, {
     loadId: (l) => l.loadId,
@@ -260,8 +291,8 @@ export function LoadsPage() {
         l.loadId,
         l.parentTripId || '',
         driverDisplayName(l, driverMap),
-        l.loadStatus,
-        statusBarLabel(l),
+        resolveTripStatus(l).name,
+        tripStatusTooltip(resolveTripStatus(l)),
         l.tractorId || '',
         l.trailerId || '',
         l.pickupLocation,
@@ -348,51 +379,121 @@ export function LoadsPage() {
               </option>
             ))}
           </Select>
-          <div className="flex flex-col gap-0.5">
-            <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
-              From
-            </label>
-            <Input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => setDateFrom(e.target.value)}
-              className="w-36"
-            />
-          </div>
-          <div className="flex flex-col gap-0.5">
-            <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
-              To
-            </label>
-            <Input
-              type="date"
-              value={dateTo}
-              onChange={(e) => setDateTo(e.target.value)}
-              className="w-36"
-            />
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            type="button"
-            onClick={() => {
-              setDateFrom(today);
-              setDateTo(today);
-            }}
-          >
-            Today
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            type="button"
-            onClick={() => {
-              setDateFrom('');
-              setDateTo('');
-            }}
-          >
-            All dates
-          </Button>
+          {datesActive ? (
+            <>
+              <div className="flex flex-col gap-0.5">
+                <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+                  From
+                </label>
+                <Input
+                  type="date"
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value)}
+                  className="w-36"
+                />
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+                  To
+                </label>
+                <Input
+                  type="date"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value)}
+                  className="w-36"
+                />
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom(today);
+                  setDateTo(today);
+                }}
+              >
+                Today
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom(week.start);
+                  setDateTo(week.end);
+                }}
+              >
+                This week
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom('');
+                  setDateTo('');
+                }}
+              >
+                All dates
+              </Button>
+            </>
+          ) : (
+            <p className="pb-1 text-xs text-text-secondary">
+              {tab === 'upcoming'
+                ? 'Upcoming board — all booked trips, no date filter.'
+                : tab === 'in_transit'
+                  ? 'In Transit board — all live trips, no date filter.'
+                  : 'All trips — date range is on History only.'}
+            </p>
+          )}
         </div>
+        {inTabCount > 0 &&
+          filtered.length === 0 &&
+          ((datesActive && (dateFrom || dateTo)) ||
+            search ||
+            statusFilter ||
+            paymentFilter ||
+            driverFilter) && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+            <span>
+              {inTabCount} trip{inTabCount === 1 ? '' : 's'} in this tab, but filters hide them
+              {datesActive && (dateFrom || dateTo)
+                ? ` (dates ${dateFrom || '…'} → ${dateTo || '…'})`
+                : ''}
+              .
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              type="button"
+              onClick={() => {
+                if (datesActive) {
+                  setDateFrom('');
+                  setDateTo('');
+                }
+                setSearch('');
+                setStatusFilter('');
+                setPaymentFilter('');
+                setDriverFilter('');
+              }}
+            >
+              Clear filters
+            </Button>
+            {datesActive && (
+              <Button
+                variant="ghost"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom(week.start);
+                  setDateTo(week.end);
+                }}
+              >
+                Use this week
+              </Button>
+            )}
+          </div>
+        )}
       </Card>
 
       <Card className="overflow-hidden">
@@ -454,8 +555,7 @@ export function LoadsPage() {
                       <div className="text-text-secondary">→ {l.deliveryLocation}</div>
                     </td>
                     <td className="px-3 py-2.5">
-                      <Badge status={l.loadStatus} />
-                      <div className="mt-1 text-[11px] text-text-secondary">{statusBarLabel(l)}</div>
+                      <TripStatusIcon load={l} />
                     </td>
                     <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
                       {formatCurrency(getLoadFinalGross(l))}
@@ -481,10 +581,52 @@ export function LoadsPage() {
           </table>
           {sorted.length === 0 && (
             <EmptyState
-              title="No trips in this tab"
-              description="Open Amazon Relay Trips with the extension live, or add a load manually. Empty means Supabase has no matching trip_bucket rows yet."
-              actionLabel="Add Load"
-              onAction={openCreate}
+              title={
+                loads.length === 0
+                  ? 'No trips synced yet'
+                  : inTabCount > 0
+                    ? 'Filters hide synced trips'
+                    : tab === 'in_transit'
+                      ? 'No In Transit trips'
+                      : tab === 'upcoming'
+                        ? 'No Upcoming trips'
+                        : tab === 'history'
+                          ? 'No History trips in this date range'
+                          : 'No trips in this tab'
+              }
+              description={
+                loads.length === 0
+                  ? 'Open Amazon Relay Trips with the extension live (GO LIVE), then refresh. Extension “Synced” can mean the page was scraped with nothing new to upsert — check CRM Errors and Supabase loads.'
+                  : inTabCount > 0 && datesActive && (dateFrom || dateTo)
+                    ? `This History tab has ${inTabCount} synced trip(s). Widen the date range (This week / All dates).`
+                    : inTabCount > 0
+                      ? `This tab has ${inTabCount} synced trip(s). Clear search/status/payment/driver filters.`
+                      : tab === 'in_transit' && tabCounts.history > 0
+                        ? `${tabCounts.history} trip(s) are under History. Switch tabs, or Force scan with Upcoming/In Transit open so active trips stay active.`
+                        : 'Open Amazon Relay Trips with the extension live, or add a load manually.'
+              }
+              actionLabel={
+                inTabCount > 0 && datesActive && (dateFrom || dateTo)
+                  ? 'All dates'
+                  : inTabCount > 0
+                    ? 'Clear filters'
+                    : 'Add Load'
+              }
+              onAction={
+                inTabCount > 0 && datesActive && (dateFrom || dateTo)
+                  ? () => {
+                      setDateFrom('');
+                      setDateTo('');
+                    }
+                  : inTabCount > 0
+                    ? () => {
+                        setSearch('');
+                        setStatusFilter('');
+                        setPaymentFilter('');
+                        setDriverFilter('');
+                      }
+                    : openCreate
+              }
             />
           )}
         </div>
@@ -575,7 +717,7 @@ export function LoadsPage() {
         {detail && (
           <div className="space-y-5 animate-fade-in">
             <div className="flex flex-wrap gap-2">
-              <Badge status={detail.loadStatus} />
+              <TripStatusIcon load={detail} />
               <Badge status={detail.paymentStatus} />
             </div>
             <div className="grid grid-cols-2 gap-4 text-sm">
@@ -596,7 +738,7 @@ export function LoadsPage() {
               <Info label="Tractor" value={detail.tractorId || '—'} />
               <Info label="Parent Trip" value={detail.parentTripId || '—'} />
               <Info label="Trip tab" value={inferTripBucket(detail) || '—'} />
-              <Info label="Status bar" value={statusBarLabel(detail)} />
+              <Info label="Status" value={tripStatusTooltip(resolveTripStatus(detail))} />
               <Info label="Distance" value={`${detail.distanceMiles} mi`} />
               <Info label="Rate Gross" value={formatCurrency(detail.rateGross)} />
               <Info label="Additional Charges" value={formatCurrency(detail.additionalCharges)} />

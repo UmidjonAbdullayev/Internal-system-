@@ -51,6 +51,8 @@ let lastNearLiveIngestAt = 0;
 let pendingReconcileActiveIds = null;
 /** Active load ids observed in the current Trips soft pass (not stale pending). */
 let currentScanActiveIds = null;
+/** True when this Trips pass actually scraped Upcoming and/or In Transit boards. */
+let currentScanSawActiveBuckets = false;
 
 function jitterMinutes(base, jitter) {
   const span = Math.max(0, Number(jitter) || 0);
@@ -411,6 +413,7 @@ async function runSoftScan({ includeTrips, includePayments, reason, force = fals
   if (includeTrips) {
     tripsScanRunning = true;
     currentScanActiveIds = [];
+    currentScanSawActiveBuckets = false;
     await setState({
       tripsScanInProgress: true,
       tripsScanStartedAt: new Date().toISOString(),
@@ -482,10 +485,16 @@ async function runSoftScan({ includeTrips, includePayments, reason, force = fals
             });
             seenSections.add('tours');
           }
-          // Full soft Trips pass → reconcile CRM active set to Relay Upcoming+In Transit
+          // Full soft Trips pass → reconcile CRM active set to Relay Upcoming+In Transit.
+          // Never send [] — Edge treats empty reconcile as "demote everything" and wiped live trips.
           const activeIds = [...new Set(currentScanActiveIds || [])];
-          pendingReconcileActiveIds = activeIds;
+          if (currentScanSawActiveBuckets && activeIds.length > 0) {
+            pendingReconcileActiveIds = activeIds;
+          } else {
+            pendingReconcileActiveIds = null;
+          }
           currentScanActiveIds = null;
+          currentScanSawActiveBuckets = false;
           await setState({
             lastTripsScanAt: new Date().toISOString(),
             lastActiveLoadIds: activeIds,
@@ -639,12 +648,17 @@ async function collectOneTab(tab, opts = {}) {
       await updateSection('tours', { state: 'Collecting', lastError: null });
     }
     if (data.section === 'tours' && Array.isArray(currentScanActiveIds)) {
+      const buckets = Array.isArray(data.trip_buckets_scanned) ? data.trip_buckets_scanned : [];
+      if (buckets.includes('upcoming') || buckets.includes('in_transit')) {
+        currentScanSawActiveBuckets = true;
+      }
       for (const load of data.loads || []) {
         if (
           load?.load_id &&
           (load.trip_bucket === 'upcoming' || load.trip_bucket === 'in_transit')
         ) {
           currentScanActiveIds.push(load.load_id);
+          currentScanSawActiveBuckets = true;
         }
       }
     }
@@ -917,9 +931,13 @@ async function flushToEdge() {
     (p) => isCompletePayment(p) || (p.load_id && p.payment_status),
   );
 
-  const reconcileIds = pendingReconcileActiveIds;
+  const reconcileIds =
+    Array.isArray(pendingReconcileActiveIds) && pendingReconcileActiveIds.length > 0
+      ? pendingReconcileActiveIds
+      : null;
   if (!loads.length && !payments.length && !reconcileIds) {
-    // Finish "Collecting" → Synced when page was scraped but nothing new to upsert
+    // Finish "Collecting" → Synced when page was scraped but nothing new to upsert.
+    // Note: Synced here means scrape+normalize OK, not necessarily new CRM rows.
     for (const id of ['tours', 'load_detail', 'payments']) {
       if (state.sections[id]?.state === 'Collecting' && state.sections[id]?.lastCollectedAt) {
         await updateSection(id, { state: 'Synced', lastError: null });
