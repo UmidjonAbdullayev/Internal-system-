@@ -50,7 +50,11 @@ function render(state) {
 
   $('sections').innerHTML = SECTIONS.map((section) => {
     const st = state.sections?.[section.id]?.state || 'Not checked';
-    return `<li><span>${section.label}</span><span class="badge ${badgeClass(st)}">${st}</span></li>`;
+    const note =
+      st === 'Synced'
+        ? ' <span class="hint-inline" title="Page scrape OK. CRM rows only change when Edge upserts succeed (see Inserted/Updated/Errors).">· scrape OK</span>'
+        : '';
+    return `<li><span>${section.label}</span><span class="badge ${badgeClass(st)}">${st}</span>${note}</li>`;
   }).join('');
 
   const prompts = state.prompts || [];

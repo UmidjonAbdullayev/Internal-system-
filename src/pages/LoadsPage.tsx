@@ -19,6 +19,7 @@ import {
   downloadCSV,
   getDriverFullName,
   todayISO,
+  getWeekRange,
 } from '@/lib/utils';
 import type { Load, LoadStatus, PaymentStatus, TrailerType, TripBucket } from '@/types';
 
@@ -99,7 +100,12 @@ export function LoadsPage() {
     useData();
   const [params, setParams] = useSearchParams();
   const today = todayISO(companySettings.timezone || 'America/Chicago');
-  const [tab, setTab] = useState<LoadsTab>((params.get('tab') as LoadsTab) || 'in_transit');
+  const week = getWeekRange(today);
+  const urlTab = params.get('tab') as LoadsTab | null;
+  const [tab, setTab] = useState<LoadsTab>(
+    urlTab && TRIP_TABS.some((x) => x.id === urlTab) ? urlTab : 'in_transit',
+  );
+  const [tabAutoPicked, setTabAutoPicked] = useState(Boolean(urlTab));
   const [search, setSearch] = useState(params.get('q') ?? '');
   const [statusFilter, setStatusFilter] = useState(params.get('status') ?? '');
   const [paymentFilter, setPaymentFilter] = useState(params.get('paymentStatus') ?? '');
@@ -122,7 +128,10 @@ export function LoadsPage() {
       setParams(params, { replace: true });
     }
     const t = params.get('tab') as LoadsTab | null;
-    if (t && TRIP_TABS.some((x) => x.id === t)) setTab(t);
+    if (t && TRIP_TABS.some((x) => x.id === t)) {
+      setTab(t);
+      setTabAutoPicked(true);
+    }
   }, [params, setParams]);
 
   const driverMap = useMemo(
@@ -143,6 +152,21 @@ export function LoadsPage() {
     }
     return counts;
   }, [loads]);
+
+  // When synced data exists but default In Transit is empty, land on a tab that has rows.
+  useEffect(() => {
+    if (tabAutoPicked || !loads.length) return;
+    const preferred: LoadsTab[] = ['in_transit', 'upcoming', 'history', 'all'];
+    const next =
+      preferred.find((t) => (t === 'all' ? loads.length > 0 : tabCounts[t] > 0)) || 'all';
+    if (next !== tab) {
+      setTab(next);
+      const nextParams = new URLSearchParams(params);
+      nextParams.set('tab', next);
+      setParams(nextParams, { replace: true });
+    }
+    setTabAutoPicked(true);
+  }, [loads.length, tabCounts, tabAutoPicked, tab, params, setParams]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
@@ -180,6 +204,12 @@ export function LoadsPage() {
       return true;
     });
   }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, driverMap]);
+
+  /** Rows in the current tab before date/search filters — used for “hidden by filter” UX. */
+  const inTabCount = useMemo(() => {
+    if (tab === 'all') return loads.length;
+    return loads.filter((l) => inferTripBucket(l) === tab).length;
+  }, [loads, tab]);
 
   const sorted = useSort(filtered, sortKey, sortDir, {
     loadId: (l) => l.loadId,
@@ -382,6 +412,17 @@ export function LoadsPage() {
             Today
           </Button>
           <Button
+            variant="outline"
+            size="sm"
+            type="button"
+            onClick={() => {
+              setDateFrom(week.start);
+              setDateTo(week.end);
+            }}
+          >
+            This week
+          </Button>
+          <Button
             variant="ghost"
             size="sm"
             type="button"
@@ -393,6 +434,40 @@ export function LoadsPage() {
             All dates
           </Button>
         </div>
+        {inTabCount > 0 && filtered.length === 0 && (dateFrom || dateTo || search || statusFilter || paymentFilter || driverFilter) && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+            <span>
+              {inTabCount} trip{inTabCount === 1 ? '' : 's'} in this tab, but filters hide them
+              {dateFrom || dateTo ? ` (dates ${dateFrom || '…'} → ${dateTo || '…'})` : ''}.
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              type="button"
+              onClick={() => {
+                setDateFrom('');
+                setDateTo('');
+                setSearch('');
+                setStatusFilter('');
+                setPaymentFilter('');
+                setDriverFilter('');
+              }}
+            >
+              Clear filters
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              type="button"
+              onClick={() => {
+                setDateFrom(week.start);
+                setDateTo(week.end);
+              }}
+            >
+              Use this week
+            </Button>
+          </div>
+        )}
       </Card>
 
       <Card className="overflow-hidden">
@@ -481,10 +556,33 @@ export function LoadsPage() {
           </table>
           {sorted.length === 0 && (
             <EmptyState
-              title="No trips in this tab"
-              description="Open Amazon Relay Trips with the extension live, or add a load manually. Empty means Supabase has no matching trip_bucket rows yet."
-              actionLabel="Add Load"
-              onAction={openCreate}
+              title={
+                loads.length === 0
+                  ? 'No trips synced yet'
+                  : inTabCount > 0
+                    ? 'Filters hide synced trips'
+                    : tab === 'in_transit'
+                      ? 'No In Transit trips'
+                      : 'No trips in this tab'
+              }
+              description={
+                loads.length === 0
+                  ? 'Open Amazon Relay Trips with the extension live (GO LIVE), then refresh. Extension “Synced” can mean the page was scraped with nothing new to upsert — check CRM Errors and Supabase loads.'
+                  : inTabCount > 0
+                    ? `This tab has ${inTabCount} synced trip(s). Clear the date filter (defaults to today) or click All dates / This week.`
+                    : tab === 'in_transit' && tabCounts.history > 0
+                      ? `${tabCounts.history} trip(s) are under History. Switch tabs, or Force scan with Upcoming/In Transit open so active trips stay active.`
+                      : 'Open Amazon Relay Trips with the extension live, or add a load manually.'
+              }
+              actionLabel={inTabCount > 0 ? 'All dates' : 'Add Load'}
+              onAction={
+                inTabCount > 0
+                  ? () => {
+                      setDateFrom('');
+                      setDateTo('');
+                    }
+                  : openCreate
+              }
             />
           )}
         </div>
