@@ -220,6 +220,54 @@ export function sanitizeLocation(raw) {
   return s.slice(0, 120);
 }
 
+/**
+ * Relay driver chips are usually "U. Aminov". Reject city/place scraps
+ * ("Colorado Springs", "Santa Clarita") and Spot/Rejected UI text.
+ */
+export function sanitizeDriverName(raw) {
+  if (raw == null) return null;
+  const firstLine = String(raw).split(/\n/)[0].replace(/\s+/g, ' ').trim();
+  if (!firstLine || firstLine.length < 3 || firstLine.length > 60) return null;
+  if (
+    /^(spot|starts|rejected|weather|driver|unassigned|n\/a|none|unknown|—|-)$/i.test(
+      firstLine,
+    )
+  ) {
+    return null;
+  }
+  if (/,\s*[A-Z]{2}\b/.test(firstLine)) return null; // City, ST
+  if (/\d/.test(firstLine)) return null;
+  // Multi-word US place names mistaken for First Last
+  if (
+    /^(Colorado Springs|Santa Clarita|Kansas City|Fort Worth|Sparrows Point|Salt Lake|Los Angeles|San Diego|San Francisco|Las Vegas|New York|El Paso|St\.?\s*Louis|Corpus Christi|Oklahoma City|Virginia Beach|Chula Vista|Des Moines|Baton Rouge|Cedar Rapids|Grand Rapids|Little Rock|Jersey City|Sioux Falls|Council Bluffs|Bowling Green|Palm Springs|Palm Beach|West Palm|Fort Wayne|Fort Myers|Fort Collins|Mount Vernon|Lake Forest|North Las|South Bend|East Bay|West Sacramento)$/i.test(
+      firstLine,
+    )
+  ) {
+    return null;
+  }
+  if (
+    /^(New|San|Los|Las|Fort|Port|Mount|Lake|North|South|East|West|Santa|Saint|St\.?|El|La|Des|Grand|Little|Palm|Corpus|Virginia|Oklahoma|Colorado|Kansas)\s+[A-Z]/i.test(
+      firstLine,
+    ) &&
+    !/^[A-Z]\.\s/.test(firstLine)
+  ) {
+    return null;
+  }
+  // Preferred: Initial. Surname
+  if (/^[A-Z]\.\s*[A-Za-z][A-Za-z'-]{1,35}$/.test(firstLine)) return firstLine;
+  // Full First Last (no place-prefix)
+  if (/^[A-Za-z][A-Za-z'-]{1,30}\s+[A-Za-z][A-Za-z'-]{1,35}$/.test(firstLine)) {
+    return firstLine;
+  }
+  // Surname-only rare
+  if (/^[A-Za-z][A-Za-z'-]{2,35}$/.test(firstLine)) return firstLine;
+  return null;
+}
+
+export function isGoodDriverName(raw) {
+  return Boolean(sanitizeDriverName(raw));
+}
+
 export function isGoodLocation(raw) {
   return Boolean(sanitizeLocation(raw));
 }
@@ -321,6 +369,7 @@ export function finalizeLoadForSync(load) {
     pickup_date: pickupDate,
     delivery_date: deliveryDate,
     payment_status: load.payment_status || 'Not Received',
+    driver_name_raw: sanitizeDriverName(load.driver_name_raw) || null,
   };
 }
 

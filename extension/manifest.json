@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.3.3",
-  "description": "Fix empty reconcile demoting all active trips; prefer active bucket over history on merge.",
+  "version": "1.3.4",
+  "description": "Scroll all In Transit rows, raise expand budget, fix driver/place parse, batch CRM flush.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
   "host_permissions": [
     "https://relay.amazon.com/*",

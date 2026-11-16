@@ -82,15 +82,25 @@ export const PAYMENTS_SCAN_JITTER_MINUTES = 10;
 export const SYNC_FLUSH_MINUTES = 2;
 export const TYPICAL_FULL_SYNC_SECONDS = '45–90';
 
-/** Auto-expand Trips rows for trailer/tractor/stop detail — lighter than before */
-export const EXPAND_DELAY_MS = 700;
-export const EXPAND_COLLAPSE_DELAY_MS = 280;
-export const EXPAND_JITTER_MS = 350;
-export const MAX_EXPAND_PER_SCAN = 8;
+/** Auto-expand Trips rows for trailer/tractor/stop detail.
+ * Active boards need a higher budget so ~15 In Transit rows all get places/driver.
+ * History keeps a smaller share so it cannot starve active expands.
+ */
+export const EXPAND_DELAY_MS = 550;
+export const EXPAND_COLLAPSE_DELAY_MS = 220;
+export const EXPAND_JITTER_MS = 280;
+export const MAX_EXPAND_PER_SCAN = 28;
+export const MAX_EXPAND_ACTIVE = 22;
+export const MAX_EXPAND_HISTORY = 6;
+export const NEAR_LIVE_MAX_EXPAND = 8;
 export const DETAIL_SCRAPE_TTL_MS = 6 * 60 * 60 * 1000;
 export const TAB_SWITCH_DELAY_MS = 1100;
 export const TAB_SWITCH_JITTER_MS = 500;
 export const HISTORY_WEEK_SETTLE_MS = 1400;
+/** Scroll virtualized Trips lists until row count stabilizes. */
+export const LIST_SCROLL_MAX_PASSES = 28;
+export const LIST_SCROLL_SETTLE_MS = 380;
+export const LIST_SCROLL_STABLE_ROUNDS = 2;
 
 /** Skip re-scraping payments if last collection was within this window (unless force). */
 export const PAYMENTS_MIN_INTERVAL_MS = 18 * 60 * 1000;
@@ -98,10 +108,12 @@ export const PAYMENTS_MIN_INTERVAL_MS = 18 * 60 * 1000;
 /**
  * Soft-scan safety: hard timeouts so a hung Payments scrape / Edge flush
  * cannot leave the popup stuck on "busy" and block Trips forever.
+ * Flush was timing out at 45s under concurrent 70+ row payloads (expand→sync).
  */
-export const SOFT_SCAN_HARD_TIMEOUT_MS = 120 * 1000;
-export const COLLECT_TAB_TIMEOUT_MS = 90 * 1000;
-export const FLUSH_TIMEOUT_MS = 45 * 1000;
+export const SOFT_SCAN_HARD_TIMEOUT_MS = 180 * 1000;
+export const COLLECT_TAB_TIMEOUT_MS = 120 * 1000;
+export const FLUSH_TIMEOUT_MS = 90 * 1000;
+export const FLUSH_BATCH_SIZE = 20;
 export const PAYMENTS_COLLECT_TIMEOUT_MS = 60 * 1000;
 
 /**

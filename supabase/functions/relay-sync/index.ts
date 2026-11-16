@@ -110,6 +110,40 @@ function preferPlace(incoming: unknown, existing: unknown, fallback: string): st
   return fallback;
 }
 
+/** Reject city/UI scraps mistaken for drivers ("Colorado Springs", "Spot\\nStarts"). */
+function sanitizeDriverName(raw: unknown): string | null {
+  if (raw == null) return null;
+  const firstLine = String(raw).split(/\n/)[0].replace(/\s+/g, " ").trim();
+  if (!firstLine || firstLine.length < 3 || firstLine.length > 60) return null;
+  if (
+    /^(spot|starts|rejected|weather|driver|unassigned|n\/a|none|unknown|—|-)$/i.test(
+      firstLine,
+    )
+  ) {
+    return null;
+  }
+  if (/,\s*[A-Z]{2}\b/.test(firstLine) || /\d/.test(firstLine)) return null;
+  if (
+    /^(Colorado Springs|Santa Clarita|Kansas City|Fort Worth|Sparrows Point|Salt Lake|Los Angeles|San Diego|San Francisco|Las Vegas|New York|El Paso|St\.?\s*Louis|Corpus Christi|Oklahoma City|Virginia Beach|Palm Springs|Fort Collins|West Sacramento)$/i
+      .test(firstLine)
+  ) {
+    return null;
+  }
+  if (
+    /^(New|San|Los|Las|Fort|Port|Mount|Lake|North|South|East|West|Santa|Saint|St\.?|El|La|Des|Grand|Little|Palm|Corpus|Virginia|Oklahoma|Colorado|Kansas)\s+[A-Z]/i
+      .test(firstLine) &&
+    !/^[A-Z]\.\s/.test(firstLine)
+  ) {
+    return null;
+  }
+  if (/^[A-Z]\.\s*[A-Za-z][A-Za-z'-]{1,35}$/.test(firstLine)) return firstLine;
+  if (/^[A-Za-z][A-Za-z'-]{1,30}\s+[A-Za-z][A-Za-z'-]{1,35}$/.test(firstLine)) {
+    return firstLine;
+  }
+  if (/^[A-Za-z][A-Za-z'-]{2,35}$/.test(firstLine)) return firstLine;
+  return null;
+}
+
 const TERMINAL_STATUSES = new Set(["Completed", "Delivered", "Cancelled", "Rejected"]);
 
 /** Keep trip_bucket + load_status consistent so History never sticks as active. */
@@ -341,9 +375,12 @@ Deno.serve(async (req: Request) => {
         continue;
       }
 
-      const driverId = load.driver_name_raw
-        ? matchDriverId(String(load.driver_name_raw), driversCache)
-        : null;
+      const driverName =
+        sanitizeDriverName(load.driver_name_raw) ||
+        sanitizeDriverName(existing?.driver_name_raw);
+      const driverId = driverName
+        ? matchDriverId(driverName, driversCache) || existing?.driver_id || null
+        : existing?.driver_id || null;
 
       const statusHistory = Array.isArray(existing?.status_history)
         ? [...existing.status_history]
@@ -387,7 +424,7 @@ Deno.serve(async (req: Request) => {
       if (nextBar && nextBar !== prevBar) {
         const stop = load.status_stop_index ?? existing?.status_stop_index ?? 1;
         const trip = load.parent_trip_id || existing?.parent_trip_id || load.load_id;
-        const driverLabel = load.driver_name_raw || existing?.driver_name_raw || "driver";
+        const driverLabel = driverName || existing?.driver_name_raw || "driver";
         if (nextBar === "arrived") {
           notifications.push({
             event_type: "facility_arrived",
@@ -422,7 +459,7 @@ Deno.serve(async (req: Request) => {
         load_id: load.load_id,
         amazon_ref_id: load.amazon_ref_id ?? null,
         driver_id: driverId,
-        driver_name_raw: load.driver_name_raw ?? null,
+        driver_name_raw: driverName,
         load_status: load.load_status,
         payment_status: load.payment_status || existing?.payment_status || "Not Received",
         // Never clobber a real city/state with Unknown / $ scraps from a collapsed scrape
@@ -666,52 +703,64 @@ Deno.serve(async (req: Request) => {
       if (activeErr) {
         errors.push(`Active reconcile lookup: ${activeErr.message}`);
       } else {
-        for (const row of activeRows || []) {
-          const lid = String(row.load_id || "").toUpperCase();
-          if (!lid || activeSet.has(lid)) continue;
-          if (TERMINAL_STATUSES.has(String(row.load_status))) {
+        const currentActiveCount = (activeRows || []).length;
+        const scrapedActiveCount = activeSet.size;
+        // Viewport-only scrapes (~6 of ~15) must not demote the unscrolled remainder.
+        const incomplete =
+          currentActiveCount > 0 &&
+          scrapedActiveCount < Math.max(3, Math.floor(currentActiveCount * 0.55));
+        if (incomplete) {
+          errors.push(
+            `Skipped reconcile demotion: scraped ${scrapedActiveCount} active id(s) vs ${currentActiveCount} in CRM (incomplete list scrape)`,
+          );
+        } else {
+          for (const row of activeRows || []) {
+            const lid = String(row.load_id || "").toUpperCase();
+            if (!lid || activeSet.has(lid)) continue;
+            if (TERMINAL_STATUSES.has(String(row.load_status))) {
+              const { error } = await sb
+                .from("loads")
+                .update({
+                  trip_bucket: "history",
+                  last_changed: now,
+                  last_synchronized: now,
+                  updated_at: now,
+                })
+                .eq("id", row.id);
+              if (!error) loadsReconciled += 1;
+              continue;
+            }
+            const nextStatus = "Completed";
+            const prevHistory = Array.isArray(row.status_history) ? row.status_history : [];
             const { error } = await sb
               .from("loads")
               .update({
                 trip_bucket: "history",
+                load_status: nextStatus,
                 last_changed: now,
                 last_synchronized: now,
+                last_observed: now,
                 updated_at: now,
+                status_history: [
+                  ...prevHistory,
+                  {
+                    status: nextStatus,
+                    timestamp: now,
+                    note: "Reconciled off Relay active set (Upcoming/In Transit)",
+                  },
+                ],
               })
               .eq("id", row.id);
-            if (!error) loadsReconciled += 1;
-            continue;
-          }
-          const nextStatus = "Completed";
-          const prevHistory = Array.isArray(row.status_history) ? row.status_history : [];
-          const { error } = await sb
-            .from("loads")
-            .update({
-              trip_bucket: "history",
-              load_status: nextStatus,
-              last_changed: now,
-              last_synchronized: now,
-              last_observed: now,
-              updated_at: now,
-              status_history: [
-                ...prevHistory,
-                {
-                  status: nextStatus,
-                  timestamp: now,
-                  note: "Reconciled off Relay active set (Upcoming/In Transit)",
-                },
-              ],
-            })
-            .eq("id", row.id);
-          if (error) errors.push(`Reconcile ${row.load_id}: ${error.message}`);
-          else {
-            loadsReconciled += 1;
-            notifications.push({
-              event_type: "load_status_change",
-              dedupe_key: `reconcile_history:${row.load_id}:${nextStatus}`,
-              message: `Load ${row.load_id} moved to History (no longer on Relay active trips)`,
-              load_id: row.load_id,
-            });
+            if (error) errors.push(`Reconcile ${row.load_id}: ${error.message}`);
+            else {
+              loadsReconciled += 1;
+              notifications.push({
+                event_type: "load_status_change",
+                dedupe_key: `reconcile_history:${row.load_id}:${nextStatus}`,
+                message: `Load ${row.load_id} moved to History (no longer on Relay active trips)`,
+                load_id: row.load_id,
+              });
+            }
           }
         }
       }
@@ -725,10 +774,11 @@ Deno.serve(async (req: Request) => {
         .in("load_status", ["Completed", "Delivered", "Cancelled", "Rejected"]);
     }
 
+    const finishedAt = new Date().toISOString();
     await sb
       .from("relay_sync_runs")
       .update({
-        finished_at: now,
+        finished_at: finishedAt,
         status: errors.length ? "completed_with_errors" : "completed",
         records_collected: loads.length + payments.length,
         records_updated: loadsUpdated + paymentsUpserted + loadsPaymentUpdated + loadsReconciled,
