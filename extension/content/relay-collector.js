@@ -308,6 +308,52 @@
     return cleaned;
   }
 
+  /** Reject city/UI scraps mistaken for drivers ("Colorado Springs", "Spot\\nStarts"). */
+  function sanitizeDriverName(raw) {
+    if (raw == null) return null;
+    const firstLine = String(raw).split(/\n/)[0].replace(/\s+/g, ' ').trim();
+    if (!firstLine || firstLine.length < 3 || firstLine.length > 60) return null;
+    if (
+      /^(spot|starts|rejected|weather|driver|unassigned|n\/a|none|unknown|—|-)$/i.test(
+        firstLine,
+      )
+    ) {
+      return null;
+    }
+    if (/,\s*[A-Z]{2}\b/.test(firstLine) || /\d/.test(firstLine)) return null;
+    if (
+      /^(Colorado Springs|Santa Clarita|Kansas City|Fort Worth|Sparrows Point|Salt Lake|Los Angeles|San Diego|San Francisco|Las Vegas|New York|El Paso|St\.?\s*Louis|Corpus Christi|Oklahoma City|Virginia Beach|Palm Springs|Fort Collins|West Sacramento)$/i.test(
+        firstLine,
+      )
+    ) {
+      return null;
+    }
+    if (
+      /^(New|San|Los|Las|Fort|Port|Mount|Lake|North|South|East|West|Santa|Saint|St\.?|El|La|Des|Grand|Little|Palm|Corpus|Virginia|Oklahoma|Colorado|Kansas)\s+[A-Z]/i.test(
+        firstLine,
+      ) &&
+      !/^[A-Z]\.\s/.test(firstLine)
+    ) {
+      return null;
+    }
+    if (/^[A-Z]\.\s*[A-Za-z][A-Za-z'-]{1,35}$/.test(firstLine)) return firstLine;
+    if (/^[A-Za-z][A-Za-z'-]{1,30}\s+[A-Za-z][A-Za-z'-]{1,35}$/.test(firstLine)) {
+      return firstLine;
+    }
+    if (/^[A-Za-z][A-Za-z'-]{2,35}$/.test(firstLine)) return firstLine;
+    return null;
+  }
+
+  function extractDriverName(block) {
+    const labeled = extractLabeledValue(block, ['Driver', 'Assigned driver', 'Operator']);
+    const fromLabel = sanitizeDriverName(labeled);
+    if (fromLabel) return fromLabel;
+    // Relay chips are almost always Initial. Surname — never bare "First Last"
+    // (that pattern matches "Colorado Springs", "Santa Clarita", etc.).
+    const initial = block.match(/\b([A-Z]\.\s*[A-Za-z][A-Za-z'-]{1,35})\b/);
+    return sanitizeDriverName(initial?.[1] || null);
+  }
+
   function placeFromAddressLine(raw) {
     if (!raw) return null;
     const s = String(raw).replace(/\s+/g, ' ').trim();
@@ -416,12 +462,35 @@
       if (!arrowDelivery && facilityArrow) arrowDelivery = cleanLoc(facilityArrow[2]);
     }
 
+    // Collapsed "City, ST → City, ST" or "City → City, ST" without facility codes
+    const cityRoute = text.match(
+      /\b([A-Za-z][A-Za-z .'-]{2,40}(?:,\s*[A-Z]{2})?)\s*(?:→|->|–|—)\s*([A-Za-z][A-Za-z .'-]{2,40}(?:,\s*[A-Z]{2})?)\b/,
+    );
+    let cityPickup = null;
+    let cityDelivery = null;
+    if (cityRoute) {
+      cityPickup =
+        placeFromAddressLine(cityRoute[1]) ||
+        cleanLoc(cityRoute[1].replace(/\.{2,}.*/, '').trim());
+      cityDelivery =
+        placeFromAddressLine(cityRoute[2]) ||
+        cleanLoc(cityRoute[2].replace(/\.{2,}.*/, '').trim());
+      // Require at least one side to look like City, ST
+      if (!/,?\s*[A-Z]{2}\b/.test(`${cityRoute[1]} ${cityRoute[2]}`)) {
+        if (!placeFromAddressLine(cityRoute[1]) && !placeFromAddressLine(cityRoute[2])) {
+          cityPickup = null;
+          cityDelivery = null;
+        }
+      }
+    }
+
     const orderedPickup = [
       addressPlaces[0],
       stopPlaces[0],
       tooltipPlaces[0],
       labeledPickup,
       arrowPickup,
+      cityPickup,
       facilityArrow ? cleanLoc(facilityArrow[1]) : null,
     ].find((x) => isGoodLocation(x));
 
@@ -431,6 +500,7 @@
       tooltipPlaces[1] || (tooltipPlaces.length > 1 ? tooltipPlaces[tooltipPlaces.length - 1] : null),
       labeledDelivery,
       arrowDelivery,
+      cityDelivery,
       facilityArrow ? cleanLoc(facilityArrow[2]) : null,
     ].find((x) => isGoodLocation(x));
 
@@ -680,10 +750,7 @@
       (block.match(/([\d,.]+)\s*mi\b/i) || [])[1] ||
         extractLabeledValue(block, ['Distance', 'Miles']),
     );
-    const driver =
-      extractLabeledValue(block, ['Driver', 'Assigned driver']) ||
-      (block.match(/\b([A-Z]\.\s*[A-Z][a-z]+|[A-Z][a-z]+\s+[A-Z][a-z]+)\b/) || [])[1] ||
-      null;
+    const driver = extractDriverName(block);
 
     const trailerRaw =
       extractLabeledValue(block, ['Trailer ID', 'Trailer']) ||
@@ -889,7 +956,7 @@
           rate_gross: rateIdx >= 0 ? parseMoney(cells[rateIdx]) : null,
           additional_charges: null,
           payment_date: null,
-          driver_name_raw: driverIdx >= 0 ? cells[driverIdx] : null,
+          driver_name_raw: driverIdx >= 0 ? sanitizeDriverName(cells[driverIdx]) : null,
           notes: null,
           observed_url: location.href,
           section: 'tours',
@@ -1203,6 +1270,13 @@
       return { load, method: load.detail_method, expanded: false };
     }
 
+    try {
+      cardRoot.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+    } catch {
+      /* ignore */
+    }
+    if (softYield) await yieldToUi();
+
     const control = findExpandControl(cardRoot);
     if (!control) {
       load.detail_method = 'no_control';
@@ -1268,10 +1342,10 @@
 
   async function enrichLoadsWithAutoExpand(loads, expandOpts = {}) {
     const {
-      maxExpand = 8,
-      expandDelayMs = 700,
-      collapseDelayMs = 280,
-      expandJitterMs = 350,
+      maxExpand = 28,
+      expandDelayMs = 550,
+      collapseDelayMs = 220,
+      expandJitterMs = 280,
       softYield = true,
       scrapedMap = null,
     } = expandOpts;
@@ -1281,7 +1355,17 @@
     let skippedHistory = 0;
     const out = [];
 
-    for (const raw of loads || []) {
+    // Expand incomplete active rows first so budget is not spent on already-rich cards
+    const ordered = [...(loads || [])].sort((a, b) => {
+      const aNeed = needsExpand(a) ? 0 : 1;
+      const bNeed = needsExpand(b) ? 0 : 1;
+      if (aNeed !== bNeed) return aNeed - bNeed;
+      const aDriver = sanitizeDriverName(a?.driver_name_raw) ? 1 : 0;
+      const bDriver = sanitizeDriverName(b?.driver_name_raw) ? 1 : 0;
+      return aDriver - bDriver;
+    });
+
+    for (const raw of ordered) {
       const histSkip = historySkipUnchanged(raw, expandOpts);
       if (histSkip?.skipUpsert) {
         skippedHistory += 1;
@@ -1299,7 +1383,8 @@
       const cachedEquip = Boolean(prior?.hasTrailer || prior?.hasTractor);
       // Still expand when places are Unknown/money even if equipment was cached
       const skipExpand =
-        (cachedEquip && locationsAreGood(raw)) || Boolean(histSkip?.skipExpand);
+        (cachedEquip && locationsAreGood(raw) && sanitizeDriverName(raw.driver_name_raw)) ||
+        Boolean(histSkip?.skipExpand);
       const allowExpand = !skipExpand && expandCount < maxExpand && needsExpand(raw);
       const { load, method } = await expandAndEnrichLoad(raw, {
         expandDelayMs,
@@ -1316,6 +1401,7 @@
         if (!load.notes && prior.notes) load.notes = prior.notes;
         if (skipExpand) load.detail_method = load.detail_method || 'cache_skip_expand';
       }
+      load.driver_name_raw = sanitizeDriverName(load.driver_name_raw);
       if (!isGoodLocation(load.pickup_location)) load.pickup_location = null;
       if (!isGoodLocation(load.delivery_location)) load.delivery_location = null;
       out.push(load);
@@ -1398,7 +1484,7 @@
         rate_gross: base,
         additional_charges: additional,
         payment_date: null,
-        driver_name_raw: extractLabeledValue(text, ['Driver', 'Assigned driver']),
+        driver_name_raw: extractDriverName(text),
         notes: null,
         observed_url: location.href,
         section: 'load_detail',
@@ -1505,8 +1591,129 @@
     return mergeLoads(mergeLoads(cardLoads, tableLoads), detailLoads);
   }
 
+  function findTripListScrollRoot() {
+    const candidates = [
+      ...document.querySelectorAll(
+        '[role="main"], main, [class*="scroll"], [class*="Scroll"], [class*="list"], [class*="List"], [class*="content"], [class*="Content"]',
+      ),
+    ];
+    let best = null;
+    let bestScore = 0;
+    for (const el of candidates) {
+      try {
+        const style = getComputedStyle(el);
+        const oy = style.overflowY || '';
+        if (!/auto|scroll|overlay/i.test(oy)) continue;
+        if (el.scrollHeight <= el.clientHeight + 40) continue;
+        const score = el.scrollHeight + el.clientHeight;
+        if (score > bestScore) {
+          best = el;
+          bestScore = score;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    return best || document.scrollingElement || document.documentElement;
+  }
+
+  /**
+   * Virtualized Trips boards only mount ~viewport rows. Scroll + merge until
+   * load_id count stabilizes so In Transit (~15) is not truncated to ~6.
+   */
+  async function scrollCollectAllVisibleTrips(forcedBucket = null, scrollOpts = {}) {
+    const maxPasses = scrollOpts.listScrollMaxPasses ?? 28;
+    const settleMs = scrollOpts.listScrollSettleMs ?? 380;
+    const stableNeed = scrollOpts.listScrollStableRounds ?? 2;
+    const root = findTripListScrollRoot();
+    const merged = new Map();
+    let stable = 0;
+    let lastCount = 0;
+    let passes = 0;
+
+    const ingest = () => {
+      for (const load of collectVisibleTripsSync(forcedBucket)) {
+        if (!load?.load_id) continue;
+        const prev = merged.get(load.load_id) || {};
+        merged.set(load.load_id, {
+          ...prev,
+          ...Object.fromEntries(Object.entries(load).filter(([, v]) => v != null && v !== '')),
+        });
+      }
+    };
+
+    try {
+      if (root.scrollTop != null) root.scrollTop = 0;
+      else window.scrollTo(0, 0);
+    } catch {
+      /* ignore */
+    }
+    await sleep(Math.min(220, settleMs), 60);
+    ingest();
+
+    for (let i = 0; i < maxPasses; i += 1) {
+      passes = i + 1;
+      const before = merged.size;
+      try {
+        const step = Math.max(240, Math.floor((root.clientHeight || window.innerHeight || 600) * 0.85));
+        if (typeof root.scrollBy === 'function') root.scrollBy(0, step);
+        else root.scrollTop = (root.scrollTop || 0) + step;
+        window.scrollBy(0, Math.floor((window.innerHeight || 600) * 0.5));
+      } catch {
+        window.scrollBy(0, Math.floor((window.innerHeight || 600) * 0.85));
+      }
+      await sleep(settleMs, 120);
+      await yieldToUi();
+      ingest();
+      if (merged.size === lastCount && merged.size === before) {
+        stable += 1;
+        if (stable >= stableNeed) break;
+      } else {
+        stable = 0;
+        lastCount = merged.size;
+      }
+      const atEnd =
+        (root.scrollTop || 0) + (root.clientHeight || 0) >= (root.scrollHeight || 0) - 8;
+      if (atEnd && stable >= 1 && merged.size === lastCount) break;
+    }
+
+    try {
+      if (root.scrollTop != null) root.scrollTop = 0;
+      else window.scrollTo(0, 0);
+    } catch {
+      /* ignore */
+    }
+    await sleep(220, 80);
+    ingest(); // catch top rows again after scroll-back
+
+    return {
+      loads: [...merged.values()],
+      list_fully_scrolled: passes >= 1,
+      scroll_passes: passes,
+      scroll_count: merged.size,
+    };
+  }
+
   async function collectVisibleTrips(forcedBucket = null, expandOpts = {}) {
-    const base = collectVisibleTripsSync(forcedBucket).map((l) => {
+    const scrollFirst = expandOpts.scrollList !== false;
+    let base = [];
+    let scrollMeta = {
+      list_fully_scrolled: !scrollFirst,
+      scroll_passes: 0,
+      scroll_count: 0,
+    };
+    if (scrollFirst) {
+      const scrolled = await scrollCollectAllVisibleTrips(forcedBucket, expandOpts);
+      base = scrolled.loads;
+      scrollMeta = {
+        list_fully_scrolled: scrolled.list_fully_scrolled,
+        scroll_passes: scrolled.scroll_passes,
+        scroll_count: scrolled.scroll_count,
+      };
+    } else {
+      base = collectVisibleTripsSync(forcedBucket);
+    }
+    base = base.map((l) => {
       if (forcedBucket === 'history') {
         return {
           ...l,
@@ -1529,6 +1736,7 @@
       expanded,
       history_skipped: history_skipped || 0,
       trip_bucket: forcedBucket || detectTripBucket(),
+      ...scrollMeta,
     };
   }
 
@@ -1647,7 +1855,7 @@
     const settle = expandOpts.historyWeekSettleMs ?? 1400;
     const jitter = expandOpts.tabSwitchJitterMs ?? 500;
     const scrapedMap = expandOpts.scrapedMap || (await getDetailScrapedMap());
-    let remainingExpand = expandOpts.maxExpand ?? 8;
+    let remainingExpand = expandOpts.maxExpand ?? 6;
     let rowsExpanded = 0;
     let merged = [];
     const weeks = [];
@@ -1752,7 +1960,9 @@
    * History also walks week filters (prior + current). Soft yields between steps.
    */
   async function collectAllTripBuckets(expandOpts = {}) {
-    const maxExpand = expandOpts.maxExpand ?? 8;
+    const maxExpand = expandOpts.maxExpand ?? 28;
+    const activeExpandBudget = expandOpts.maxExpandActive ?? Math.min(22, maxExpand);
+    const historyExpandBudget = expandOpts.maxExpandHistory ?? Math.min(6, maxExpand);
     const scrapedMap = expandOpts.scrapedMap || (await getDetailScrapedMap());
     const tabDelay = expandOpts.tabSwitchDelayMs ?? 1100;
     const tabJitter = expandOpts.tabSwitchJitterMs ?? 500;
@@ -1763,7 +1973,7 @@
       if (bucket === 'history' && doHistoryWeeks) {
         const hist = await collectHistoryWithWeekFilters({
           ...expandOpts,
-          maxExpand,
+          maxExpand: historyExpandBudget,
           scrapedMap,
         });
         return {
@@ -1774,15 +1984,27 @@
           history_skipped: hist.history_skipped || 0,
           auto_tab_switch: false,
           rows_expanded: hist.expanded,
+          list_fully_scrolled: true,
+          active_scrape_complete: false,
         };
       }
-      const result = await collectVisibleTrips(null, { ...expandOpts, maxExpand, scrapedMap });
+      const budget =
+        bucket === 'history' ? historyExpandBudget : activeExpandBudget;
+      const result = await collectVisibleTrips(null, {
+        ...expandOpts,
+        maxExpand: budget,
+        scrapedMap,
+      });
+      const activeOk = bucket === 'upcoming' || bucket === 'in_transit';
       return {
         loads: result.loads,
         trip_buckets_scanned: [bucket].filter(Boolean),
         history_weeks_scanned: [],
         auto_tab_switch: false,
         rows_expanded: result.expanded,
+        list_fully_scrolled: Boolean(result.list_fully_scrolled),
+        scroll_count: result.scroll_count || result.loads.length,
+        active_scrape_complete: activeOk && Boolean(result.list_fully_scrolled),
       };
     }
 
@@ -1794,11 +2016,16 @@
 
     let merged = [];
     const scanned = [];
-    let remainingExpand = maxExpand;
+    let remainingActiveExpand = activeExpandBudget;
+    let remainingHistoryExpand = historyExpandBudget;
     let rowsExpanded = 0;
     let historyWeeks = [];
     let historyFilters = [];
     let historySkipped = 0;
+    let listFullyScrolled = true;
+    let activeScrollCount = 0;
+    let sawInTransit = false;
+    let sawUpcoming = false;
 
     for (const tab of tabs) {
       try {
@@ -1812,10 +2039,10 @@
       if (tab.bucket === 'history' && doHistoryWeeks) {
         const hist = await collectHistoryWithWeekFilters({
           ...expandOpts,
-          maxExpand: remainingExpand,
+          maxExpand: remainingHistoryExpand,
           scrapedMap,
         });
-        remainingExpand = Math.max(0, remainingExpand - (hist.expanded || 0));
+        remainingHistoryExpand = Math.max(0, remainingHistoryExpand - (hist.expanded || 0));
         rowsExpanded += hist.expanded || 0;
         scanned.push(tab.bucket);
         historyWeeks = hist.weeks;
@@ -1827,16 +2054,20 @@
 
       const result = await collectVisibleTrips(tab.bucket, {
         ...expandOpts,
-        maxExpand: remainingExpand,
+        maxExpand: remainingActiveExpand,
         scrapedMap,
       });
       const loads = result.loads.map((l) => ({
         ...l,
         trip_bucket: tab.bucket,
       }));
-      remainingExpand = Math.max(0, remainingExpand - (result.expanded || 0));
+      remainingActiveExpand = Math.max(0, remainingActiveExpand - (result.expanded || 0));
       rowsExpanded += result.expanded || 0;
       scanned.push(tab.bucket);
+      if (tab.bucket === 'in_transit') sawInTransit = true;
+      if (tab.bucket === 'upcoming') sawUpcoming = true;
+      if (!result.list_fully_scrolled) listFullyScrolled = false;
+      activeScrollCount += result.scroll_count || loads.length;
       merged = mergeLoads(merged, loads);
       for (const load of loads) {
         if (!detailIsRich(load)) continue;
@@ -1857,6 +2088,9 @@
       }
     }
 
+    const activeScrapeComplete =
+      listFullyScrolled && (sawInTransit || sawUpcoming) && activeScrollCount > 0;
+
     return {
       loads: merged,
       trip_buckets_scanned: scanned,
@@ -1865,6 +2099,9 @@
       history_skipped: historySkipped,
       auto_tab_switch: true,
       rows_expanded: rowsExpanded,
+      list_fully_scrolled: listFullyScrolled,
+      scroll_count: activeScrollCount,
+      active_scrape_complete: activeScrapeComplete,
     };
   }
 
@@ -1925,16 +2162,22 @@
           }
 
           const expandOpts = {
-            maxExpand: msg?.maxExpand ?? 8,
-            expandDelayMs: msg?.expandDelayMs ?? 700,
-            collapseDelayMs: msg?.collapseDelayMs ?? 280,
-            expandJitterMs: msg?.expandJitterMs ?? 350,
+            maxExpand: msg?.maxExpand ?? 28,
+            maxExpandActive: msg?.maxExpandActive ?? 22,
+            maxExpandHistory: msg?.maxExpandHistory ?? 6,
+            expandDelayMs: msg?.expandDelayMs ?? 550,
+            collapseDelayMs: msg?.collapseDelayMs ?? 220,
+            expandJitterMs: msg?.expandJitterMs ?? 280,
             tabSwitchDelayMs: msg?.tabSwitchDelayMs ?? 1100,
             tabSwitchJitterMs: msg?.tabSwitchJitterMs ?? 500,
             historyWeekSettleMs: msg?.historyWeekSettleMs ?? 1400,
             historyWeeks: msg?.historyWeeks !== false,
             softYield: msg?.softYield !== false,
             historySkipMap: msg?.historySkipMap || {},
+            listScrollMaxPasses: msg?.listScrollMaxPasses ?? 28,
+            listScrollSettleMs: msg?.listScrollSettleMs ?? 380,
+            listScrollStableRounds: msg?.listScrollStableRounds ?? 2,
+            scrollList: msg?.scrollList !== false,
           };
 
           if (section === 'tours' && msg?.allTripTabs !== false) {
@@ -1951,6 +2194,9 @@
                 history_skipped: multi.history_skipped || 0,
                 auto_tab_switch: multi.auto_tab_switch,
                 rows_expanded: multi.rows_expanded || 0,
+                list_fully_scrolled: multi.list_fully_scrolled !== false,
+                scroll_count: multi.scroll_count || multi.loads?.length || 0,
+                active_scrape_complete: Boolean(multi.active_scrape_complete),
                 detail_detected: multi.loads.some((l) => l.trailer_id || l.tractor_id),
                 payments: [],
                 pageTitle: document.title,
@@ -2056,11 +2302,13 @@
         const bucket = detectTripBucket();
         // Expand changed rows so PU/drop city-state + trailer/load id are visible
         const result = await collectVisibleTrips(bucket, {
-          maxExpand: 3,
-          expandDelayMs: 700,
-          collapseDelayMs: 280,
-          expandJitterMs: 350,
+          maxExpand: 8,
+          expandDelayMs: 550,
+          collapseDelayMs: 220,
+          expandJitterMs: 280,
           softYield: true,
+          scrollList: true,
+          listScrollMaxPasses: 16,
         });
         const loads = (result.loads || []).filter((l) => !l.history_skip);
         if (!loads.length) return;
