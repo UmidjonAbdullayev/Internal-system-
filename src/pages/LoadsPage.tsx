@@ -553,6 +553,13 @@ export function LoadsPage() {
                     <td className="px-3 py-2.5 text-xs">
                       <div>{l.pickupLocation}</div>
                       <div className="text-text-secondary">→ {l.deliveryLocation}</div>
+                      {(l.arrivalActual || l.arrivalScheduled) && (
+                        <div className="mt-0.5 text-[11px] text-text-secondary">
+                          {l.arrivalActual ? `Arrived ${l.arrivalActual}` : null}
+                          {l.arrivalActual && l.arrivalScheduled ? ' · ' : null}
+                          {l.arrivalScheduled ? `Sch. ${l.arrivalScheduled}` : null}
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2.5">
                       <TripStatusIcon load={l} />
@@ -736,6 +743,12 @@ export function LoadsPage() {
               <Info label="Delivery Date" value={formatDate(detail.deliveryDate)} />
               <Info label="Trailer" value={`${detail.trailerId || '—'} (${detail.trailerType})`} />
               <Info label="Tractor" value={detail.tractorId || '—'} />
+              <Info label="Arrived" value={detail.arrivalActual || '—'} />
+              <Info label="Sch. arrival" value={detail.arrivalScheduled || '—'} />
+              <Info
+                label="Arrival address"
+                value={detail.arrivalAddress || '—'}
+              />
               <Info label="Parent Trip" value={detail.parentTripId || '—'} />
               <Info label="Trip tab" value={inferTripBucket(detail) || '—'} />
               <Info label="Status" value={tripStatusTooltip(resolveTripStatus(detail))} />

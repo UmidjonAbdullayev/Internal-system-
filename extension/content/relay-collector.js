@@ -529,47 +529,90 @@
     return (m ? m[0] : s).slice(0, 40);
   }
 
+  const RELAY_TIME_RE =
+    /(\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+[A-Za-z]+\s+\d{1,2}(?:,?\s*\d{4})?(?:\s*,?\s*\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?)?)/i;
+
+  function normalizeRelayTime(raw) {
+    if (!raw) return null;
+    return String(raw).replace(/\bY\+?\b/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || null;
+  }
+
   /**
    * Relay Arrival section (actual vs Sch.) — used for facility-arrival Telegram alerts.
-   * Example:
+   * Example (media/relay-arrival-status.png):
    *   Arrival
    *   15 Nov, 13:45 PST   Y+
    *   Sch. 15 Nov, 14:45 PST
+   * Also captures Departure / Pickup Sch. into notes as "Sch. pickup: …".
    */
   function scrapeArrivalSection(text) {
     const src = String(text || '');
-    if (!/\bArrival\b/i.test(src)) {
-      return { arrival_actual: null, arrival_scheduled: null, arrival_address: null };
+    const empty = {
+      arrival_actual: null,
+      arrival_scheduled: null,
+      arrival_address: null,
+      pickup_scheduled: null,
+    };
+    if (!/\bArrival\b/i.test(src) && !/\bDeparture\b/i.test(src) && !/\bSch\.?\b/i.test(src)) {
+      return empty;
     }
-
-    const timeRe =
-      /(\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+[A-Za-z]+\s+\d{1,2}(?:,?\s*\d{4})?(?:\s*,?\s*\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?)?)/i;
 
     let arrival_actual = null;
     let arrival_scheduled = null;
+    let pickup_scheduled = null;
 
-    const block =
+    const arrivalBlock =
       (src.match(
-        /Arrival\s*[\r\n]+([\s\S]{0,280}?)(?:Report delay|Departure|Trailer|Tractor|Stop\s*\d|$)/i,
+        /Arrival\s*[\r\n]+([\s\S]{0,320}?)(?:Report delay|Departure|Trailer|Tractor|Stop\s*\d|$)/i,
       ) || [])[1] || '';
-    const schLine = (block.match(/Sch\.?\s*([^\r\n]+)/i) || src.match(/Sch\.?\s*([^\r\n]+)/i) || [])[1];
-    if (schLine) {
-      const schHit = schLine.match(timeRe);
-      arrival_scheduled = (schHit ? schHit[1] : schLine).replace(/\s+/g, ' ').trim().slice(0, 80);
+    const departureBlock =
+      (src.match(
+        /(?:Departure|Pickup)\s*[\r\n]+([\s\S]{0,320}?)(?:Report delay|Arrival|Trailer|Tractor|Stop\s*\d|$)/i,
+      ) || [])[1] || '';
+
+    const schFrom = (block, whole) => {
+      const schLine =
+        (block.match(/Sch\.?\s*([^\r\n]+)/i) || whole.match(/Sch\.?\s*([^\r\n]+)/i) || [])[1];
+      if (!schLine) return null;
+      const schHit = schLine.match(RELAY_TIME_RE);
+      return normalizeRelayTime(schHit ? schHit[1] : schLine);
+    };
+
+    if (arrivalBlock || /\bArrival\b/i.test(src)) {
+      arrival_scheduled = schFrom(arrivalBlock, /\bArrival\b/i.test(src) ? src : '');
+      const actualLine = arrivalBlock
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l && !/^Sch\.?/i.test(l) && !/^Arrival$/i.test(l) && !/^Report/i.test(l));
+      if (actualLine) {
+        const actHit = actualLine.replace(/\bY\+?\b/g, '').match(RELAY_TIME_RE);
+        if (actHit) arrival_actual = normalizeRelayTime(actHit[1]);
+      }
+      if (!arrival_actual) {
+        const inline = src.match(
+          /Arrival\s+([^\n]{0,80}?\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?)/i,
+        );
+        if (inline) arrival_actual = normalizeRelayTime(inline[1]);
+      }
     }
-    const actualLine = block
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .find((l) => l && !/^Sch\.?/i.test(l) && !/^Arrival$/i.test(l) && !/^Report/i.test(l));
-    if (actualLine) {
-      const actHit = actualLine.replace(/\bY\+?\b/g, '').match(timeRe);
-      if (actHit) arrival_actual = actHit[1].replace(/\s+/g, ' ').trim().slice(0, 80);
+
+    if (departureBlock) {
+      pickup_scheduled = schFrom(departureBlock, '');
+      if (!pickup_scheduled) {
+        const depActual = departureBlock
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .find((l) => l && !/^Sch\.?/i.test(l) && !/^(Departure|Pickup)$/i.test(l));
+        if (depActual && /Sch\.?/i.test(departureBlock) === false) {
+          /* keep only Sch. for pickup_scheduled */
+        }
+      }
     }
-    if (!arrival_actual) {
-      const inline = src.match(
-        /Arrival\s+([^\n]{0,80}?\d{1,2}:\d{2}\s*(?:PST|PDT|EST|EDT|CST|CDT|MST|MDT)?)/i,
+    if (!pickup_scheduled) {
+      const puSch = src.match(
+        /(?:Departure|Pickup)[^\n]{0,40}Sch\.?\s*([^\r\n]+)|Sch\.?\s*([^\r\n]+)[^\n]{0,40}(?:pickup|depart)/i,
       );
-      if (inline) arrival_actual = inline[1].replace(/\bY\+?\b/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      if (puSch) pickup_scheduled = normalizeRelayTime(puSch[1] || puSch[2]);
     }
 
     // Prefer a street-like address near Arrival / current stop
@@ -579,7 +622,7 @@
     );
     if (addrHit) arrival_address = addrHit[1].replace(/\s+/g, ' ').trim().slice(0, 160);
 
-    return { arrival_actual, arrival_scheduled, arrival_address };
+    return { arrival_actual, arrival_scheduled, arrival_address, pickup_scheduled };
   }
 
   function applyArrivalFields(target, text) {
@@ -588,6 +631,12 @@
     if (arr.arrival_actual) target.arrival_actual = arr.arrival_actual;
     if (arr.arrival_scheduled) target.arrival_scheduled = arr.arrival_scheduled;
     if (arr.arrival_address) target.arrival_address = arr.arrival_address;
+    if (arr.pickup_scheduled) {
+      const line = `Sch. pickup: ${arr.pickup_scheduled}`;
+      if (!target.notes || !/Sch\.?\s*pickup:/i.test(target.notes)) {
+        target.notes = [target.notes, line].filter(Boolean).join('\n').slice(0, 2000);
+      }
+    }
     return target;
   }
 
@@ -1105,20 +1154,114 @@
     return buttons[0] || null;
   }
 
+  /**
+   * Relay Trips expands legs when the user clicks *anywhere on the trip row*
+   * (not only a chevron). Prefer a non-navigating cell inside the card.
+   */
+  function findRowClickTarget(cardRoot) {
+    if (!cardRoot) return null;
+    const isNavLink = (el) => {
+      if (!el || el === cardRoot) return false;
+      if (el.tagName === 'A' && el.getAttribute('href')) return true;
+      const role = el.getAttribute?.('role') || '';
+      if (role === 'link') return true;
+      return false;
+    };
+    const isDangerousControl = (el) => {
+      if (!el || el === cardRoot) return false;
+      const label = `${el.getAttribute?.('aria-label') || ''} ${el.getAttribute?.('title') || ''} ${el.className || ''}`;
+      if (/menu|more|overflow|share|copy|delete|cancel|reject|filter|search|close/i.test(label)) {
+        return true;
+      }
+      if (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') return true;
+      return false;
+    };
+
+    // Prefer a wide text cell (route / payout / miles) — same surface a human clicks
+    const candidates = [
+      ...cardRoot.querySelectorAll('[role="row"], [role="button"], [class*="row" i], [class*="card" i], [class*="Trip" i]'),
+      cardRoot,
+    ];
+    for (const el of candidates) {
+      if (!el || isNavLink(el) || isDangerousControl(el)) continue;
+      const r = el.getBoundingClientRect?.();
+      if (r && (r.width < 80 || r.height < 18)) continue;
+      const text = (el.innerText || '').trim();
+      if (text.length < 12) continue;
+      return el;
+    }
+
+    // Click a text node parent that is not the load-id <a>
+    const spans = [...cardRoot.querySelectorAll('div, span, p, td, li')].filter((el) => {
+      if (isNavLink(el) || el.closest('a[href]')) return false;
+      if (isDangerousControl(el) || el.closest('button')) return false;
+      const t = (el.innerText || '').trim();
+      return t.length >= 8 && t.length < 400;
+    });
+    if (spans[0]) return spans[0];
+    return cardRoot;
+  }
+
+  function fireHumanClick(el) {
+    if (!el) return false;
+    const opts = { bubbles: true, cancelable: true, view: window, buttons: 1 };
+    try {
+      if (typeof PointerEvent === 'function') {
+        el.dispatchEvent(new PointerEvent('pointerdown', opts));
+      }
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      if (typeof PointerEvent === 'function') {
+        el.dispatchEvent(new PointerEvent('pointerup', opts));
+      }
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      el.dispatchEvent(new MouseEvent('click', opts));
+      return true;
+    } catch {
+      try {
+        el.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  function expandDetailScopes(cardRoot) {
+    return [
+      cardRoot,
+      cardRoot.nextElementSibling,
+      cardRoot.parentElement,
+      cardRoot.parentElement?.nextElementSibling,
+      cardRoot.parentElement?.parentElement,
+    ].filter(Boolean);
+  }
+
+  function scopesHaveLegDetail(scopes) {
+    for (const scope of scopes) {
+      const t = scope.innerText || '';
+      if (/\bTrailer\b/i.test(t) && /\bTractor\b/i.test(t)) return true;
+      if (/\bArrival\b/i.test(t) && /Sch\.?/i.test(t)) return true;
+      if (/\bArrival\b/i.test(t) && /\bDeparture\b/i.test(t)) return true;
+      if (/\bTrailer\b/i.test(t) && /\bArrival\b/i.test(t)) return true;
+    }
+    return false;
+  }
+
   function isCardExpanded(cardRoot) {
     if (!cardRoot) return false;
     if (cardRoot.querySelector('[aria-expanded="true"]')) return true;
-    const t = cardRoot.innerText || '';
-    if (/\bTrailer\b/i.test(t) && /\bTractor\b/i.test(t)) return true;
-    // Expanded stop table: street address + Arrival/Departure columns
-    if (
-      /\bArrival\b/i.test(t) &&
-      /\bDeparture\b/i.test(t) &&
-      /\d{1,6}\s+[A-Za-z].+,\s*[A-Za-z].+,\s*(?:[A-Z]{2}|[A-Za-z]{4,})\s+\d{5}/.test(t)
-    ) {
-      return true;
+    return scopesHaveLegDetail(expandDetailScopes(cardRoot));
+  }
+
+  async function waitForExpandedDetail(cardRoot, timeoutMs = 2200) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (isCardExpanded(cardRoot) || scopesHaveLegDetail(expandDetailScopes(cardRoot))) {
+        return true;
+      }
+      await sleep(140);
     }
-    return false;
+    return isCardExpanded(cardRoot) || scopesHaveLegDetail(expandDetailScopes(cardRoot));
   }
 
   async function bgMessage(payload) {
@@ -1135,7 +1278,9 @@
   }
 
   async function markDetailScraped(rows) {
-    const rich = (rows || []).filter((r) => r?.load_id && detailIsRich(r));
+    const rich = (rows || []).filter(
+      (r) => r?.load_id && (detailIsRich(r) || arrivalIsRich(r)),
+    );
     if (!rich.length) return;
     await bgMessage({
       type: 'MARK_DETAIL_SCRAPED',
@@ -1143,6 +1288,9 @@
         load_id: r.load_id,
         trailer_id: r.trailer_id,
         tractor_id: r.tractor_id,
+        arrival_actual: r.arrival_actual || null,
+        arrival_scheduled: r.arrival_scheduled || null,
+        arrival_address: r.arrival_address || null,
         notes: r.notes || null,
       })),
     });
@@ -1221,8 +1369,10 @@
   }
 
   /**
-   * DOM/React first; click-expand when Trailer/Tractor or city/state places missing.
-   * Rate-limited; collapses after scrape. Skips IDs already in chrome.storage when rich.
+   * DOM/React first; then click *the trip row* (anywhere) to expand legs.
+   * Relay does not require a chevron — 1.3.4 hunted buttons and often got
+   * no_control / wrong control, so trailer / Arrival / Sch. never appeared.
+   * Waits for leg content, scrapes, then collapses via the same row click.
    */
   async function expandAndEnrichLoad(load, opts = {}) {
     const {
@@ -1236,6 +1386,18 @@
     if (
       detailIsRich(load) &&
       locationsAreGood(load) &&
+      arrivalIsRich(load) &&
+      load.notes &&
+      /Late:|Stops:/.test(load.notes)
+    ) {
+      return { load, method: 'already_rich', expanded: false };
+    }
+
+    // In-transit / arrived rows still need Arrival+Sch even when equipment is cached
+    if (
+      detailIsRich(load) &&
+      locationsAreGood(load) &&
+      !needsExpand(load) &&
       load.notes &&
       /Late:|Stops:/.test(load.notes)
     ) {
@@ -1250,15 +1412,17 @@
     let enriched = parseDetailFromCard(cardRoot, load.trip_bucket, load.section || 'tours');
     load = mergeParsedOntoLoad(load, enriched);
 
-    if (!needsExpand(load) || (isCardExpanded(cardRoot) && locationsAreGood(load) && detailIsRich(load))) {
+    if (!needsExpand(load)) {
       load.detail_method =
         load.detail_method || (detailIsRich(load) && locationsAreGood(load) ? 'dom' : 'open_partial');
       return { load, method: load.detail_method, expanded: false };
     }
 
     if (isCardExpanded(cardRoot)) {
-      enriched = parseDetailFromCard(cardRoot, load.trip_bucket, load.section || 'tours');
-      load = mergeParsedOntoLoad(load, enriched);
+      for (const scope of expandDetailScopes(cardRoot)) {
+        enriched = parseDetailFromCard(scope, load.trip_bucket, load.section || 'tours');
+        load = mergeParsedOntoLoad(load, enriched);
+      }
       if (!needsExpand(load)) {
         load.detail_method = load.detail_method || 'dom_expanded';
         return { load, method: load.detail_method, expanded: false };
@@ -1277,53 +1441,69 @@
     }
     if (softYield) await yieldToUi();
 
-    const control = findExpandControl(cardRoot);
-    if (!control) {
-      load.detail_method = 'no_control';
-      return { load, method: 'no_control', expanded: false };
-    }
+    const rowTarget = findRowClickTarget(cardRoot);
+    const chevron = findExpandControl(cardRoot);
+    // Primary: click the row (user-confirmed Relay behavior). Chevron is fallback only.
+    const clickTargets = [rowTarget, chevron, cardRoot].filter(
+      (el, i, arr) => el && arr.indexOf(el) === i,
+    );
 
-    try {
-      control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-    } catch {
-      try {
-        control.click();
-      } catch {
-        load.detail_method = 'click_failed';
-        return { load, method: 'click_failed', expanded: false };
+    let clicked = false;
+    let usedTarget = null;
+    for (const target of clickTargets) {
+      if (fireHumanClick(target)) {
+        clicked = true;
+        usedTarget = target;
+        break;
       }
+    }
+    if (!clicked) {
+      load.detail_method = 'click_failed';
+      return { load, method: 'click_failed', expanded: false };
     }
 
     if (softYield) await yieldToUi();
-    await sleep(expandDelayMs, expandJitterMs);
-
-    // Detail often mounts on the card or next sibling panel (leg dropdown under trip)
-    const scopes = [
+    // Fixed delay + poll until Trailer/Tractor/Arrival/Sch. mount
+    await sleep(Math.min(expandDelayMs, 400), Math.min(expandJitterMs, 180));
+    const opened = await waitForExpandedDetail(
       cardRoot,
-      cardRoot.nextElementSibling,
-      cardRoot.parentElement,
-      cardRoot.parentElement?.nextElementSibling,
-    ].filter(Boolean);
-    for (const scope of scopes) {
+      Math.max(1600, expandDelayMs + expandJitterMs + 800),
+    );
+
+    // If row click did nothing, retry once with chevron (legacy)
+    if (!opened && chevron && chevron !== usedTarget) {
+      fireHumanClick(chevron);
+      if (softYield) await yieldToUi();
+      await sleep(300, 120);
+      await waitForExpandedDetail(cardRoot, 1600);
+    }
+
+    // Detail mounts on the card or sibling panel under the trip row
+    for (const scope of expandDetailScopes(cardRoot)) {
       const parsed = parseDetailFromCard(scope, load.trip_bucket, load.section || 'tours');
       if (!parsed) continue;
       load = mergeParsedOntoLoad(load, parsed);
-      if (detailIsRich(load) && locationsAreGood(load)) break;
+      if (detailIsRich(load) && locationsAreGood(load) && (!needsExpand(load) || arrivalIsRich(load))) {
+        break;
+      }
     }
 
     await sleep(collapseDelayMs, Math.min(120, expandJitterMs));
     try {
-      const collapse =
+      // Collapse the same way a user would: click the row again
+      const collapseTarget =
+        findRowClickTarget(cardRoot) ||
         cardRoot.querySelector('[aria-expanded="true"]') ||
-        findExpandControl(cardRoot) ||
-        control;
-      collapse.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        usedTarget ||
+        chevron ||
+        cardRoot;
+      fireHumanClick(collapseTarget);
     } catch {
       /* leave open if collapse fails */
     }
 
-    load.detail_method = 'click_expand';
-    return { load, method: 'click_expand', expanded: true };
+    load.detail_method = opened || detailIsRich(load) || arrivalIsRich(load) ? 'click_row' : 'click_row_empty';
+    return { load, method: load.detail_method, expanded: true };
   }
 
   function historySkipUnchanged(load, expandOpts = {}) {
@@ -1381,9 +1561,12 @@
 
       const prior = already[raw.load_id];
       const cachedEquip = Boolean(prior?.hasTrailer || prior?.hasTractor);
-      // Still expand when places are Unknown/money even if equipment was cached
+      // Still expand when places/Arrival/Sch. missing — do not skip solely on cached equipment
       const skipExpand =
-        (cachedEquip && locationsAreGood(raw) && sanitizeDriverName(raw.driver_name_raw)) ||
+        (cachedEquip &&
+          locationsAreGood(raw) &&
+          sanitizeDriverName(raw.driver_name_raw) &&
+          !needsExpand(raw)) ||
         Boolean(histSkip?.skipExpand);
       const allowExpand = !skipExpand && expandCount < maxExpand && needsExpand(raw);
       const { load, method } = await expandAndEnrichLoad(raw, {
@@ -1393,12 +1576,19 @@
         softYield,
         allowExpand,
       });
-      if (method === 'click_expand') expandCount += 1;
+      if (method === 'click_expand' || method === 'click_row' || method === 'click_row_empty') {
+        expandCount += 1;
+      }
       if (softYield && expandCount > 0 && expandCount % 2 === 0) await yieldToUi();
-      if (prior && (!load.trailer_id || !load.tractor_id || !load.notes)) {
-        load.trailer_id = load.trailer_id || prior.trailer_id || null;
-        load.tractor_id = load.tractor_id || prior.tractor_id || null;
-        if (!load.notes && prior.notes) load.notes = prior.notes;
+      if (prior) {
+        if (!load.trailer_id || !load.tractor_id || !load.notes) {
+          load.trailer_id = load.trailer_id || prior.trailer_id || null;
+          load.tractor_id = load.tractor_id || prior.tractor_id || null;
+          if (!load.notes && prior.notes) load.notes = prior.notes;
+        }
+        load.arrival_actual = load.arrival_actual || prior.arrival_actual || null;
+        load.arrival_scheduled = load.arrival_scheduled || prior.arrival_scheduled || null;
+        load.arrival_address = load.arrival_address || prior.arrival_address || null;
         if (skipExpand) load.detail_method = load.detail_method || 'cache_skip_expand';
       }
       load.driver_name_raw = sanitizeDriverName(load.driver_name_raw);

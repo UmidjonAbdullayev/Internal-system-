@@ -331,8 +331,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           at: Date.now(),
           hasTrailer: Boolean(row.trailer_id) || Boolean(prev.hasTrailer),
           hasTractor: Boolean(row.tractor_id) || Boolean(prev.hasTractor),
+          hasArrival:
+            Boolean(row.arrival_actual || row.arrival_scheduled) || Boolean(prev.hasArrival),
           trailer_id: row.trailer_id || prev.trailer_id || null,
           tractor_id: row.tractor_id || prev.tractor_id || null,
+          arrival_actual: row.arrival_actual || prev.arrival_actual || null,
+          arrival_scheduled: row.arrival_scheduled || prev.arrival_scheduled || null,
+          arrival_address: row.arrival_address || prev.arrival_address || null,
           notes: row.notes || prev.notes || null,
         };
       }
