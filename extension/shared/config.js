@@ -86,7 +86,7 @@ export const TYPICAL_FULL_SYNC_SECONDS = '45–90';
  * Active boards need a higher budget so ~15 In Transit rows all get places/driver.
  * History keeps a smaller share so it cannot starve active expands.
  */
-/** Row-click expand: wait for legs (Trailer/Tractor/Arrival/Sch.) to mount. */
+/** Safe expand: wait for legs (Trailer/Tractor/Arrival/Sch.) after toggle/chevron. */
 export const EXPAND_DELAY_MS = 650;
 export const EXPAND_COLLAPSE_DELAY_MS = 220;
 export const EXPAND_JITTER_MS = 300;
