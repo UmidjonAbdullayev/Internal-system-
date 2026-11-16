@@ -12,12 +12,15 @@ import { Modal, ConfirmDialog } from '@/components/ui/Modal';
 import { Drawer } from '@/components/ui/Drawer';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { SortHeader, useSort, type SortDir } from '@/components/shared/SortHeader';
+import { TripStatusIcon } from '@/components/shared/TripStatusIcon';
 import { getLoadFinalGross } from '@/lib/calculations';
+import { resolveTripStatus, tripStatusTooltip } from '@/lib/loadStatusDisplay';
 import {
   formatCurrency,
   formatDate,
   downloadCSV,
   getDriverFullName,
+  getWeekRange,
   todayISO,
 } from '@/lib/utils';
 import type { Load, LoadStatus, PaymentStatus, TrailerType, TripBucket } from '@/types';
@@ -66,12 +69,9 @@ function driverDisplayName(
   return load.driverNameRaw || 'Unassigned';
 }
 
-function statusBarLabel(load: Load): string {
-  if (load.statusBarState === 'arrived') return `Arrived · stop ${load.statusStopIndex ?? 1}`;
-  if (load.statusBarState === 'loaded_enroute') return `Loaded / en route · stop ${load.statusStopIndex ?? 1}`;
-  if (load.statusBarState === 'cancelled') return 'Cancelled stop';
-  if (load.statusBarState) return String(load.statusBarState);
-  return load.loadStatus;
+/** Date range only applies on History — live boards show all matching rows. */
+function tabUsesDateFilter(tab: LoadsTab): boolean {
+  return tab === 'history';
 }
 
 const emptyForm = {
@@ -99,14 +99,19 @@ export function LoadsPage() {
     useData();
   const [params, setParams] = useSearchParams();
   const today = todayISO(companySettings.timezone || 'America/Chicago');
-  const [tab, setTab] = useState<LoadsTab>((params.get('tab') as LoadsTab) || 'in_transit');
+  const week = getWeekRange(today);
+  const urlTab = params.get('tab') as LoadsTab | null;
+  const [tab, setTab] = useState<LoadsTab>(
+    urlTab && TRIP_TABS.some((x) => x.id === urlTab) ? urlTab : 'in_transit',
+  );
   const [search, setSearch] = useState(params.get('q') ?? '');
   const [statusFilter, setStatusFilter] = useState(params.get('status') ?? '');
   const [paymentFilter, setPaymentFilter] = useState(params.get('paymentStatus') ?? '');
   const [driverFilter, setDriverFilter] = useState('');
-  /** Default = current ops date (America/Chicago unless Settings override). */
+  /** History-only date range (day / week / custom). Live tabs ignore these. */
   const [dateFrom, setDateFrom] = useState(params.get('from') || today);
   const [dateTo, setDateTo] = useState(params.get('to') || today);
+  const datesActive = tabUsesDateFilter(tab);
   const [sortKey, setSortKey] = useState('deliveryDate');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [formOpen, setFormOpen] = useState(false);
@@ -152,7 +157,8 @@ export function LoadsPage() {
       if (statusFilter && l.loadStatus !== statusFilter) return false;
       if (paymentFilter && l.paymentStatus !== paymentFilter) return false;
       if (driverFilter && l.driverId !== driverFilter) return false;
-      if (dateFrom || dateTo) {
+      // Upcoming / In Transit / All: no date filter — live boards show every matching row.
+      if (datesActive && (dateFrom || dateTo)) {
         const inRange = (d: string) => {
           if (!d) return false;
           if (dateFrom && d < dateFrom) return false;
@@ -179,7 +185,7 @@ export function LoadsPage() {
       }
       return true;
     });
-  }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, driverMap]);
+  }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, datesActive, driverMap]);
 
   const sorted = useSort(filtered, sortKey, sortDir, {
     loadId: (l) => l.loadId,
@@ -260,8 +266,8 @@ export function LoadsPage() {
         l.loadId,
         l.parentTripId || '',
         driverDisplayName(l, driverMap),
-        l.loadStatus,
-        statusBarLabel(l),
+        resolveTripStatus(l).name,
+        tripStatusTooltip(resolveTripStatus(l)),
         l.tractorId || '',
         l.trailerId || '',
         l.pickupLocation,
@@ -348,50 +354,73 @@ export function LoadsPage() {
               </option>
             ))}
           </Select>
-          <div className="flex flex-col gap-0.5">
-            <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
-              From
-            </label>
-            <Input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => setDateFrom(e.target.value)}
-              className="w-36"
-            />
-          </div>
-          <div className="flex flex-col gap-0.5">
-            <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
-              To
-            </label>
-            <Input
-              type="date"
-              value={dateTo}
-              onChange={(e) => setDateTo(e.target.value)}
-              className="w-36"
-            />
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            type="button"
-            onClick={() => {
-              setDateFrom(today);
-              setDateTo(today);
-            }}
-          >
-            Today
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            type="button"
-            onClick={() => {
-              setDateFrom('');
-              setDateTo('');
-            }}
-          >
-            All dates
-          </Button>
+          {datesActive ? (
+            <>
+              <div className="flex flex-col gap-0.5">
+                <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+                  From
+                </label>
+                <Input
+                  type="date"
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value)}
+                  className="w-36"
+                />
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
+                  To
+                </label>
+                <Input
+                  type="date"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value)}
+                  className="w-36"
+                />
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom(today);
+                  setDateTo(today);
+                }}
+              >
+                Today
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom(week.start);
+                  setDateTo(week.end);
+                }}
+              >
+                This week
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                type="button"
+                onClick={() => {
+                  setDateFrom('');
+                  setDateTo('');
+                }}
+              >
+                All dates
+              </Button>
+            </>
+          ) : (
+            <p className="pb-1 text-xs text-text-secondary">
+              {tab === 'upcoming'
+                ? 'Upcoming board — all booked trips, no date filter.'
+                : tab === 'in_transit'
+                  ? 'In Transit board — all live trips, no date filter.'
+                  : 'All trips — date range is on History only.'}
+            </p>
+          )}
         </div>
       </Card>
 
@@ -454,8 +483,7 @@ export function LoadsPage() {
                       <div className="text-text-secondary">→ {l.deliveryLocation}</div>
                     </td>
                     <td className="px-3 py-2.5">
-                      <Badge status={l.loadStatus} />
-                      <div className="mt-1 text-[11px] text-text-secondary">{statusBarLabel(l)}</div>
+                      <TripStatusIcon load={l} />
                     </td>
                     <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
                       {formatCurrency(getLoadFinalGross(l))}
@@ -481,10 +509,35 @@ export function LoadsPage() {
           </table>
           {sorted.length === 0 && (
             <EmptyState
-              title="No trips in this tab"
-              description="Open Amazon Relay Trips with the extension live, or add a load manually. Empty means Supabase has no matching trip_bucket rows yet."
-              actionLabel="Add Load"
-              onAction={openCreate}
+              title={
+                loads.length === 0
+                  ? 'No trips synced yet'
+                  : tab === 'in_transit'
+                    ? 'No In Transit trips'
+                    : tab === 'upcoming'
+                      ? 'No Upcoming trips'
+                      : tab === 'history'
+                        ? 'No History trips in this date range'
+                        : 'No trips in this tab'
+              }
+              description={
+                loads.length === 0
+                  ? 'Open Amazon Relay Trips with the extension live (GO LIVE), then refresh.'
+                  : tab === 'history' && (dateFrom || dateTo)
+                    ? 'Widen the History date range (This week / All dates), or sync Relay History.'
+                    : tab === 'in_transit' && tabCounts.history > 0
+                      ? `${tabCounts.history} trip(s) are under History. Switch tabs, or Force scan with Upcoming/In Transit open.`
+                      : 'Open Amazon Relay Trips with the extension live, or add a load manually.'
+              }
+              actionLabel={tab === 'history' && (dateFrom || dateTo) ? 'All dates' : 'Add Load'}
+              onAction={
+                tab === 'history' && (dateFrom || dateTo)
+                  ? () => {
+                      setDateFrom('');
+                      setDateTo('');
+                    }
+                  : openCreate
+              }
             />
           )}
         </div>
@@ -575,7 +628,7 @@ export function LoadsPage() {
         {detail && (
           <div className="space-y-5 animate-fade-in">
             <div className="flex flex-wrap gap-2">
-              <Badge status={detail.loadStatus} />
+              <TripStatusIcon load={detail} />
               <Badge status={detail.paymentStatus} />
             </div>
             <div className="grid grid-cols-2 gap-4 text-sm">
@@ -596,7 +649,7 @@ export function LoadsPage() {
               <Info label="Tractor" value={detail.tractorId || '—'} />
               <Info label="Parent Trip" value={detail.parentTripId || '—'} />
               <Info label="Trip tab" value={inferTripBucket(detail) || '—'} />
-              <Info label="Status bar" value={statusBarLabel(detail)} />
+              <Info label="Status" value={tripStatusTooltip(resolveTripStatus(detail))} />
               <Info label="Distance" value={`${detail.distanceMiles} mi`} />
               <Info label="Rate Gross" value={formatCurrency(detail.rateGross)} />
               <Info label="Additional Charges" value={formatCurrency(detail.additionalCharges)} />
