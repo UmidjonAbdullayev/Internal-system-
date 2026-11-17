@@ -1146,13 +1146,22 @@
   function isUnsafeExpandTarget(el) {
     if (!el) return true;
     if (isDriverAssignControl(el)) return true;
-    if (el.closest && isDriverAssignControl(el.closest('a, button, [role="button"], [role="link"]'))) {
-      return true;
+    // Only treat an ancestor as unsafe when THAT ancestor itself is a driver control —
+    // do not climb to a large row button that merely contains a driver chip.
+    if (el.closest) {
+      const driverAnc = el.closest(
+        'a, button, [role="button"], [role="link"], [role="combobox"], [aria-haspopup="listbox"]',
+      );
+      if (driverAnc && driverAnc !== el && isDriverAssignControl(driverAnc)) return true;
     }
     const label = `${el.getAttribute?.('aria-label') || ''} ${el.getAttribute?.('title') || ''} ${
       el.className || ''
     }`;
-    if (/menu|more|overflow|share|copy|delete|cancel|reject|filter|search|close|ask a question|report delay/i.test(label)) {
+    if (
+      /menu|more|overflow|share|copy|delete|cancel|reject|filter|search|close|ask a question|report delay/i.test(
+        label,
+      )
+    ) {
       return true;
     }
     if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return true;
@@ -1163,13 +1172,23 @@
   }
 
   function isBlueishColor(color) {
-    const m = String(color || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (!color || color === 'transparent' || color === 'none' || color === 'currentColor') return false;
+    const hex = String(color).match(/^#([0-9a-f]{3,8})$/i);
+    if (hex) {
+      let h = hex[1];
+      if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+      const r = parseInt(h.slice(0, 2), 16);
+      const g = parseInt(h.slice(2, 4), 16);
+      const b = parseInt(h.slice(4, 6), 16);
+      return b >= 120 && b > r + 15 && b >= g - 10 && r <= 140;
+    }
+    const m = String(color).match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
     if (!m) return false;
     const r = Number(m[1]);
     const g = Number(m[2]);
     const b = Number(m[3]);
-    // Relay chevrons are blue (#0x / amazon blue); exclude gray/black arrows
-    return b >= 140 && b > r + 25 && b >= g && r <= 120;
+    // Relay chevron / link blue — slightly looser than 1.3.6 (was missing some theme blues)
+    return b >= 120 && b > r + 15 && b >= g - 10 && r <= 140;
   }
 
   function elementLooksBlue(el) {
@@ -1191,10 +1210,16 @@
       }
       const attrFill = node.getAttribute?.('fill');
       const attrStroke = node.getAttribute?.('stroke');
-      if (attrFill && attrFill !== 'none' && /#(?:0{0,2}[0-9a-f]{2}|007|06c|2196|147|008)/i.test(attrFill)) {
+      if (attrFill && attrFill !== 'none' && isBlueishColor(attrFill)) return true;
+      if (attrStroke && attrStroke !== 'none' && isBlueishColor(attrStroke)) return true;
+      if (attrFill && attrFill !== 'none' && /#(?:0{0,2}[0-9a-f]{2}|007|06c|2196|147|008|00a|1a7)/i.test(attrFill)) {
         return true;
       }
-      if (attrStroke && attrStroke !== 'none' && /#(?:0{0,2}[0-9a-f]{2}|007|06c|2196|147|008)/i.test(attrStroke)) {
+      if (
+        attrStroke &&
+        attrStroke !== 'none' &&
+        /#(?:0{0,2}[0-9a-f]{2}|007|06c|2196|147|008|00a|1a7)/i.test(attrStroke)
+      ) {
         return true;
       }
     }
@@ -1207,85 +1232,199 @@
     } ${el?.getAttribute?.('data-testid') || ''}`;
   }
 
+  function isChevronGlyphText(text) {
+    const t = String(text || '').trim();
+    // Visible Relay chevron is a blue `>` (or similar caret glyphs)
+    return /^(?:>|›|▸|▹|►|▻|❯|⟩|〉|&gt;)$/.test(t);
+  }
+
   function findIdAnchorInScope(scope, id) {
     if (!scope || !id) return null;
     const needle = String(id).trim().toUpperCase();
-    return (
-      [...scope.querySelectorAll('a, button, [role="link"], span, div, td, li')].find((el) => {
-        const t = (el.innerText || el.textContent || '').trim().toUpperCase();
-        return t === needle;
-      }) || null
+    const exact = [...scope.querySelectorAll('a, button, [role="link"], span, div, td, li')].filter(
+      (el) => (el.innerText || el.textContent || '').trim().toUpperCase() === needle,
     );
+    // Prefer the smallest exact text node (the visible id chip, not a wrapper)
+    exact.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+    return exact[0] || null;
+  }
+
+  /** Prefer clickable wrapper for a glyph/svg without treating the whole row as the target. */
+  function clickableWrapper(el, idEl) {
+    if (!el) return null;
+    let node = el;
+    for (let i = 0; i < 5 && node; i += 1) {
+      if (idEl && node === idEl) break;
+      if (isUnsafeExpandTarget(node)) {
+        node = node.parentElement;
+        continue;
+      }
+      const role = node.getAttribute?.('role') || '';
+      const text = (node.innerText || '').trim();
+      const r = node.getBoundingClientRect?.();
+      const small = !r || (r.width > 0 && r.width <= 64 && r.height <= 64);
+      if (
+        small &&
+        (node.tagName === 'BUTTON' ||
+          role === 'button' ||
+          node.getAttribute?.('aria-expanded') != null ||
+          node.getAttribute?.('tabindex') === '0' ||
+          isChevronGlyphText(text) ||
+          node.querySelector?.('svg'))
+      ) {
+        // Reject wrappers that also contain the shipment id + lots of row text
+        if (idEl && node.contains(idEl) && text.length > 28) {
+          node = node.parentElement;
+          continue;
+        }
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return isUnsafeExpandTarget(el) ? null : el;
   }
 
   /**
-   * Blue chevron (>) beside a shipment / trip id. Small control only —
-   * never the Assign Driver dropdown arrows or the whole row.
+   * Local scopes for "is this card open?" — never climb to the list parent
+   * (virtualized Trips board shares one parent; that made 1.3.6 invent internals).
+   */
+  function localExpandScopes(cardRoot) {
+    if (!cardRoot) return [];
+    return [cardRoot, cardRoot.nextElementSibling].filter(Boolean);
+  }
+
+  /**
+   * Wider scrape scopes after a successful expand (detail may mount under parent).
+   * Still avoid the list container when possible.
+   */
+  function expandDetailScopes(cardRoot) {
+    if (!cardRoot) return [];
+    const scopes = localExpandScopes(cardRoot);
+    const parent = cardRoot.parentElement;
+    if (parent) {
+      // Only include parent when it still looks like a single tour card, not the whole board
+      const t = (parent.innerText || '').slice(0, 500);
+      const tripHits = (t.match(/\bT-[A-Z0-9]{5,}\b/gi) || []).length;
+      if (tripHits <= 1) scopes.push(parent);
+      if (parent.nextElementSibling) scopes.push(parent.nextElementSibling);
+    }
+    return scopes.filter(Boolean);
+  }
+
+  /**
+   * Blue chevron (>) beside a shipment / trip id — glyph, SVG, or small toggle.
+   * 1.3.6 required button+[blue/aria] and often matched nothing on live Relay.
    */
   function findBlueChevronNearId(rowRoot, id) {
     if (!rowRoot) return null;
     const idEl = findIdAnchorInScope(rowRoot, id);
     const searchRoot =
       (idEl &&
-        (idEl.closest('[role="row"], tr, li, [class*="row" i], [class*="leg" i], [class*="shipment" i]') ||
+        (idEl.closest(
+          '[role="row"], tr, li, [class*="row" i], [class*="leg" i], [class*="shipment" i], [class*="Tour" i]',
+        ) ||
           idEl.parentElement?.parentElement ||
           idEl.parentElement)) ||
       rowRoot;
     const idRect = idEl?.getBoundingClientRect?.() || null;
 
-    const candidates = [
-      ...searchRoot.querySelectorAll(
-        'button, [role="button"], [aria-expanded], [tabindex="0"], [class*="chevron" i], [class*="Caret" i], [class*="expand" i], [data-testid*="expand" i]',
-      ),
-    ];
+    const candidateSet = new Set();
+    const addCand = (el) => {
+      if (el) candidateSet.add(el);
+    };
+
+    for (const el of searchRoot.querySelectorAll(
+      'button, [role="button"], [aria-expanded], [tabindex="0"], [class*="chevron" i], [class*="Caret" i], [class*="caret" i], [class*="expand" i], [class*="Expand" i], [data-testid*="expand" i], svg, span, i, div',
+    )) {
+      addCand(el);
+    }
+
+    // Walk left siblings of the id chip — where the blue `>` lives in screenshots
+    if (idEl) {
+      let sib = idEl.previousElementSibling;
+      while (sib) {
+        addCand(sib);
+        for (const d of sib.querySelectorAll('button, [role="button"], svg, span, i, div')) addCand(d);
+        sib = sib.previousElementSibling;
+      }
+      let p = idEl.parentElement;
+      for (let depth = 0; depth < 3 && p && p !== searchRoot; depth += 1) {
+        sib = p.previousElementSibling;
+        while (sib) {
+          addCand(sib);
+          for (const d of sib.querySelectorAll('button, [role="button"], svg, span, i, div')) addCand(d);
+          sib = sib.previousElementSibling;
+        }
+        p = p.parentElement;
+      }
+    }
 
     const scored = [];
-    for (const raw of candidates) {
-      const el =
-        raw.closest?.('button, [role="button"], [aria-expanded], [tabindex="0"]') || raw;
-      if (!el || isUnsafeExpandTarget(el)) continue;
-      if (idEl && (el === idEl || (el.contains?.(idEl) && (el.innerText || '').trim().length > 24))) {
-        continue;
+    for (const raw of candidateSet) {
+      const glyph = isChevronGlyphText((raw.innerText || raw.textContent || '').trim());
+      const hasSvg = Boolean(raw.querySelector?.('svg') || raw.tagName === 'svg');
+      const label = controlLabel(raw);
+      const ariaExp = raw.getAttribute?.('aria-expanded');
+      const classToggle = /expand|collapse|chevron|caret|toggle|detail/i.test(label);
+      if (
+        !glyph &&
+        !hasSvg &&
+        !classToggle &&
+        ariaExp == null &&
+        raw.tagName !== 'BUTTON' &&
+        raw.getAttribute?.('role') !== 'button'
+      ) {
+        // Keep only tiny nodes immediately left of the id (icon fonts / CSS triangles)
+        const rr = raw.getBoundingClientRect?.();
+        const leftish =
+          idRect &&
+          rr &&
+          rr.width > 0 &&
+          rr.width <= 40 &&
+          rr.height <= 40 &&
+          rr.right <= idRect.left + 16;
+        if (!leftish) continue;
       }
+
+      const el = clickableWrapper(raw, idEl);
+      if (!el || isUnsafeExpandTarget(el)) continue;
+      if (idEl && el === idEl) continue;
+      if (idEl && el.contains?.(idEl) && (el.innerText || '').trim().length > 28) continue;
+
       const r = el.getBoundingClientRect?.();
       if (!r || r.width <= 0 || r.height <= 0) continue;
-      if (r.width > 56 || r.height > 56) continue;
+      if (r.width > 72 || r.height > 72) continue;
 
-      const label = controlLabel(el);
-      const hasSvg = Boolean(el.querySelector?.('svg') || el.tagName === 'svg');
-      const ariaExp = el.getAttribute?.('aria-expanded');
-      const looksToggle =
-        /expand|collapse|chevron|caret|toggle|detail|show|hide/i.test(label) ||
-        ariaExp != null ||
-        hasSvg;
-      const blue = elementLooksBlue(el);
-      if (!looksToggle && !blue) continue;
-      // Assign-driver steppers are rarely blue; require blue OR explicit expand label/aria
-      if (!blue && !/expand|collapse|chevron|caret|toggle|detail/i.test(label) && ariaExp == null) {
-        continue;
-      }
+      const blue = elementLooksBlue(el) || elementLooksBlue(raw);
+      const leftOfId = idRect && r.right <= idRect.left + 16;
+      const sameRow =
+        idRect && Math.abs((r.top + r.bottom) / 2 - (idRect.top + idRect.bottom) / 2) < 32;
+
+      // Must look like a chevron/toggle OR sit immediately left of the id
+      if (!glyph && !hasSvg && !classToggle && ariaExp == null && !blue && !leftOfId) continue;
 
       let score = 0;
-      if (blue) score += 55;
-      if (/expand|collapse|chevron|caret/i.test(label)) score += 40;
+      if (glyph) score += 60;
+      if (blue) score += 45;
+      if (classToggle) score += 40;
       if (ariaExp != null) score += 35;
-      if (hasSvg) score += 10;
-      if (idRect && r.right <= idRect.left + 12) score += 30;
-      if (idRect && Math.abs((r.top + r.bottom) / 2 - (idRect.top + idRect.bottom) / 2) < 28) {
-        score += 20;
-      }
+      if (hasSvg) score += 25;
+      if (leftOfId) score += 40;
+      if (sameRow) score += 20;
+      if (el.tagName === 'BUTTON' || el.getAttribute?.('role') === 'button') score += 10;
       scored.push({ el, score });
     }
     scored.sort((a, b) => b.score - a.score);
-    // Confidence gate — skip when mechanism is unclear
-    return scored[0]?.score >= 50 ? scored[0].el : null;
+    // 1.3.7: lower confidence gate; left-of-id SVG/glyph typically scores 85+
+    return scored[0]?.score >= 40 ? scored[0].el : null;
   }
 
   /**
-   * Dedicated parent (T-…) expansion toggle. Never the whole parent row.
+   * Parent (T-…) expand target: dedicated toggle, else the trip-id chip itself.
+   * Never the whole row / Assign Driver column.
    */
   function findParentExpandToggle(parentRoot, parentId) {
-    if (!parentRoot || isCardExpanded(parentRoot)) return null;
+    if (!parentRoot) return null;
     if (parentHasInternalRows(parentRoot)) return null;
 
     const selectors = [
@@ -1299,6 +1438,7 @@
       '[class*="chevron" i]',
       '[class*="Expand" i]',
       '[class*="Caret" i]',
+      '[class*="caret" i]',
     ];
     for (const sel of selectors) {
       try {
@@ -1307,27 +1447,50 @@
         const target = el.closest('button, [role="button"], [aria-expanded]') || el;
         if (isUnsafeExpandTarget(target)) continue;
         const r = target.getBoundingClientRect?.();
-        if (r && (r.width > 64 || r.height > 64)) continue;
+        if (r && (r.width > 72 || r.height > 72)) continue;
         return target;
       } catch {
         /* invalid selector */
       }
     }
 
-    const byId = parentId ? findBlueChevronNearId(parentRoot, parentId) : null;
-    if (byId) return byId;
+    if (parentId) {
+      const byChevron = findBlueChevronNearId(parentRoot, parentId);
+      if (byChevron) return byChevron;
 
-    // Last resort: small left-edge toggle with aria-expanded / blue chevron look
-    const buttons = [...parentRoot.querySelectorAll('button, [role="button"], [aria-expanded], [tabindex="0"]')];
-    for (const b of buttons) {
-      if (isUnsafeExpandTarget(b)) continue;
+      // Safe fallback: click the T-… id chip (accordion often binds here), not the row
+      const idEl = findIdAnchorInScope(parentRoot, parentId);
+      if (idEl && !isUnsafeExpandTarget(idEl) && !isDriverAssignControl(idEl)) {
+        const wrap =
+          idEl.closest('button, [role="button"], a, [tabindex="0"]') || idEl;
+        if (wrap && !isUnsafeExpandTarget(wrap)) {
+          const t = (wrap.innerText || '').trim();
+          // Reject if wrapper is the whole row
+          if (t.length <= 48) return wrap;
+        }
+        return idEl;
+      }
+    }
+
+    // Last resort: small left-edge toggle
+    const parentRect = parentRoot.getBoundingClientRect?.();
+    const buttons = [
+      ...parentRoot.querySelectorAll('button, [role="button"], [aria-expanded], [tabindex="0"], svg'),
+    ];
+    for (const raw of buttons) {
+      const b = clickableWrapper(raw, null);
+      if (!b || isUnsafeExpandTarget(b)) continue;
       const r = b.getBoundingClientRect?.();
-      if (!r || r.width <= 0 || r.width > 48 || r.height > 48) continue;
+      if (!r || r.width <= 0 || r.width > 56 || r.height > 56) continue;
       const label = controlLabel(b);
+      const nearLeft = parentRect ? r.left <= parentRect.left + 72 : true;
       if (
-        b.getAttribute('aria-expanded') === 'false' ||
-        /expand|chevron|caret|toggle|detail/i.test(label) ||
-        elementLooksBlue(b)
+        nearLeft &&
+        (b.getAttribute('aria-expanded') === 'false' ||
+          /expand|chevron|caret|toggle|detail/i.test(label) ||
+          elementLooksBlue(b) ||
+          b.querySelector?.('svg') ||
+          b.tagName === 'svg')
       ) {
         return b;
       }
@@ -1338,7 +1501,8 @@
   function listInternalShipmentIds(parentRoot) {
     if (!parentRoot) return [];
     const ids = new Set();
-    for (const scope of expandDetailScopes(parentRoot)) {
+    // Only this card + immediate next sibling (expanded panel) — never the list parent
+    for (const scope of localExpandScopes(parentRoot)) {
       const t = scope.innerText || '';
       for (const m of t.matchAll(/\b([0-9]{2,3}[A-Z0-9]{5,})\b/g)) {
         if (isValidRelayLoadId(m[1])) ids.add(String(m[1]).toUpperCase());
@@ -1354,12 +1518,17 @@
   async function waitForInternalRows(parentRoot, timeoutMs = 2200) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (parentHasInternalRows(parentRoot) || scopesHaveLegDetail(expandDetailScopes(parentRoot))) {
+      if (
+        parentHasInternalRows(parentRoot) ||
+        scopesHaveLegDetail(localExpandScopes(parentRoot))
+      ) {
         return true;
       }
       await sleep(140);
     }
-    return parentHasInternalRows(parentRoot) || scopesHaveLegDetail(expandDetailScopes(parentRoot));
+    return (
+      parentHasInternalRows(parentRoot) || scopesHaveLegDetail(localExpandScopes(parentRoot))
+    );
   }
 
   function fireHumanClick(el) {
@@ -1386,16 +1555,6 @@
     }
   }
 
-  function expandDetailScopes(cardRoot) {
-    return [
-      cardRoot,
-      cardRoot.nextElementSibling,
-      cardRoot.parentElement,
-      cardRoot.parentElement?.nextElementSibling,
-      cardRoot.parentElement?.parentElement,
-    ].filter(Boolean);
-  }
-
   function scopesHaveLegDetail(scopes) {
     for (const scope of scopes) {
       const t = scope.innerText || '';
@@ -1410,7 +1569,8 @@
   function isCardExpanded(cardRoot) {
     if (!cardRoot) return false;
     if (cardRoot.querySelector('[aria-expanded="true"]')) return true;
-    return scopesHaveLegDetail(expandDetailScopes(cardRoot));
+    // Local scopes only — parentElement is the virtualized list and false-triggers
+    return scopesHaveLegDetail(localExpandScopes(cardRoot));
   }
 
   async function waitForExpandedDetail(cardRoot, timeoutMs = 2200) {
@@ -1549,11 +1709,11 @@
   }
 
   /**
-   * Safe two-level expand (1.3.6+):
-   *  1) Parent T-… — dedicated toggle only (never whole-row click / Assign Driver)
-   *  2) Internal shipment — blue chevron (>) beside the leg id only
-   * Skip when the toggle/chevron cannot be identified. Do not collapse rows that
-   * were already expanded. Collapse only via the same toggle/chevron we clicked.
+   * Safe two-level expand (1.3.7+):
+   *  1) Parent T-… — dedicated toggle, else trip-id chip (never whole-row / Assign Driver)
+   *  2) Internal shipment — blue `>` / SVG chevron beside the leg id
+   * 1.3.6 was a no-op: chevron matcher required button+blue/aria, and list-parent
+   * scopes invented "already open" internals. Do not collapse pre-expanded rows.
    */
   async function expandAndEnrichLoad(load, opts = {}) {
     const {
@@ -1585,7 +1745,7 @@
       return { load, method: 'already_rich', expanded: false };
     }
 
-    const cardRoot = findCardRootForLoad(load);
+    let cardRoot = findCardRootForLoad(load);
     if (!cardRoot) {
       return { load, method: 'no_card', expanded: false };
     }
@@ -1619,31 +1779,29 @@
       /* ignore */
     }
     if (softYield) await yieldToUi();
+    // Virtualized list may remount the node after scroll — re-resolve
+    cardRoot = findCardRootForLoad(load) || cardRoot;
 
     const parentId =
       (load.parent_trip_id && String(load.parent_trip_id).toUpperCase()) ||
       (/^T-[A-Z0-9]{5,}$/i.test(String(load.load_id || ''))
         ? String(load.load_id).toUpperCase()
         : null);
-    const parentRoot =
-      (parentId && findCardRootForLoadId(parentId)) || cardRoot;
+    let parentRoot = (parentId && findCardRootForLoadId(parentId)) || cardRoot;
 
     const togglesWeOpened = [];
     let didWork = false;
 
     // ── LEVEL 1: parent shipments (T-…) ──────────────────────────────────
     const internalsBefore = listInternalShipmentIds(parentRoot);
-    if (parentId && internalsBefore.length === 0 && !scopesHaveLegDetail(expandDetailScopes(parentRoot))) {
+    if (
+      parentId &&
+      internalsBefore.length === 0 &&
+      !scopesHaveLegDetail(localExpandScopes(parentRoot))
+    ) {
       const parentToggle = findParentExpandToggle(parentRoot, parentId);
       if (!parentToggle) {
-        // No safe parent toggle — try level-2 on this card if it is already a leg row
-        const maybeLeg =
-          load.amazon_ref_id ||
-          (/^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(String(load.load_id || '')) ? load.load_id : null);
-        if (!maybeLeg) {
-          load.detail_method = 'no_safe_control';
-          return { load, method: 'no_safe_control', expanded: false };
-        }
+        // No safe parent control — continue; level-2 / single-card path may still work
       } else if (fireHumanClick(parentToggle)) {
         togglesWeOpened.push(parentToggle);
         didWork = true;
@@ -1653,15 +1811,15 @@
           parentRoot,
           Math.max(1600, expandDelayMs + expandJitterMs + 800),
         );
-      } else {
-        load.detail_method = 'click_failed';
-        return { load, method: 'click_failed', expanded: false };
+        // Remount after accordion open
+        parentRoot = (parentId && findCardRootForLoadId(parentId)) || parentRoot;
+        cardRoot = findCardRootForLoad(load) || cardRoot;
       }
+      // click_failed on parent: still try level-2 / id fallback below
     }
 
     load = scrapeScopesOntoLoad(load, [parentRoot, cardRoot]);
     if (!needsExpand(load)) {
-      // Collapse only toggles we opened; leave pre-expanded parents alone
       await sleep(collapseDelayMs, Math.min(120, expandJitterMs));
       for (let i = togglesWeOpened.length - 1; i >= 0; i -= 1) {
         try {
@@ -1675,6 +1833,7 @@
     }
 
     // ── LEVEL 2: internal shipments — blue chevron only ──────────────────
+    parentRoot = (parentId && findCardRootForLoadId(parentId)) || parentRoot;
     const internalIds = listInternalShipmentIds(parentRoot);
     const legCandidates = [];
     if (load.amazon_ref_id && /^[0-9]{2,3}[A-Z0-9]{5,}$/i.test(String(load.amazon_ref_id))) {
@@ -1687,7 +1846,7 @@
       if (!legCandidates.includes(id)) legCandidates.push(id);
     }
 
-    let openedDetail = scopesHaveLegDetail(expandDetailScopes(parentRoot));
+    let openedDetail = scopesHaveLegDetail(localExpandScopes(parentRoot));
     let chevronClicks = 0;
 
     for (const legId of legCandidates.slice(0, 6)) {
@@ -1697,14 +1856,14 @@
       if (!legRow) continue;
 
       // Already showing Arrival/Sch/trailer under this leg — do not re-click
-      if (scopesHaveLegDetail(expandDetailScopes(legRow))) {
+      if (scopesHaveLegDetail(localExpandScopes(legRow))) {
         load = scrapeScopesOntoLoad(load, [legRow, parentRoot]);
         openedDetail = true;
         continue;
       }
 
       const chevron = findBlueChevronNearId(legRow, legId);
-      if (!chevron) continue; // unclear → skip this leg, never fall back to row click
+      if (!chevron) continue; // never fall back to whole-row / Assign Driver
 
       try {
         chevron.scrollIntoView?.({ block: 'center', inline: 'nearest' });
@@ -1732,7 +1891,7 @@
       }
     }
 
-    // Single-level card (no internals): blue chevron / dedicated toggle on the card itself
+    // Single-level / still collapsed: toggle or id chip on this card
     if (!didWork && !openedDetail && needsExpand(load)) {
       const selfId = load.load_id || load.amazon_ref_id || parentId;
       const chevron =

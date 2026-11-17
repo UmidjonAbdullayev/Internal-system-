@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.3.6",
-  "description": "Safe two-level expand (parent toggle + blue chevron); never Assign Driver.",
+  "version": "1.3.7",
+  "description": "Fix expand no-op: match blue > / trip-id toggle; never Assign Driver.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
   "host_permissions": [
     "https://relay.amazon.com/*",
