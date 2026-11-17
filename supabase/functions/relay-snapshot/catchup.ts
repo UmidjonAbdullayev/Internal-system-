@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
-import { PAUSE_MS, sendRestoreSummary } from "./shared.ts";
+import { PAUSE_MS, recordTripEvent, sendRestoreSummary } from "./shared.ts";
 
 export async function beginCatchUp(sb: SupabaseClient, liveMissing: string[]) {
   const now = new Date().toISOString();
@@ -64,7 +64,16 @@ export async function finalizeCatchUp(sb: SupabaseClient) {
         updated_at: now,
       })
       .eq("trip_id", tripId);
-    if (!error) removed.push(tripId);
+    if (!error) {
+      removed.push(tripId);
+      await recordTripEvent(sb, {
+        trip_id: tripId,
+        event_type: "removed_from_relay",
+        to_section: "HISTORY",
+        to_status: "removed_from_relay",
+        detail: { reason: "catch_up_finalize" },
+      });
+    }
   }
 
   await sb.from("activity_logs").insert({
