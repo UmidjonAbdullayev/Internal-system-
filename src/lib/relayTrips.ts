@@ -346,7 +346,14 @@ export function plainEnglishStatus(trip: RelayTrip, now = Date.now()): string {
   return trip.status || 'In progress';
 }
 
+/** Trip-level cancelled (status / tour_state / execution_status). */
+export function isTripCancelled(trip: Pick<RelayTrip, 'status' | 'tourState' | 'executionStatus'>): boolean {
+  const blob = `${trip.status || ''} ${trip.tourState || ''} ${trip.executionStatus || ''}`.toLowerCase();
+  return /cancel/.test(blob);
+}
+
 export function displayStatusLabel(trip: RelayTrip): string {
+  if (isTripCancelled(trip)) return 'Cancelled';
   const raw = trip.executionStatus || trip.tourState || trip.status || '';
   if (!raw) {
     if (trip.section === 'HISTORY') return 'Completed';
@@ -500,6 +507,8 @@ export function filterTrips(
     endDateEnd?: string | null;
     endTimeZone?: string;
     tripEndYmd?: (trip: RelayTrip) => string | null;
+    /** Upcoming: include cancelled with future start (off by default). */
+    showRecentlyCancelled?: boolean;
   },
 ): RelayTrip[] {
   const now = opts.now ?? Date.now();
@@ -507,6 +516,19 @@ export function filterTrips(
   return trips.filter((trip) => {
     const bucket = sectionToTab(trip.section);
     if (opts.tab !== 'all' && bucket !== opts.tab) return false;
+    // Live tabs: active (non-cancelled) only — cancelled belong in History.
+    if (
+      (opts.tab === 'upcoming' || opts.tab === 'in_transit') &&
+      isTripCancelled(trip) &&
+      !(
+        opts.tab === 'upcoming' &&
+        opts.showRecentlyCancelled &&
+        trip.startTime &&
+        Date.parse(trip.startTime) > now
+      )
+    ) {
+      return false;
+    }
     if (opts.status) {
       if (displayStatusLabel(trip).toLowerCase() !== opts.status.toLowerCase()) return false;
     }
@@ -583,24 +605,30 @@ export function historySummary(trips: RelayTrip[], now = Date.now()) {
   };
 }
 
+/** Tab badges = CRM rows (same as list). Live tabs count active only. */
+export function tabCountsFromTrips(trips: RelayTrip[]): Record<TripTab, number> {
+  const counts: Record<TripTab, number> = {
+    upcoming: 0,
+    in_transit: 0,
+    history: 0,
+    all: trips.length,
+  };
+  for (const t of trips) {
+    const b = sectionToTab(t.section);
+    if (!b) continue;
+    if ((b === 'upcoming' || b === 'in_transit') && isTripCancelled(t)) continue;
+    counts[b] += 1;
+  }
+  return counts;
+}
+
+/** @deprecated Prefer tabCountsFromTrips — snapshot totals caused badge≠list vanish bug. */
 export function tabCountsFromSnapshots(
   snapshots: RelaySectionSnapshot[],
   trips: RelayTrip[],
 ): Record<TripTab, number> {
-  const bySection = Object.fromEntries(snapshots.map((s) => [s.section, s.totalRecords])) as Partial<
-    Record<RelaySection, number>
-  >;
-  const live: Record<TripBucket, number> = { upcoming: 0, in_transit: 0, history: 0 };
-  for (const t of trips) {
-    const b = sectionToTab(t.section);
-    if (b) live[b] += 1;
-  }
-  return {
-    upcoming: bySection.UPCOMING ?? live.upcoming,
-    in_transit: bySection.IN_TRANSIT ?? live.in_transit,
-    history: bySection.HISTORY ?? live.history,
-    all: trips.length,
-  };
+  void snapshots;
+  return tabCountsFromTrips(trips);
 }
 
 export function computeSyncHealth(

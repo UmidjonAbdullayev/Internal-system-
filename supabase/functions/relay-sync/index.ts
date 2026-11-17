@@ -495,7 +495,8 @@ Deno.serve(async (req: Request) => {
         errors.push(`Invalid tripId skipped: ${trip?.tripId || "(missing)"}`);
         continue;
       }
-      const section = normalizeSection(trip.tab || trip.section);
+      const sourceTab = normalizeSection(trip.tab || trip.section);
+      let section = sourceTab;
       const { data: prevTrip } = await sb
         .from("relay_trips")
         .select("trip_id, section, status, driver_name_raw, start_time, execution_status")
@@ -503,10 +504,21 @@ Deno.serve(async (req: Request) => {
         .maybeSingle();
 
       const nextDriver = sanitizeDriverName(trip.driver);
-      const nextStatus = trip.status || trip.executionStatus || trip.tourState || null;
+      let nextStatus = trip.status || trip.executionStatus || trip.tourState || null;
+      const cancelBlob = `${nextStatus || ""} ${trip.tourState || ""} ${trip.executionStatus || ""}`.toLowerCase();
+      const legs = (trip.legs as { executionStatus?: string; status?: string }[]) || [];
+      const allLegsCancel =
+        legs.length > 0 &&
+        legs.every((leg) => /cancel/.test(String(leg.executionStatus || leg.status || "").toLowerCase()));
+      const cancelled = /cancel/.test(cancelBlob) || allLegsCancel;
+      if (cancelled) {
+        section = "HISTORY";
+        if (!nextStatus || !/cancel/i.test(String(nextStatus))) nextStatus = "CANCELLED";
+      }
       const tripRow = {
         trip_id: tripId,
         section,
+        source_tab: sourceTab,
         relay_version: trip.version != null ? String(trip.version) : null,
         last_seen_at: now,
         tour_state: trip.tourState ?? null,
@@ -536,6 +548,18 @@ Deno.serve(async (req: Request) => {
       }
       tripsUpserted += 1;
       syncedTripIds.push(tripId);
+
+      if (prevTrip?.section && prevTrip.section !== section) {
+        await sb.from("trip_events").insert({
+          trip_id: tripId,
+          event_type: cancelled ? "cancelled_to_history" : "section_change",
+          from_section: prevTrip.section,
+          to_section: section,
+          from_status: prevTrip.status,
+          to_status: nextStatus,
+          detail: { source_tab: sourceTab },
+        }).then(() => null, () => null);
+      }
 
       const liveSection = section === "UPCOMING" || section === "IN_TRANSIT";
       if (liveSection) {
@@ -729,11 +753,25 @@ Deno.serve(async (req: Request) => {
         const totalRecords = Number(snapshot.totalRecords) || 0;
         const syncedAt = snapshot.syncedAt || now;
 
-        const { data: sectionRows } = await sb
+        const { data: sectionRows, count: priorCount } = await sb
           .from("relay_trips")
-          .select("trip_id, last_seen_at, status")
+          .select("trip_id, last_seen_at, status", { count: "exact" })
           .eq("section", section)
           .eq("archived", false);
+
+        // Never apply empty section sync if this section previously had trips.
+        if (tripIds.length === 0 && (priorCount || 0) > 0) {
+          const msg =
+            `Skipped empty ${section} snapshot: CRM had ${priorCount} trip(s); refusing wipe`;
+          console.warn(msg);
+          errors.push(msg);
+          sectionCounts[section] = {
+            relay: 0,
+            crm: priorCount || 0,
+            mismatch: true,
+          };
+          continue;
+        }
 
         const inSnapshot = new Set(tripIds);
         for (const row of sectionRows || []) {
@@ -746,7 +784,17 @@ Deno.serve(async (req: Request) => {
             })
             .eq("trip_id", row.trip_id);
           if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
-          else snapshotMoved += 1;
+          else {
+            snapshotMoved += 1;
+            await sb.from("trip_events").insert({
+              trip_id: row.trip_id,
+              event_type: "moved_awaiting_section",
+              from_section: section,
+              to_section: section,
+              from_status: row.status,
+              to_status: "moved_awaiting_section",
+            }).then(() => null, () => null);
+          }
         }
 
         // Not seen in any section within 10 minutes → removed_from_relay
@@ -768,7 +816,17 @@ Deno.serve(async (req: Request) => {
             })
             .eq("trip_id", row.trip_id);
           if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
-          else snapshotRemoved += 1;
+          else {
+            snapshotRemoved += 1;
+            await sb.from("trip_events").insert({
+              trip_id: row.trip_id,
+              event_type: "removed_from_relay",
+              from_section: section,
+              to_section: "HISTORY",
+              from_status: row.status,
+              to_status: "removed_from_relay",
+            }).then(() => null, () => null);
+          }
         }
 
         const { count: crmCount } = await sb

@@ -9,6 +9,7 @@ import {
   markSyncAttempt,
   LIVE_SECTIONS,
   REMOVED_AFTER_MS,
+  recordTripEvent,
 } from "./shared.ts";
 import { upsertTrips } from "./upsert.ts";
 import { beginCatchUp, finalizeCatchUp } from "./catchup.ts";
@@ -135,11 +136,41 @@ Deno.serve(async (req: Request) => {
         const syncedAt = snapshot.syncedAt || now;
         const inSnapshot = new Set(tripIds);
 
-        const { data: sectionRows } = await sb
+        const { data: sectionRows, count: priorCount } = await sb
           .from("relay_trips")
-          .select("trip_id")
+          .select("trip_id, status, section", { count: "exact" })
           .eq("section", section)
           .eq("archived", false);
+
+        // Never apply empty section sync if CRM previously had trips in this section.
+        if (tripIds.length === 0 && (priorCount || 0) > 0) {
+          const msg =
+            `Skipped empty ${section} snapshot: CRM had ${priorCount} trip(s); refusing wipe`;
+          console.warn(msg);
+          errors.push(msg);
+          await markSyncAttempt(sb, section, {
+            last_attempt_at: now,
+            syncing: false,
+            last_error: msg,
+          });
+          sectionCounts[section] = {
+            relay: 0,
+            crm: priorCount || 0,
+            mismatch: true,
+          };
+          return json({
+            success: true,
+            trips_upserted: upserted.tripsUpserted,
+            legs_upserted: upserted.legsUpserted,
+            stops_upserted: upserted.stopsUpserted,
+            snapshot_moved: 0,
+            snapshot_removed: 0,
+            synced_trip_ids: upserted.syncedTripIds,
+            section_counts: sectionCounts,
+            empty_snapshot_skipped: true,
+            errors,
+          });
+        }
 
         for (const row of sectionRows || []) {
           if (inSnapshot.has(row.trip_id)) continue;
@@ -154,7 +185,17 @@ Deno.serve(async (req: Request) => {
               })
               .eq("trip_id", row.trip_id);
             if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
-            else snapshotMoved += 1;
+            else {
+              snapshotMoved += 1;
+              await recordTripEvent(sb, {
+                trip_id: row.trip_id,
+                event_type: "moved_awaiting_section",
+                from_section: section,
+                to_section: section,
+                from_status: row.status,
+                to_status: "moved_awaiting_section",
+              });
+            }
           } else {
             const { error } = await sb
               .from("relay_trips")
@@ -192,7 +233,17 @@ Deno.serve(async (req: Request) => {
               })
               .eq("trip_id", row.trip_id);
             if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
-            else snapshotRemoved += 1;
+            else {
+              snapshotRemoved += 1;
+              await recordTripEvent(sb, {
+                trip_id: row.trip_id,
+                event_type: "removed_from_relay",
+                from_section: section,
+                to_section: "HISTORY",
+                from_status: "moved_awaiting_section",
+                to_status: "removed_from_relay",
+              });
+            }
           }
         }
 

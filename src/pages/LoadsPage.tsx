@@ -18,11 +18,11 @@ import {
   displayStatusLabel,
   filterTrips,
   historySummary,
+  tabCountsFromTrips,
   tripDriverName,
   type TripTab,
 } from '@/lib/relayTrips';
 import {
-  isSectionPaused,
   liveMirrorMode,
   sectionForTab,
   syncStateForSection,
@@ -112,6 +112,7 @@ export function LoadsPage() {
     dataSource,
     refreshData,
     dataReady,
+    dataError,
   } = useData();
   const [params, setParams] = useSearchParams();
   // History end-time filter TZ — default Asia/Tashkent (configurable via Settings timezone).
@@ -134,6 +135,7 @@ export function LoadsPage() {
     getDateRangeFromPreset('this_week', undefined, todayISO(historyTz)),
   );
   const [showLastKnown, setShowLastKnown] = useState(false);
+  const [showRecentlyCancelled, setShowRecentlyCancelled] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [focusedIndex, setFocusedIndex] = useState(0);
   const [legendOpen, setLegendOpen] = useState(false);
@@ -180,7 +182,7 @@ export function LoadsPage() {
     [historyTz],
   );
 
-  /** ONE selector for tab counts, list, and empty-state (no hidden retention filter). */
+  /** ONE selector for tab counts, list, and empty-state (CRM rows only — never snapshot totals). */
   const selectTrips = useCallback(
     (
       forTab: TripTab,
@@ -203,34 +205,19 @@ export function LoadsPage() {
         endDateStart: filters.applyHistoryDates && forTab === 'history' ? historyRange.start : null,
         endDateEnd: filters.applyHistoryDates && forTab === 'history' ? historyRange.end : null,
         tripEndYmd,
+        showRecentlyCancelled,
       }),
-    [relayTrips, historyRange, tripEndYmd],
+    [relayTrips, historyRange, tripEndYmd, showRecentlyCancelled],
   );
 
-  const tabCounts = useMemo(() => {
-    const snapCount = (section: 'UPCOMING' | 'IN_TRANSIT' | 'HISTORY') => {
-      const snap = snapshots.find((s) => s.section === section);
-      const row = syncStateForSection(syncState, section);
-      if (snap && !isSectionPaused(row)) return snap.totalRecords;
-      return null;
-    };
-    const up = snapCount('UPCOMING');
-    const it = snapCount('IN_TRANSIT');
-    const emptyFilters = {
-      search: '',
-      status: '',
-      driver: '',
-      lateOnly: false,
-      needsAttentionOnly: false,
-      applyHistoryDates: false,
-    };
-    return {
-      upcoming: up ?? selectTrips('upcoming', emptyFilters).length,
-      in_transit: it ?? selectTrips('in_transit', emptyFilters).length,
-      history: selectTrips('history', emptyFilters).length,
-      all: relayTrips.length,
-    } satisfies Record<TripTab, number>;
-  }, [relayTrips, snapshots, syncState, selectTrips]);
+  const tabCounts = useMemo(() => tabCountsFromTrips(relayTrips), [relayTrips]);
+
+  const relayTileHint = useMemo(() => {
+    const it = snapshots.find((s) => s.section === 'IN_TRANSIT');
+    const up = snapshots.find((s) => s.section === 'UPCOMING');
+    if (!it && !up) return null;
+    return `Relay total incl. cancelled: Upcoming ${up?.totalRecords ?? '—'} · In Transit ${it?.totalRecords ?? '—'}`;
+  }, [snapshots]);
 
   useEffect(() => {
     if (tabAutoPicked || !relayTrips.length) return;
@@ -262,17 +249,9 @@ export function LoadsPage() {
   }, [relayTrips]);
 
   const filtered = useMemo(() => {
-    // Syncing: keep last-known trips (never hide all). Paused: empty until "Show last known".
-    if (
-      (tab === 'upcoming' || tab === 'in_transit') &&
-      (mirrorMode === 'paused' ||
-        mirrorMode === 'delayed' ||
-        mirrorMode === 'offline' ||
-        mirrorMode === 'auth') &&
-      !showLastKnown
-    ) {
-      return [];
-    }
+    // Always show CRM rows — sync health is a chip, never blanks the list.
+    void mirrorMode;
+    void showLastKnown;
     const rows = selectTrips(tab, {
       search,
       status: statusFilter,
@@ -495,6 +474,22 @@ export function LoadsPage() {
         ))}
       </div>
 
+      {dataError && (
+        <div
+          className="mb-3 rounded-md border border-danger/40 bg-danger/5 px-3 py-2 text-sm text-danger"
+          role="alert"
+        >
+          Failed to load trips from Supabase: {dataError}. Showing last loaded rows (if any).
+          <button
+            type="button"
+            className="ml-2 underline"
+            onClick={() => void refreshData()}
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {(tab === 'upcoming' || tab === 'in_transit') && (
         <LiveMirrorBanner
           mode={mirrorMode}
@@ -504,6 +499,12 @@ export function LoadsPage() {
           extensionAliveAt={extensionHeartbeat?.aliveAt}
           onShowLastKnown={() => setShowLastKnown(true)}
         />
+      )}
+
+      {relayTileHint && (
+        <p className="mb-2 text-[11px] text-text-secondary" title={relayTileHint}>
+          {relayTileHint}
+        </p>
       )}
 
       {tab === 'history' && historyStats && (
@@ -579,6 +580,17 @@ export function LoadsPage() {
             />
             Needs attention
           </label>
+          {tab === 'upcoming' && (
+            <label className="inline-flex items-center gap-2 rounded-lg border border-border bg-white px-3 h-9 text-xs font-medium text-text cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={showRecentlyCancelled}
+                onChange={(e) => setShowRecentlyCancelled(e.target.checked)}
+                className="rounded border-border"
+              />
+              Show recently cancelled
+            </label>
+          )}
         </div>
         {tab === 'history' && (
           <div className="mt-3">
@@ -646,32 +658,32 @@ export function LoadsPage() {
         {filtered.length === 0 && dataReady && (
           <EmptyState
             title={
-              relayTrips.length === 0
-                ? 'No Relay trips synced yet'
-                : filtersActive && inTabCount > 0
-                  ? 'Filters hide synced trips'
-                  : tab === 'in_transit'
-                    ? 'No In Transit trips in Relay right now'
-                    : tab === 'upcoming'
-                      ? 'No upcoming trips in Relay right now'
-                      : tab === 'history'
-                        ? 'No History trips in this date range'
-                        : 'No trips in this tab'
+              dataError
+                ? 'Could not refresh trips'
+                : relayTrips.length === 0
+                  ? 'No Relay trips synced yet'
+                  : filtersActive && inTabCount > 0
+                    ? 'Filters hide synced trips'
+                    : tab === 'in_transit'
+                      ? 'No In Transit trips in Relay right now'
+                      : tab === 'upcoming'
+                        ? 'No upcoming trips in Relay right now'
+                        : tab === 'history'
+                          ? 'No History trips in this date range'
+                          : 'No trips in this tab'
             }
             description={
-              relayTrips.length === 0
-                ? 'Extension writes relay_trips / legs / stops. Open Amazon Relay Trips, GO LIVE, then Refresh.'
-                : filtersActive && inTabCount > 0
-                  ? `Active filters: ${namedFilters.join('; ')}.`
-                  : tab === 'upcoming' || tab === 'in_transit'
-                    ? mirrorMode === 'auth'
-                      ? 'Log in to Amazon Relay in the extension tab, then wait for sync.'
-                      : mirrorMode === 'offline' ||
-                          mirrorMode === 'delayed' ||
-                          mirrorMode === 'paused'
-                        ? 'Use Show last known data, or wait for Relay sync.'
+              dataError
+                ? `Supabase error: ${dataError}. Previous rows are kept when a refresh fails.`
+                : relayTrips.length === 0
+                  ? 'Extension writes relay_trips / legs / stops. Open Amazon Relay Trips, GO LIVE, then Refresh.'
+                  : filtersActive && inTabCount > 0
+                    ? `Active filters: ${namedFilters.join('; ')}.`
+                    : tab === 'upcoming' || tab === 'in_transit'
+                      ? mirrorMode === 'auth'
+                        ? 'Log in to Amazon Relay in the extension tab, then wait for sync.'
                         : 'Switch tabs or wait for the next Relay snapshot.'
-                    : 'Try another date preset or clear filters.'
+                      : 'Try another date preset or clear filters.'
             }
             actionLabel={filtersActive && inTabCount > 0 ? 'Clear filters' : 'Refresh'}
             onAction={

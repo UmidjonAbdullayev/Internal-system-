@@ -1,5 +1,20 @@
 import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
-import { isValidRelayId, normalizeSection, sanitizeDriverName } from "./shared.ts";
+import {
+  isValidRelayId,
+  looksCancelled,
+  normalizeSection,
+  recordTripEvent,
+  sanitizeDriverName,
+} from "./shared.ts";
+
+function allLegsCancelled(trip: Record<string, unknown>): boolean {
+  const legs = (trip.legs as Record<string, unknown>[]) || [];
+  if (!legs.length) return false;
+  return legs.every((leg) => {
+    const st = String(leg.executionStatus || leg.status || "").toLowerCase();
+    return /cancel/.test(st);
+  });
+}
 
 export async function upsertTrips(
   sb: SupabaseClient,
@@ -25,13 +40,36 @@ export async function upsertTrips(
       errors.push(`Invalid tripId skipped: ${trip?.tripId || "(missing)"}`);
       continue;
     }
-    let section = normalizeSection(trip.tab || trip.section);
+    const sourceTab = normalizeSection(trip.tab || trip.section);
+    let section = sourceTab;
     if (opts.forceHistory || opts.catchUp) section = "HISTORY";
+
+    const status = trip.status || trip.executionStatus || trip.tourState || null;
+    const cancelled =
+      looksCancelled(status, trip.tourState, trip.executionStatus) || allLegsCancelled(trip);
+    // Cancelled never stays on UPCOMING / IN_TRANSIT regardless of request tab.
+    if (cancelled) {
+      section = "HISTORY";
+      if (!status || !/cancel/i.test(String(status))) {
+        // keep Relay status if already cancelled-shaped; else force Cancelled label source
+      }
+    }
+
+    const { data: prevTrip } = await sb
+      .from("relay_trips")
+      .select("trip_id, section, status")
+      .eq("trip_id", tripId)
+      .maybeSingle();
+
+    const nextStatus = cancelled
+      ? String(status || "CANCELLED")
+      : status;
 
     const { error: tripErr } = await sb.from("relay_trips").upsert(
       {
         trip_id: tripId,
         section,
+        source_tab: sourceTab,
         relay_version: trip.version != null ? String(trip.version) : null,
         last_seen_at: now,
         tour_state: trip.tourState ?? null,
@@ -46,7 +84,7 @@ export async function upsertTrips(
         rate_per_mile: trip.ratePerMile ?? null,
         driver_name_raw: sanitizeDriverName(trip.driver),
         equipment: trip.equipment ?? null,
-        status: trip.status || trip.executionStatus || trip.tourState || null,
+        status: nextStatus,
         content_hash: trip.contentHash ?? null,
         raw: trip.raw ?? {},
         archived: false,
@@ -61,6 +99,27 @@ export async function upsertTrips(
     }
     tripsUpserted += 1;
     syncedTripIds.push(tripId);
+
+    if (prevTrip && prevTrip.section !== section) {
+      await recordTripEvent(sb, {
+        trip_id: tripId,
+        event_type: cancelled ? "cancelled_to_history" : "section_change",
+        from_section: prevTrip.section,
+        to_section: section,
+        from_status: prevTrip.status,
+        to_status: nextStatus != null ? String(nextStatus) : null,
+        detail: { source_tab: sourceTab },
+      });
+    } else if (!prevTrip && cancelled && section === "HISTORY") {
+      await recordTripEvent(sb, {
+        trip_id: tripId,
+        event_type: "cancelled_to_history",
+        from_section: sourceTab,
+        to_section: "HISTORY",
+        to_status: nextStatus != null ? String(nextStatus) : null,
+        detail: { source_tab: sourceTab, first_seen: true },
+      });
+    }
 
     if (opts.catchUp) {
       await sb

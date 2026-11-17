@@ -29,7 +29,13 @@ import type {
 } from '@/types';
 import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations';
 import { generateId, getWeekRange } from '@/lib/utils';
-import { supabase } from '@/lib/supabase';
+import {
+  supabase,
+  fetchAllPages,
+  RELAY_TRIP_LIST_COLUMNS,
+  RELAY_LEG_LIST_COLUMNS,
+  RELAY_STOP_LIST_COLUMNS,
+} from '@/lib/supabase';
 import {
   assembleRelayTrips,
   loadReportToRow,
@@ -195,12 +201,47 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   /** Hydrate from Supabase iiyqkdjwxlnfqvlidbqr — live Relay extension data. */
   const hydrate = useCallback(async () => {
+    let relayTripsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
+    let relayLegsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
+    let relayStopsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
+    try {
+      [relayTripsRes, relayLegsRes, relayStopsRes] = await Promise.all([
+        fetchAllPages<Record<string, unknown>>((from, to) =>
+          supabase
+            .from('relay_trips')
+            .select(RELAY_TRIP_LIST_COLUMNS)
+            .eq('archived', false)
+            .order('last_seen_at', { ascending: false })
+            .range(from, to),
+        ),
+        fetchAllPages<Record<string, unknown>>((from, to) =>
+          supabase
+            .from('relay_legs')
+            .select(RELAY_LEG_LIST_COLUMNS)
+            .eq('archived', false)
+            .range(from, to),
+        ),
+        fetchAllPages<Record<string, unknown>>((from, to) =>
+          supabase
+            .from('relay_stops')
+            .select(RELAY_STOP_LIST_COLUMNS)
+            .eq('archived', false)
+            .order('seq', { ascending: true })
+            .range(from, to),
+        ),
+      ]);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Relay hydrate failed';
+      console.error('Relay trips hydrate threw', message);
+      setDataError(message);
+      setDataReady(true);
+      // Keep previous relayTrips — never blank the Trips page on error.
+      return;
+    }
+
     const [
       driversRes,
       loadsRes,
-      relayTripsRes,
-      relayLegsRes,
-      relayStopsRes,
       relaySnapshotsRes,
       syncRunsRes,
       loadReportsRes,
@@ -218,9 +259,6 @@ export function DataProvider({ children }: { children: ReactNode }) {
     ] = await Promise.all([
       supabase.from('drivers').select('*').order('created_at', { ascending: true }),
       supabase.from('loads').select('*').order('created_at', { ascending: false }),
-      supabase.from('relay_trips').select('*').eq('archived', false).order('last_seen_at', { ascending: false }),
-      supabase.from('relay_legs').select('*').eq('archived', false),
-      supabase.from('relay_stops').select('*').eq('archived', false).order('seq', { ascending: true }),
       supabase.from('relay_section_snapshots').select('*'),
       supabase
         .from('relay_sync_runs')
@@ -252,7 +290,6 @@ export function DataProvider({ children }: { children: ReactNode }) {
       settlementChargesRes.error ||
       paymentsRes.error ||
       activityRes.error;
-    // Relay tables are required for Trips; surface but still hydrate other CRM data if present.
     const relayErr =
       relayTripsRes.error ||
       relayLegsRes.error ||
@@ -266,7 +303,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
       return;
     }
     if (relayErr) {
-      console.warn('Relay trips hydrate warning', relayErr.message);
+      console.error('Relay trips hydrate failed', relayErr.message);
+      setDataError(relayErr.message);
+      setDataReady(true);
+      // Keep previous relayTrips / snapshots — never replace with [] on error.
+      return;
     }
 
     setDataError(null);
@@ -321,9 +362,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setLoads((loadsRes.data || []).map((r) => mapLoad(r as Record<string, unknown>)));
 
     const assembledTrips = assembleRelayTrips(
-      (relayTripsRes.data || []) as Record<string, unknown>[],
-      (relayLegsRes.data || []) as Record<string, unknown>[],
-      (relayStopsRes.data || []) as Record<string, unknown>[],
+      relayTripsRes.data,
+      relayLegsRes.data,
+      relayStopsRes.data,
     );
     const snapshots = (relaySnapshotsRes.data || [])
       .map((r) => mapRelaySectionSnapshot(r as Record<string, unknown>))

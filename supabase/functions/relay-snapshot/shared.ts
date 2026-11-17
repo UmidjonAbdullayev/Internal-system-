@@ -46,6 +46,42 @@ export function normalizeSection(raw: unknown): string | null {
   return null;
 }
 
+/** tour_state / status / execution cancelled → never stay on live tabs. */
+export function looksCancelled(
+  status: unknown,
+  tourState?: unknown,
+  executionStatus?: unknown,
+): boolean {
+  const blob = `${status || ""} ${tourState || ""} ${executionStatus || ""}`.toLowerCase();
+  return /cancel/.test(blob);
+}
+
+export async function recordTripEvent(
+  sb: SupabaseClient,
+  row: {
+    trip_id: string;
+    event_type: string;
+    from_section?: string | null;
+    to_section?: string | null;
+    from_status?: string | null;
+    to_status?: string | null;
+    detail?: Record<string, unknown>;
+  },
+) {
+  await sb
+    .from("trip_events")
+    .insert({
+      trip_id: row.trip_id,
+      event_type: row.event_type,
+      from_section: row.from_section ?? null,
+      to_section: row.to_section ?? null,
+      from_status: row.from_status ?? null,
+      to_status: row.to_status ?? null,
+      detail: row.detail ?? {},
+    })
+    .then(() => null, () => null);
+}
+
 export function sanitizeDriverName(raw: unknown): string | null {
   if (raw == null) return null;
   const firstLine = String(raw).split(/\n/)[0].replace(/\s+/g, " ").trim();
