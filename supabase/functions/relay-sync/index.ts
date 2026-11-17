@@ -782,91 +782,90 @@ Deno.serve(async (req: Request) => {
             crm: priorCount || 0,
             mismatch: true,
           };
-          continue;
-        }
-
-        const inSnapshot = new Set(tripIds);
-        for (const row of sectionRows || []) {
-          if (inSnapshot.has(row.trip_id)) continue;
-          const { error } = await sb
-            .from("relay_trips")
-            .update({
-              status: "moved_awaiting_section",
-              updated_at: now,
-            })
-            .eq("trip_id", row.trip_id);
-          if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
-          else {
-            snapshotMoved += 1;
-            await sb.from("trip_events").insert({
-              trip_id: row.trip_id,
-              event_type: "moved_awaiting_section",
-              from_section: section,
-              to_section: section,
-              from_status: row.status,
-              to_status: "moved_awaiting_section",
-            }).then(() => null, () => null);
+        } else {
+          const inSnapshot = new Set(tripIds);
+          for (const row of sectionRows || []) {
+            if (inSnapshot.has(row.trip_id)) continue;
+            const { error } = await sb
+              .from("relay_trips")
+              .update({
+                status: "moved_awaiting_section",
+                updated_at: now,
+              })
+              .eq("trip_id", row.trip_id);
+            if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
+            else {
+              snapshotMoved += 1;
+              await sb.from("trip_events").insert({
+                trip_id: row.trip_id,
+                event_type: "moved_awaiting_section",
+                from_section: section,
+                to_section: section,
+                from_status: row.status,
+                to_status: "moved_awaiting_section",
+              }).then(() => null, () => null);
+            }
           }
-        }
 
-        // Not seen in any section within 10 minutes → removed_from_relay
-        const cutoff = new Date(Date.now() - REMOVED_AFTER_MS).toISOString();
-        const { data: stale } = await sb
-          .from("relay_trips")
-          .select("trip_id, last_seen_at, status")
-          .eq("archived", false)
-          .in("status", ["moved_awaiting_section", "In Transit", "Booked", "IN_PROGRESS"])
-          .lt("last_seen_at", cutoff);
-        for (const row of stale || []) {
-          if (inSnapshot.has(row.trip_id)) continue;
-          const { error } = await sb
+          // Not seen in any section within 10 minutes → removed_from_relay
+          const cutoff = new Date(Date.now() - REMOVED_AFTER_MS).toISOString();
+          const { data: stale } = await sb
             .from("relay_trips")
-            .update({
-              status: "removed_from_relay",
-              section: "HISTORY",
-              updated_at: now,
-            })
-            .eq("trip_id", row.trip_id);
-          if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
-          else {
-            snapshotRemoved += 1;
-            await sb.from("trip_events").insert({
-              trip_id: row.trip_id,
-              event_type: "removed_from_relay",
-              from_section: section,
-              to_section: "HISTORY",
-              from_status: row.status,
-              to_status: "removed_from_relay",
-            }).then(() => null, () => null);
+            .select("trip_id, last_seen_at, status")
+            .eq("archived", false)
+            .in("status", ["moved_awaiting_section", "In Transit", "Booked", "IN_PROGRESS"])
+            .lt("last_seen_at", cutoff);
+          for (const row of stale || []) {
+            if (inSnapshot.has(row.trip_id)) continue;
+            const { error } = await sb
+              .from("relay_trips")
+              .update({
+                status: "removed_from_relay",
+                section: "HISTORY",
+                updated_at: now,
+              })
+              .eq("trip_id", row.trip_id);
+            if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
+            else {
+              snapshotRemoved += 1;
+              await sb.from("trip_events").insert({
+                trip_id: row.trip_id,
+                event_type: "removed_from_relay",
+                from_section: section,
+                to_section: "HISTORY",
+                from_status: row.status,
+                to_status: "removed_from_relay",
+              }).then(() => null, () => null);
+            }
           }
-        }
 
-        const { count: crmCount } = await sb
-          .from("relay_trips")
-          .select("trip_id", { count: "exact", head: true })
-          .eq("section", section)
-          .eq("archived", false)
-          .neq("status", "removed_from_relay");
+          const { count: crmCount } = await sb
+            .from("relay_trips")
+            .select("trip_id", { count: "exact", head: true })
+            .eq("section", section)
+            .eq("archived", false)
+            .neq("status", "removed_from_relay");
 
-        const crm = crmCount ?? 0;
-        const mismatch = crm !== tripIds.length;
-        await sb.from("relay_section_snapshots").upsert(
-          {
-            section,
-            trip_ids: tripIds,
-            total_records: totalRecords,
-            crm_count: crm,
+          const crm = crmCount ?? 0;
+          const mismatch = crm !== tripIds.length;
+          await sb.from("relay_section_snapshots").upsert(
+            {
+              section,
+              trip_ids: tripIds,
+              total_records: totalRecords,
+              crm_count: crm,
+              mismatch,
+              synced_at: syncedAt,
+              updated_at: now,
+            },
+            { onConflict: "section" },
+          );
+          sectionCounts[section] = {
+            relay: tripIds.length,
+            crm,
             mismatch,
-            synced_at: syncedAt,
-            updated_at: now,
-          },
-          { onConflict: "section" },
-        );
-        sectionCounts[section] = {
-          relay: tripIds.length,
-          crm,
-          mismatch,
-        };
+          };
+        }
       }
     }
 
@@ -1376,6 +1375,8 @@ Deno.serve(async (req: Request) => {
       trip_alerts_queued: uniqueAlerts.length,
     });
   } catch (err) {
-    return json({ success: false, error: String(err) }, 500);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ msg: "relay-sync fatal", error: message }));
+    return json({ success: false, error: message }, 500);
   }
 });
