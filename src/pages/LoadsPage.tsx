@@ -10,15 +10,23 @@ import { Card } from '@/components/ui/Card';
 import { Modal } from '@/components/ui/Modal';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { SyncStatusLine } from '@/components/trips/SyncStatusLine';
+import { LiveMirrorBanner } from '@/components/trips/LiveMirrorBanner';
 import { TripLegend } from '@/components/trips/TripLegend';
 import { TripRow } from '@/components/trips/TripRow';
 import {
   displayStatusLabel,
   filterTrips,
-  tabCountsFromSnapshots,
+  sectionToTab,
   tripDriverName,
   type TripTab,
 } from '@/lib/relayTrips';
+import {
+  isSectionPaused,
+  liveMirrorMode,
+  sectionForTab,
+  syncStateForSection,
+  withinTripHistoryRetention,
+} from '@/lib/liveMirrors';
 import { downloadCSV, formatCurrency, getDriverFullName } from '@/lib/utils';
 import type { LoadStatus, PaymentStatus, TrailerType } from '@/types';
 
@@ -75,14 +83,17 @@ export function LoadsPage() {
     drivers,
     relayTrips,
     relaySnapshots,
-    relaySyncHealth,
     activityLogs,
+    syncState,
+    sectionSnapshots,
+    companySettings,
     addLoad,
     dataSource,
     refreshData,
     dataReady,
   } = useData();
   const [params, setParams] = useSearchParams();
+  const retentionDays = companySettings.historyRetentionDays || 45;
   const urlTab = params.get('tab') as TripTab | null;
   const [tab, setTab] = useState<TripTab>(
     urlTab && TRIP_TABS.some((x) => x.id === urlTab) ? urlTab : 'in_transit',
@@ -93,12 +104,23 @@ export function LoadsPage() {
   const [driverFilter, setDriverFilter] = useState(params.get('driver') ?? '');
   const [lateOnly, setLateOnly] = useState(params.get('late') === '1');
   const [needsAttentionOnly, setNeedsAttentionOnly] = useState(params.get('attention') === '1');
+  const [showLastKnown, setShowLastKnown] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [focusedIndex, setFocusedIndex] = useState(0);
   const [legendOpen, setLegendOpen] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const listRef = useRef<HTMLDivElement>(null);
+
+  const liveSection = sectionForTab(tab === 'all' ? 'in_transit' : tab);
+  const sectionSync = liveSection ? syncStateForSection(syncState, liveSection) : undefined;
+  const sectionSnap =
+    sectionSnapshots.find((s) => s.section === liveSection) ||
+    relaySnapshots.find((s) => s.section === liveSection);
+  const mirrorMode =
+    tab === 'upcoming' || tab === 'in_transit'
+      ? liveMirrorMode(sectionSync, { showLastKnown })
+      : 'live';
 
   useEffect(() => {
     if (params.get('action') === 'new') {
@@ -113,10 +135,33 @@ export function LoadsPage() {
     }
   }, [params, setParams]);
 
-  const tabCounts = useMemo(
-    () => tabCountsFromSnapshots(relaySnapshots, relayTrips),
-    [relaySnapshots, relayTrips],
-  );
+  const snapshots = sectionSnapshots.length ? sectionSnapshots : relaySnapshots;
+
+  const tabCounts = useMemo(() => {
+    const snapCount = (section: 'UPCOMING' | 'IN_TRANSIT' | 'HISTORY') => {
+      const snap = snapshots.find((s) => s.section === section);
+      const row = syncStateForSection(syncState, section);
+      if (snap && !isSectionPaused(row)) return snap.totalRecords;
+      return null;
+    };
+    const up = snapCount('UPCOMING');
+    const it = snapCount('IN_TRANSIT');
+    const counts: Record<TripTab, number> = {
+      upcoming: up ?? 0,
+      in_transit: it ?? 0,
+      history: 0,
+      all: relayTrips.length,
+    };
+    for (const t of relayTrips) {
+      const b = sectionToTab(t.section);
+      if (b === 'upcoming' && up == null) counts.upcoming += 1;
+      else if (b === 'in_transit' && it == null) counts.in_transit += 1;
+      else if (b === 'history' && withinTripHistoryRetention(t, retentionDays)) counts.history += 1;
+    }
+    if (up != null) counts.upcoming = up;
+    if (it != null) counts.in_transit = it;
+    return counts;
+  }, [relayTrips, snapshots, syncState, retentionDays]);
 
   useEffect(() => {
     if (tabAutoPicked || !relayTrips.length) return;
@@ -147,18 +192,32 @@ export function LoadsPage() {
     return [...set].sort((a, b) => a.localeCompare(b));
   }, [relayTrips]);
 
-  const filtered = useMemo(
-    () =>
-      filterTrips(relayTrips, {
-        tab,
-        search,
-        status: statusFilter,
-        driver: driverFilter,
-        lateOnly,
-        needsAttentionOnly,
-      }),
-    [relayTrips, tab, search, statusFilter, driverFilter, lateOnly, needsAttentionOnly],
-  );
+  const filtered = useMemo(() => {
+    const liveTab = tab === 'upcoming' || tab === 'in_transit';
+    if (liveTab && (mirrorMode === 'paused' || mirrorMode === 'syncing')) {
+      return [];
+    }
+    const base = filterTrips(relayTrips, {
+      tab,
+      search,
+      status: statusFilter,
+      driver: driverFilter,
+      lateOnly,
+      needsAttentionOnly,
+    });
+    if (tab !== 'history') return base;
+    return base.filter((t) => withinTripHistoryRetention(t, retentionDays));
+  }, [
+    relayTrips,
+    tab,
+    search,
+    statusFilter,
+    driverFilter,
+    lateOnly,
+    needsAttentionOnly,
+    mirrorMode,
+    retentionDays,
+  ]);
 
   const inTabCount = useMemo(() => {
     if (tab === 'all') return relayTrips.length;
@@ -270,10 +329,10 @@ export function LoadsPage() {
         title="Loads / Trips"
         subtitle={
           <span className="block">
-            <SyncStatusLine health={relaySyncHealth} />
+            <SyncStatusLine syncState={sectionSync} showLastKnown={showLastKnown} />
             <span className="mt-0.5 block text-xs text-text-secondary">
               {filtered.length} shown · {dataSource}
-              {relaySnapshots.some((s) => s.mismatch) ? ' · snapshot mismatch — check extension popup' : ''}
+              {snapshots.some((s) => s.mismatch) ? ' · snapshot mismatch — check extension popup' : ''}
             </span>
           </span>
         }
@@ -312,6 +371,14 @@ export function LoadsPage() {
           </button>
         ))}
       </div>
+
+      {(tab === 'upcoming' || tab === 'in_transit') && (
+        <LiveMirrorBanner
+          mode={mirrorMode}
+          relayCount={sectionSnap?.totalRecords}
+          onShowLastKnown={() => setShowLastKnown(true)}
+        />
+      )}
 
       <Card className="mb-4 p-3">
         <div className="flex flex-wrap items-end gap-2">

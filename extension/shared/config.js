@@ -62,6 +62,10 @@ export const PAGE_SIZE = 100;
 export const MIN_REQUEST_GAP_MS = 2000;
 /** History backfill: 2s between pages. */
 export const HISTORY_PAGE_GAP_MS = 2000;
+/** Live section considered paused when last successful sync older than this. */
+export const LIVE_PAUSE_MS = 5 * 60 * 1000;
+/** Catch-up HISTORY pages go back this far before last_successful_sync_at. */
+export const CATCH_UP_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 /** Schedule minimums (options cannot go below these). */
 export const SCHEDULE_MIN = {

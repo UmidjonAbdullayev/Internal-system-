@@ -69,6 +69,23 @@ export function SettingsPage() {
                 }
               />
             </Field>
+            <Field label="History retention (days)">
+              <Input
+                type="number"
+                min={1}
+                value={form.historyRetentionDays ?? 45}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    historyRetentionDays: Math.max(1, Number(e.target.value) || 45),
+                  })
+                }
+              />
+            </Field>
+            <p className="text-xs text-text-secondary">
+              Daily 03:00 cleanup copies HISTORY trips older than this into permanent trip_summaries,
+              then deletes detail (never Upcoming / In Transit).
+            </p>
             <Button onClick={() => updateSettings(form)}>Save Settings</Button>
           </CardContent>
         </Card>

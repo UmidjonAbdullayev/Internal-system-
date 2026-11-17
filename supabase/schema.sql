@@ -314,6 +314,78 @@ create table if not exists public.telegram_admin_sessions (
 create index if not exists telegram_admin_sessions_expires_idx
   on public.telegram_admin_sessions(expires_at);
 
+-- Live mirrors / catch-up / retention (see migration 20261117120000)
+create table if not exists public.sync_state (
+  section text primary key check (section in ('IN_TRANSIT', 'UPCOMING', 'HISTORY')),
+  last_successful_sync_at timestamptz,
+  last_attempt_at timestamptz,
+  last_error text,
+  syncing boolean not null default false,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.relay_catch_up (
+  id integer primary key default 1 check (id = 1),
+  active boolean not null default false,
+  gap_start timestamptz,
+  gap_end timestamptz,
+  missing_trip_ids text[] not null default '{}',
+  found_trip_ids text[] not null default '{}',
+  removed_trip_ids text[] not null default '{}',
+  restore_summary_sent_at timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.retention_settings (
+  id integer primary key default 1 check (id = 1),
+  history_retention_days integer not null default 45 check (history_retention_days >= 1),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.trip_summaries (
+  id uuid primary key default gen_random_uuid(),
+  trip_id text not null unique,
+  driver_name text,
+  status text,
+  tour_state text,
+  execution_status text,
+  work_type text,
+  business_type text,
+  equipment text,
+  start_time timestamptz,
+  end_time timestamptz,
+  total_miles numeric,
+  payout numeric,
+  currency text,
+  rate_per_mile numeric,
+  facility_codes text[] not null default '{}',
+  leg_load_ids text[] not null default '{}',
+  leg_count integer not null default 0,
+  stop_count integer not null default 0,
+  was_late boolean not null default false,
+  late_stop_count integer not null default 0,
+  needs_review boolean not null default false,
+  removed_from_relay boolean not null default false,
+  first_seen_at timestamptz,
+  last_seen_at timestamptz,
+  summarized_at timestamptz not null default now()
+);
+
+create table if not exists public.cleanup_runs (
+  id uuid primary key default gen_random_uuid(),
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  retention_days integer,
+  summarized_count integer not null default 0,
+  deleted_trips integer not null default 0,
+  deleted_legs integer not null default 0,
+  deleted_stops integer not null default 0,
+  deleted_activity integer not null default 0,
+  deleted_alerts integer not null default 0,
+  error text,
+  meta jsonb not null default '{}'::jsonb
+);
+
 -- RLS: extension writes via Edge Functions (service role); authenticated CRM can read
 alter table public.users enable row level security;
 alter table public.drivers enable row level security;

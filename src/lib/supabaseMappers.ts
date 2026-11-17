@@ -17,7 +17,9 @@ import type {
   RelayTrip,
   Settlement,
   SettlementStatus,
+  SyncStateRow,
   TrailerType,
+  TripSummary,
 } from '@/types';
 import { sanitizeReportLocation } from '@/lib/reportRows';
 
@@ -339,6 +341,62 @@ export function mapRelaySectionSnapshot(row: Record<string, unknown>): RelaySect
     mismatch: Boolean(row.mismatch),
     syncedAt: str(row.synced_at),
     updatedAt: str(row.updated_at),
+  };
+}
+
+/** Alias used by live-mirrors / retention code paths. */
+export function mapSectionSnapshot(row: Record<string, unknown>): RelaySectionSnapshot {
+  return (
+    mapRelaySectionSnapshot(row) || {
+      section: 'HISTORY',
+      tripIds: [],
+      totalRecords: 0,
+      crmCount: 0,
+      mismatch: false,
+      syncedAt: '',
+    }
+  );
+}
+
+export function mapSyncState(row: Record<string, unknown>): SyncStateRow {
+  return {
+    section: (normalizeRelaySection(row.section) || 'HISTORY') as RelaySection,
+    lastSuccessfulSyncAt: row.last_successful_sync_at ? str(row.last_successful_sync_at) : null,
+    lastAttemptAt: row.last_attempt_at ? str(row.last_attempt_at) : null,
+    lastError: row.last_error ? str(row.last_error) : null,
+    syncing: Boolean(row.syncing),
+    updatedAt: str(row.updated_at),
+  };
+}
+
+export function mapTripSummary(row: Record<string, unknown>): TripSummary {
+  return {
+    id: str(row.id),
+    tripId: str(row.trip_id),
+    driverName: row.driver_name ? str(row.driver_name) : null,
+    status: row.status ? str(row.status) : null,
+    tourState: row.tour_state ? str(row.tour_state) : null,
+    executionStatus: row.execution_status ? str(row.execution_status) : null,
+    workType: row.work_type ? str(row.work_type) : null,
+    businessType: row.business_type ? str(row.business_type) : null,
+    equipment: row.equipment ? str(row.equipment) : null,
+    startTime: row.start_time ? str(row.start_time) : null,
+    endTime: row.end_time ? str(row.end_time) : null,
+    totalMiles: row.total_miles == null ? null : num(row.total_miles),
+    payout: row.payout == null ? null : num(row.payout),
+    currency: row.currency ? str(row.currency) : null,
+    ratePerMile: row.rate_per_mile == null ? null : num(row.rate_per_mile),
+    facilityCodes: Array.isArray(row.facility_codes) ? row.facility_codes.map((c) => str(c)) : [],
+    legLoadIds: Array.isArray(row.leg_load_ids) ? row.leg_load_ids.map((c) => str(c)) : [],
+    legCount: num(row.leg_count),
+    stopCount: num(row.stop_count),
+    wasLate: Boolean(row.was_late),
+    lateStopCount: num(row.late_stop_count),
+    needsReview: Boolean(row.needs_review),
+    removedFromRelay: Boolean(row.removed_from_relay),
+    firstSeenAt: row.first_seen_at ? str(row.first_seen_at) : null,
+    lastSeenAt: row.last_seen_at ? str(row.last_seen_at) : null,
+    summarizedAt: str(row.summarized_at),
   };
 }
 

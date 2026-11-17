@@ -210,10 +210,22 @@ function GroupRows({
   );
 }
 
+function summaryInRange(
+  endTime: string | null,
+  startTime: string | null,
+  rangeStart: string,
+  rangeEnd: string,
+): boolean {
+  const day = (endTime || startTime || '').slice(0, 10);
+  if (!day) return false;
+  return day >= rangeStart && day <= rangeEnd;
+}
+
 export function ReportsPage() {
   const {
     loads,
     loadReports,
+    tripSummaries,
     drivers,
     companySettings,
     dataReady,
@@ -225,11 +237,16 @@ export function ReportsPage() {
 
   const tz = companySettings.timezone || 'America/Chicago';
   const today = todayISO(tz);
+  const retentionDays = companySettings.historyRetentionDays || 45;
+  const detailCutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
   const [preset, setPreset] = useState<DatePreset>('this_week');
   const [customRange, setCustomRange] = useState<DateRange>(() =>
     getDateRangeFromPreset('this_week', undefined, today),
   );
   const range = getDateRangeFromPreset(preset, customRange, today);
+  const rangeUsesSummaries = range.start < detailCutoff;
 
   const [syncing, setSyncing] = useState(false);
   const [didAutoSync, setDidAutoSync] = useState(false);
@@ -254,6 +271,16 @@ export function ReportsPage() {
       ),
     [loadReports, range.end, range.start],
   );
+
+  /** Older than retention: permanent trip_summaries (no address/phone). */
+  const summaryRowsInRange = useMemo(() => {
+    if (!rangeUsesSummaries) return [];
+    return tripSummaries.filter((s) => {
+      const day = (s.endTime || s.startTime || '').slice(0, 10);
+      if (!day || day >= detailCutoff) return false;
+      return summaryInRange(s.endTime, s.startTime, range.start, range.end);
+    });
+  }, [tripSummaries, range.start, range.end, rangeUsesSummaries, detailCutoff]);
 
   const groups = useMemo(() => groupReportsByWeek(rowsInRange), [rowsInRange]);
 
@@ -358,7 +385,9 @@ export function ReportsPage() {
     <div>
       <PageHeader
         title="Reports"
-        subtitle={`Ops sheet · ${range.start} → ${range.end} (${tz})`}
+        subtitle={`Ops sheet · ${range.start} → ${range.end} (${tz}) · detail ≤${retentionDays}d${
+          rangeUsesSummaries ? ' · older from trip_summaries' : ''
+        }`}
         actions={
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" size="sm" onClick={handleUpdate} disabled={syncing}>
@@ -408,15 +437,61 @@ export function ReportsPage() {
         </span>
       </div>
 
+      {rangeUsesSummaries && summaryRowsInRange.length > 0 ? (
+        <div className="mb-6 overflow-x-auto rounded-lg border border-border">
+          <div className="border-b border-border bg-bg/80 px-3 py-2 text-xs font-semibold uppercase text-text-secondary">
+            Archived trip summaries (older than {retentionDays}d · no address/phone)
+          </div>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-left text-xs uppercase text-text-secondary">
+                <th className="px-3 py-2">Trip</th>
+                <th className="px-3 py-2">Driver</th>
+                <th className="px-3 py-2">Route</th>
+                <th className="px-3 py-2">End</th>
+                <th className="px-3 py-2 text-right">Miles</th>
+                <th className="px-3 py-2 text-right">Pay</th>
+                <th className="px-3 py-2">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summaryRowsInRange.map((s) => (
+                <tr key={s.id} className="border-b border-border/60">
+                  <td className="px-3 py-2 font-medium text-primary">{s.tripId}</td>
+                  <td className="px-3 py-2">{s.driverName || '—'}</td>
+                  <td className="px-3 py-2 text-xs">
+                    {(s.facilityCodes || []).filter(Boolean).join(' → ') || '—'}
+                  </td>
+                  <td className="px-3 py-2 text-xs whitespace-nowrap">
+                    {(s.endTime || s.startTime || '').slice(0, 10) || '—'}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{s.totalMiles ?? '—'}</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-semibold">
+                    {formatCurrency(Number(s.payout) || 0)}
+                  </td>
+                  <td className="px-3 py-2 text-xs">
+                    {s.status || s.executionStatus || '—'}
+                    {s.wasLate ? ' · late' : ''}
+                    {s.needsReview ? ' · review' : ''}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+
       {!rowsInRange.length ? (
         <EmptyState
           title="No report rows for this range"
           description={
-            loadReports.length > 0
-              ? `${loadReports.length} report row(s) exist outside this week’s filter — widen the date preset or click Sync from loads.`
-              : loads.length > 0
-                ? `${loads.length} synced load(s) in CRM — click Sync from loads to pull this week into Reports.`
-                : 'Use Update to pull synced Relay tours, or Quick Add / Add row to create entries.'
+            summaryRowsInRange.length > 0
+              ? `${summaryRowsInRange.length} archived trip summar${summaryRowsInRange.length === 1 ? 'y' : 'ies'} shown above for dates older than ${retentionDays} days.`
+              : loadReports.length > 0
+                ? `${loadReports.length} report row(s) exist outside this week’s filter — widen the date preset or click Sync from loads.`
+                : loads.length > 0
+                  ? `${loads.length} synced load(s) in CRM — click Sync from loads to pull this week into Reports.`
+                  : 'Use Update to pull synced Relay tours, or Quick Add / Add row to create entries.'
           }
           actionLabel={syncing ? 'Syncing…' : 'Sync from loads'}
           onAction={() => {

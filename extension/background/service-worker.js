@@ -135,6 +135,7 @@ configureAlwaysOn({
         message: 'Log in to Relay',
         lastAuthErrorAt: new Date().toISOString(),
       },
+      reconnectSyncing: true,
       syncProgress: {
         phase: 'auth',
         detail: 'Paused — log in to Amazon Relay, then sync resumes automatically.',
@@ -165,6 +166,12 @@ configureAlwaysOn({
   },
   onTripsDiff: async (diff) => {
     await handleTripsDiff(diff);
+  },
+  onBeginCatchUp: async ({ missingTripIds }) => {
+    return beginCatchUpOnEdge(missingTripIds || []);
+  },
+  onFinalizeCatchUp: async () => {
+    await finalizeCatchUpOnEdge();
   },
 });
 
@@ -452,12 +459,22 @@ async function handleCapture(msg) {
 }
 
 async function handleTripsDiff(diff) {
-  const { tileCountTab, newTrips, changedTrips, removedTripIds, trips, snapshot } = diff;
+  const { tileCountTab, newTrips, changedTrips, removedTripIds, trips, snapshot, catchUp } = diff;
   const toPush = [...newTrips, ...changedTrips];
 
   // Always send full section trip payloads + optional snapshot to new CRM model
   if ((trips && trips.length) || snapshot) {
-    await pushTripsModelImmediate(trips || toPush, snapshot, tileCountTab);
+    const json = await pushTripsModelImmediate(trips || toPush, snapshot, tileCountTab, {
+      catchUp: Boolean(catchUp),
+    });
+    if (json?.live_missing?.length) {
+      const prev = (await getState()).pendingCatchUpMissing || [];
+      await setState({
+        pendingCatchUpMissing: [
+          ...new Set([...prev, ...json.live_missing.map((id) => String(id).toUpperCase())]),
+        ],
+      });
+    }
   } else if (toPush.length) {
     await pushTripsImmediate(toPush, {
       reason: 'always-on',
@@ -469,45 +486,96 @@ async function handleTripsDiff(diff) {
     });
   }
 
-  if (removedTripIds?.length) {
+  if (removedTripIds?.length && !catchUp) {
     await handleRemovedTrips(tileCountTab, removedTripIds);
   }
 
   await updateBadge();
 }
 
-/** UPSERT relay_trips/legs/stops (+ snapshot) via relay-snapshot; loads via relay-sync. */
-async function pushTripsModelImmediate(trips, snapshot, tileCountTab) {
+async function postRelaySnapshot(body, extensionApiKey, label) {
+  const res = await withTimeout(
+    fetch(RELAY_SNAPSHOT_FN, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        apikey: SUPABASE_ANON_KEY,
+        'X-Relay-Extension-Key': extensionApiKey,
+      },
+      body: JSON.stringify(body),
+    }),
+    FLUSH_TIMEOUT_MS,
+    label,
+  );
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.success) {
+    throw new Error(json.error || `HTTP ${res.status}`);
+  }
+  return json;
+}
+
+async function beginCatchUpOnEdge(missingTripIds) {
   const state = await getState();
-  if (!state.live || !state.extensionApiKey) return;
+  if (!state.extensionApiKey) {
+    return {
+      missingTripIds,
+      untilIso: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    };
+  }
+  try {
+    const json = await postRelaySnapshot(
+      { action: 'begin_catch_up', missingTripIds },
+      state.extensionApiKey,
+      'begin_catch_up',
+    );
+    return {
+      missingTripIds: json.catch_up?.missing_trip_ids || missingTripIds,
+      untilIso: json.catch_up?.catch_up_until || null,
+    };
+  } catch (err) {
+    log('beginCatchUpOnEdge failed', err?.message || err);
+    return {
+      missingTripIds,
+      untilIso: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    };
+  }
+}
+
+async function finalizeCatchUpOnEdge() {
+  const state = await getState();
+  if (!state.extensionApiKey) return;
+  try {
+    await postRelaySnapshot(
+      { action: 'finalize_catch_up' },
+      state.extensionApiKey,
+      'finalize_catch_up',
+    );
+  } catch (err) {
+    log('finalizeCatchUpOnEdge failed', err?.message || err);
+  }
+}
+
+/** UPSERT relay_trips/legs/stops (+ snapshot) via relay-snapshot; loads via relay-sync. */
+async function pushTripsModelImmediate(trips, snapshot, tileCountTab, opts = {}) {
+  const state = await getState();
+  if (!state.live || !state.extensionApiKey) return null;
 
   const edgeTrips = await tripsToEdgePayload(trips);
   const loads = tripsToCrmLoads(trips);
   const clientId = await ensureClientId();
 
   try {
-    const res = await withTimeout(
-      fetch(RELAY_SNAPSHOT_FN, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-          apikey: SUPABASE_ANON_KEY,
-          'X-Relay-Extension-Key': state.extensionApiKey,
-        },
-        body: JSON.stringify({
-          client_id: clientId,
-          trips: edgeTrips,
-          ...(snapshot ? { snapshot } : {}),
-        }),
-      }),
-      FLUSH_TIMEOUT_MS,
-      `relay-snapshot ${tileCountTab || ''}`,
+    const json = await postRelaySnapshot(
+      {
+        client_id: clientId,
+        trips: edgeTrips,
+        catchUp: Boolean(opts.catchUp),
+        ...(snapshot ? { snapshot } : {}),
+      },
+      state.extensionApiKey,
+      `relay-snapshot ${tileCountTab || ''}${opts.catchUp ? ' catch-up' : ''}`,
     );
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok || !json.success) {
-      throw new Error(json.error || `HTTP ${res.status}`);
-    }
     if (json.section_counts) {
       await setState({
         sectionCounts: {
@@ -527,6 +595,7 @@ async function pushTripsModelImmediate(trips, snapshot, tileCountTab) {
       lastError: null,
       lastCollectedAt: new Date().toISOString(),
     });
+    return json;
   } catch (err) {
     log('pushTripsModelImmediate failed', err?.message || err);
     if (loads.length) {
@@ -535,6 +604,7 @@ async function pushTripsModelImmediate(trips, snapshot, tileCountTab) {
     const delay = flushBackoffMs;
     flushBackoffMs = Math.min(FLUSH_BACKOFF_MAX_MS, flushBackoffMs * 2);
     setTimeout(() => void flushToEdge(), delay);
+    return null;
   }
 }
 

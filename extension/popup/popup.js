@@ -32,8 +32,22 @@ function render(state) {
   const phase = prog.phase || 'idle';
   const pct = Math.max(0, Math.min(100, Number(prog.percent) || 0));
   const busy =
-    state.scanInProgress || state.tripsScanInProgress || state.paymentsScanInProgress;
-  $('sync-phase').textContent = busy && phase !== 'near-live' ? `${phase}…` : phase;
+    state.scanInProgress ||
+    state.tripsScanInProgress ||
+    state.paymentsScanInProgress ||
+    state.reconnectSyncing ||
+    state.catchUp?.active ||
+    phase === 'syncing' ||
+    phase === 'catch-up';
+  const phaseLabel =
+    state.reconnectSyncing || phase === 'syncing'
+      ? 'Syncing with Relay…'
+      : state.catchUp?.active || phase === 'catch-up'
+        ? 'Catch-up…'
+        : busy && phase !== 'near-live'
+          ? `${phase}…`
+          : phase;
+  $('sync-phase').textContent = phaseLabel;
   $('sync-bar-fill').style.width = `${busy || pct ? pct : 0}%`;
   const durationNote =
     prog.lastDurationMs != null
@@ -45,7 +59,7 @@ function render(state) {
   const health = state.health || {};
   $('sync-detail').textContent =
     (prog.detail ||
-      'Always-on entitiesV2. Badge = in-transit count (or ! if login needed).') +
+      'Live mirrors + catch-up. Badge = in-transit count (or ! if login needed).') +
     (health.status === 'auth' ? ' Log in to Relay.' : '') +
     durationNote +
     weeks;

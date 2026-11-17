@@ -9,6 +9,8 @@ import {
   PAGE_SIZE,
   MIN_REQUEST_GAP_MS,
   HISTORY_PAGE_GAP_MS,
+  LIVE_PAUSE_MS,
+  CATCH_UP_LOOKBACK_MS,
   SCHEDULE_MIN,
   SCHEDULE_DEFAULTS,
   SCHEDULE_JITTER_MS,
@@ -40,6 +42,8 @@ let hooks = {
   onAuthRequired: async () => {},
   onHealthy: async () => {},
   onBackoff: async () => {},
+  onBeginCatchUp: async () => ({ missingTripIds: [], untilIso: null }),
+  onFinalizeCatchUp: async () => {},
   log: (...args) => {
     if (DEBUG) console.log('[RelayCapture]', ...args);
   },
@@ -353,9 +357,14 @@ export async function diffSectionTrips(tileCountTab, trips) {
 }
 
 /**
- * Fetch all pages for a tab (or HISTORY page1-only / backfill).
+ * Fetch all pages for a tab (or HISTORY page1-only / backfill / catch-up).
+ * catchUp: page HISTORY newest-first until older than untilIso or all missing found.
  */
-export async function syncSection(tabId, tileCountTab, { page1Only = false } = {}) {
+export async function syncSection(
+  tabId,
+  tileCountTab,
+  { page1Only = false, catchUp = false, catchUpUntilIso = null, missingTripIds = [] } = {},
+) {
   const state = await getState();
   if (state.health?.pausedUntil && Date.parse(state.health.pausedUntil) > Date.now()) {
     return { ok: false, skipped: 'paused' };
@@ -365,6 +374,11 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
   let pages = 0;
   let from = 0;
   let totalRecords = Infinity;
+  const stillMissing = new Set(
+    (missingTripIds || []).map((id) => String(id || '').toUpperCase()).filter(Boolean),
+  );
+  const foundIds = [];
+  const untilMs = catchUpUntilIso ? Date.parse(catchUpUntilIso) : null;
 
   for (;;) {
     if (!(await getState()).live) return { ok: false, skipped: 'stopped' };
@@ -388,6 +402,29 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
     const trips = extractTrips(ENTITIES_V2_URL, page.data, page.requestBody);
     allTrips.push(...trips);
 
+    if (catchUp && tileCountTab === 'HISTORY') {
+      for (const t of trips) {
+        const id = String(t.tripId || '').toUpperCase();
+        if (stillMissing.has(id)) {
+          stillMissing.delete(id);
+          foundIds.push(id);
+        }
+      }
+      const oldestEnd = trips.reduce((min, t) => {
+        const ts = Date.parse(t.endTime || t.startTime || '') || Infinity;
+        return Math.min(min, ts);
+      }, Infinity);
+      const pastLookback =
+        untilMs != null && Number.isFinite(oldestEnd) && oldestEnd < untilMs && trips.length > 0;
+      const got = page.entities.length;
+      const done =
+        !stillMissing.size || pastLookback || got < PAGE_SIZE || from + PAGE_SIZE >= totalRecords;
+      if (done) break;
+      from += PAGE_SIZE;
+      await waitRequestGap(gap);
+      continue;
+    }
+
     const got = page.entities.length;
     if (page1Only) break;
     if (got < PAGE_SIZE) break;
@@ -399,7 +436,9 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
 
   const diff = await diffSectionTrips(tileCountTab, allTrips);
   log(
-    `tab=${tileCountTab} pages=${pages} trips=${diff.stats.trips} new=${diff.stats.newCount} changed=${diff.stats.changedCount} removed=${diff.stats.removedCount}`,
+    `tab=${tileCountTab} pages=${pages} trips=${diff.stats.trips} new=${diff.stats.newCount} changed=${diff.stats.changedCount} removed=${diff.stats.removedCount}${
+      catchUp ? ` catchUpFound=${foundIds.length} stillMissing=${stillMissing.size}` : ''
+    }`,
   );
 
   await setState({
@@ -429,9 +468,9 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
   const reportedTotal =
     Number.isFinite(totalRecords) && totalRecords !== Infinity ? Number(totalRecords) : uniqueIds.length;
 
-  // Snapshot only after full pagination (all pages), error-free, counts match
+  // Snapshot only after full pagination (all pages), error-free, counts match — not during catch-up pages
   let snapshot = null;
-  if (!page1Only) {
+  if (!page1Only && !catchUp) {
     if (uniqueIds.length !== reportedTotal) {
       log(
         `snapshot SKIP ${tileCountTab}: unique tripIds=${uniqueIds.length} != totalRecords=${reportedTotal}`,
@@ -446,9 +485,13 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
     }
   }
 
+  const tripsForPush = catchUp
+    ? allTrips.filter((t) => foundIds.includes(String(t.tripId || '').toUpperCase()))
+    : allTrips;
+
   await hooks.onTripsDiff({
     tileCountTab,
-    trips: allTrips,
+    trips: tripsForPush.length ? tripsForPush : allTrips,
     newTrips: diff.newTrips,
     changedTrips: diff.changedTrips,
     removedTripIds: diff.removedTripIds,
@@ -458,9 +501,26 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
     totalRecords: reportedTotal,
     snapshot,
     fetchHadError: false,
+    catchUp: Boolean(catchUp),
+    catchUpFoundIds: foundIds,
+    catchUpStillMissing: [...stillMissing],
   });
 
-  return { ok: true, pages, totalRecords: reportedTotal, snapshot, ...diff.stats };
+  return {
+    ok: true,
+    pages,
+    totalRecords: reportedTotal,
+    snapshot,
+    catchUpFoundIds: foundIds,
+    catchUpStillMissing: [...stillMissing],
+    ...diff.stats,
+  };
+}
+
+function sectionIsPaused(sectionSyncEntry) {
+  const at = sectionSyncEntry?.lastSyncAt;
+  if (!at) return true;
+  return Date.now() - Date.parse(at) > LIVE_PAUSE_MS;
 }
 
 export async function ensureAlarmsAlwaysOn() {
@@ -514,36 +574,154 @@ export async function alwaysOnTick({ force = false } = {}) {
     const now = Date.now();
     const due = { ...(state.nextDueAt || {}) };
 
-    const runOrder = [];
-    if (force || !due.IN_TRANSIT || now >= due.IN_TRANSIT) runOrder.push('IN_TRANSIT');
-    if (force || !due.UPCOMING || now >= due.UPCOMING) runOrder.push('UPCOMING');
+    const wasPaused =
+      Boolean(state.reconnectSyncing) ||
+      sectionIsPaused(state.sectionSync?.IN_TRANSIT) ||
+      sectionIsPaused(state.sectionSync?.UPCOMING);
 
-    // HISTORY: backfill until done, else page1 on schedule
-    const historyDue = force || !due.HISTORY || now >= due.HISTORY;
-    if (historyDue) runOrder.push('HISTORY');
+    if (wasPaused && !state.catchUp?.active) {
+      await setState({
+        reconnectSyncing: true,
+        syncProgress: {
+          phase: 'syncing',
+          detail: 'Syncing with Relay…',
+          percent: 20,
+        },
+      });
+    }
 
-    for (const tab of runOrder) {
+    // Live sections first (always full pages)
+    const liveOrder = [];
+    if (force || wasPaused || !due.IN_TRANSIT || now >= due.IN_TRANSIT) liveOrder.push('IN_TRANSIT');
+    if (force || wasPaused || !due.UPCOMING || now >= due.UPCOMING) liveOrder.push('UPCOMING');
+
+    let liveSnapshotsOk = 0;
+    if (wasPaused) {
+      await setState({ pendingCatchUpMissing: [] });
+    }
+
+    for (const tab of liveOrder) {
       if (!(await getState()).live) break;
-      if (tab === 'HISTORY') {
-        if (!state.historyBackfillDone) {
-          const res = await syncSection(lock.tabId, 'HISTORY', { page1Only: false });
-          if (res.ok) {
-            await setState({ historyBackfillDone: true });
-            due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
-          } else if (res.authRequired) break;
-        } else {
-          const res = await syncSection(lock.tabId, 'HISTORY', { page1Only: true });
-          if (res.ok) due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
-          else if (res.authRequired) break;
+      const res = await syncSection(lock.tabId, tab, { page1Only: false });
+      if (res.ok) {
+        if (tab === 'IN_TRANSIT') due.IN_TRANSIT = now + jitter(schedule.IN_TRANSIT_MS);
+        if (tab === 'UPCOMING') due.UPCOMING = now + jitter(schedule.UPCOMING_MS);
+        if (res.snapshot) liveSnapshotsOk += 1;
+      } else if (res.authRequired) {
+        await setState({ nextDueAt: due, scheduleMs: schedule });
+        return;
+      }
+    }
+
+    // After live Upcoming+In Transit on reconnect/pause: HISTORY catch-up
+    const stAfterLive = await getState();
+    const liveMissing = [
+      ...new Set(
+        [
+          ...(stAfterLive.pendingCatchUpMissing || []),
+        ].map((id) => String(id).toUpperCase()),
+      ),
+    ];
+    if (
+      wasPaused &&
+      liveSnapshotsOk > 0 &&
+      !(stAfterLive.catchUp && stAfterLive.catchUp.active && stAfterLive.catchUp.startedAt)
+    ) {
+      const begin = await hooks.onBeginCatchUp({
+        missingTripIds: liveMissing,
+      });
+      const missing = begin?.missingTripIds?.length ? begin.missingTripIds : liveMissing;
+      const untilIso =
+        begin?.untilIso ||
+        new Date(
+          Date.now() - CATCH_UP_LOOKBACK_MS - LIVE_PAUSE_MS,
+        ).toISOString();
+
+      if (missing.length) {
+        await setState({
+          catchUp: {
+            active: true,
+            missingTripIds: missing,
+            foundTripIds: [],
+            untilIso,
+            startedAt: new Date().toISOString(),
+          },
+          syncProgress: {
+            phase: 'catch-up',
+            detail: `Catch-up: paging HISTORY for ${missing.length} missing trip(s)…`,
+            percent: 55,
+          },
+        });
+        const catchRes = await syncSection(lock.tabId, 'HISTORY', {
+          catchUp: true,
+          catchUpUntilIso: untilIso,
+          missingTripIds: missing,
+        });
+        if (catchRes.authRequired) {
+          await setState({ nextDueAt: due, scheduleMs: schedule });
+          return;
         }
-      } else if (tab === 'IN_TRANSIT') {
-        const res = await syncSection(lock.tabId, 'IN_TRANSIT', { page1Only: false });
-        if (res.ok) due.IN_TRANSIT = now + jitter(schedule.IN_TRANSIT_MS);
-        else if (res.authRequired) break;
-      } else if (tab === 'UPCOMING') {
-        const res = await syncSection(lock.tabId, 'UPCOMING', { page1Only: false });
-        if (res.ok) due.UPCOMING = now + jitter(schedule.UPCOMING_MS);
-        else if (res.authRequired) break;
+        await hooks.onFinalizeCatchUp({
+          foundIds: catchRes.catchUpFoundIds || [],
+          stillMissing: catchRes.catchUpStillMissing || [],
+        });
+        await setState({
+          catchUp: {
+            active: false,
+            missingTripIds: [],
+            foundTripIds: catchRes.catchUpFoundIds || [],
+            untilIso: null,
+            startedAt: null,
+          },
+          reconnectSyncing: false,
+          syncProgress: {
+            phase: 'always-on',
+            detail: 'Catch-up complete — live mirrors restored.',
+            percent: 100,
+          },
+        });
+      } else {
+        await hooks.onFinalizeCatchUp({ foundIds: [], stillMissing: [] });
+        await setState({
+          reconnectSyncing: false,
+          catchUp: {
+            active: false,
+            missingTripIds: [],
+            foundTripIds: [],
+            untilIso: null,
+            startedAt: null,
+          },
+          syncProgress: {
+            phase: 'always-on',
+            detail: 'Syncing with Relay… complete.',
+            percent: 100,
+          },
+        });
+      }
+    } else if (stAfterLive.reconnectSyncing && liveSnapshotsOk >= liveOrder.length && liveOrder.length) {
+      await setState({
+        reconnectSyncing: false,
+        syncProgress: {
+          phase: 'always-on',
+          detail: 'Live mirrors in sync with Relay.',
+          percent: 100,
+        },
+      });
+    }
+
+    // Normal HISTORY: page1 next cycle (picks up trips that left In Transit)
+    const historyDue = force || !due.HISTORY || now >= due.HISTORY;
+    if (historyDue && (await getState()).live) {
+      const histState = await getState();
+      if (!histState.historyBackfillDone) {
+        const res = await syncSection(lock.tabId, 'HISTORY', { page1Only: false });
+        if (res.ok) {
+          await setState({ historyBackfillDone: true });
+          due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
+        }
+      } else {
+        const res = await syncSection(lock.tabId, 'HISTORY', { page1Only: true });
+        if (res.ok) due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
       }
     }
 

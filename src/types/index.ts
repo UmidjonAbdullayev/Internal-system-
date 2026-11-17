@@ -170,7 +170,7 @@ export interface RelaySectionSnapshot {
   crmCount: number;
   mismatch: boolean;
   syncedAt: string;
-  updatedAt: string;
+  updatedAt?: string;
 }
 
 export type RelaySyncHealthStatus = 'healthy' | 'paused' | 'unknown';
@@ -180,6 +180,46 @@ export interface RelaySyncHealth {
   lastSyncedAt: string | null;
   detail: string | null;
 }
+
+export interface SyncStateRow {
+  section: RelaySection;
+  lastSuccessfulSyncAt: string | null;
+  lastAttemptAt: string | null;
+  lastError: string | null;
+  syncing: boolean;
+  updatedAt: string;
+}
+
+export interface TripSummary {
+  id: string;
+  tripId: string;
+  driverName: string | null;
+  status: string | null;
+  tourState: string | null;
+  executionStatus: string | null;
+  workType: string | null;
+  businessType: string | null;
+  equipment: string | null;
+  startTime: string | null;
+  endTime: string | null;
+  totalMiles: number | null;
+  payout: number | null;
+  currency: string | null;
+  ratePerMile: number | null;
+  facilityCodes: string[];
+  legLoadIds: string[];
+  legCount: number;
+  stopCount: number;
+  wasLate: boolean;
+  lateStopCount: number;
+  needsReview: boolean;
+  removedFromRelay: boolean;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  summarizedAt: string;
+}
+
+export type LiveMirrorMode = 'live' | 'paused' | 'syncing' | 'last_known';
 
 export interface Load {
   id: string;
