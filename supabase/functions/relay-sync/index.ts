@@ -1376,6 +1376,8 @@ Deno.serve(async (req: Request) => {
       trip_alerts_queued: uniqueAlerts.length,
     });
   } catch (err) {
-    return json({ success: false, error: String(err) }, 500);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ msg: "relay-sync fatal", error: message }));
+    return json({ success: false, error: message }, 500);
   }
 });
