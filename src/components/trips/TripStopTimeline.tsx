@@ -5,12 +5,12 @@ import {
   cptWarning,
   formatLocalStopTime,
   mapsUrl,
+  minutesLate,
   stopAddressLine,
   stopTypeLabel,
   timeSourceLabel,
   tripLateReason,
 } from '@/lib/relayTrips';
-import { cn } from '@/lib/utils';
 
 function legForStop(trip: RelayTrip, stop: RelayStop): RelayLeg | null {
   return trip.legs.find((l) => l.loadId === stop.loadId) || null;
@@ -21,6 +21,10 @@ function copyText(label: string, value: string) {
     () => toast.success(`${label} copied`),
     () => toast.error('Copy failed'),
   );
+}
+
+function lateSuffix(mins: number | null): string {
+  return mins != null ? ` · ${mins}m late` : '';
 }
 
 function StopBlock({
@@ -36,19 +40,30 @@ function StopBlock({
 }) {
   const leg = legForStop(trip, stop);
   const address = stopAddressLine(stop);
-  // CPT is a leg-level pull time — show only while this stop is active / first pickup.
+  // CPT only when no CHECKOUT actual and CPT already passed (see cptWarning).
   const showCpt =
     Boolean(leg?.cpt) &&
     !stop.actualDeparture &&
     (Boolean(stop.actualArrival) || (stop.seq ?? index + 1) === 1);
   const cpt = showCpt ? cptWarning(stop, leg) : null;
-  const lateReason = tripLateReason(trip);
+  const lateReason = stop.lateReason || (index === 0 ? tripLateReason(trip) : null);
   const schArr = formatLocalStopTime(stop.scheduledArrival, stop.timeZone, stop.scheduledArrivalLocal);
   const actArr = formatLocalStopTime(stop.actualArrival, stop.timeZone, stop.actualArrivalLocal);
-  const schDep = formatLocalStopTime(stop.scheduledDeparture, stop.timeZone, null);
-  const actDep = formatLocalStopTime(stop.actualDeparture, stop.timeZone, null);
+  const schDep = formatLocalStopTime(
+    stop.scheduledDeparture,
+    stop.timeZone,
+    stop.scheduledDepartureLocal,
+  );
+  const actDep = formatLocalStopTime(
+    stop.actualDeparture,
+    stop.timeZone,
+    stop.actualDepartureLocal,
+  );
+  const arrLate = minutesLate(stop.actualArrival, stop.scheduledArrival);
+  const depLate = minutesLate(stop.actualDeparture, stop.scheduledDeparture);
   const arrSource = timeSourceLabel(stop, 'arrival');
   const depSource = timeSourceLabel(stop, 'departure');
+  const etaArr = formatLocalStopTime(stop.eta, stop.timeZone, stop.etaLocal);
 
   return (
     <li className="relative flex gap-3 pb-5 last:pb-0">
@@ -100,11 +115,20 @@ function StopBlock({
             <p className="text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
               Arrival
             </p>
-            <p className="mt-0.5 font-medium text-text">
-              {actArr !== '—' ? actArr : schArr}
-            </p>
-            {actArr !== '—' && schArr !== '—' && (
-              <p className="text-text-secondary">Sch. {schArr}</p>
+            {schArr !== '—' ? (
+              <p className="mt-0.5 text-text-secondary">Sch {schArr}</p>
+            ) : (
+              <p className="mt-0.5 text-text-secondary">Sch —</p>
+            )}
+            {actArr !== '—' ? (
+              <p className="mt-0.5 font-medium text-text">
+                Actual {actArr}
+                {lateSuffix(arrLate)}
+              </p>
+            ) : etaArr !== '—' ? (
+              <p className="mt-0.5 font-medium text-text">ETA {etaArr}</p>
+            ) : (
+              <p className="mt-0.5 font-medium text-text">Actual —</p>
             )}
             {arrSource && (
               <p className="mt-0.5 text-[10px] text-text-secondary">{arrSource}</p>
@@ -114,23 +138,26 @@ function StopBlock({
             <p className="text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
               Departure
             </p>
-            <p className="mt-0.5 font-medium text-text">
-              {actDep !== '—' ? actDep : schDep}
-            </p>
-            {actDep !== '—' && schDep !== '—' && (
-              <p className="text-text-secondary">Sch. {schDep}</p>
+            {schDep !== '—' ? (
+              <p className="mt-0.5 text-text-secondary">Sch {schDep}</p>
+            ) : (
+              <p className="mt-0.5 text-text-secondary">Sch —</p>
+            )}
+            {actDep !== '—' ? (
+              <p className="mt-0.5 font-medium text-text">
+                Actual {actDep}
+                {lateSuffix(depLate)}
+              </p>
+            ) : (
+              <p className="mt-0.5 font-medium text-text">Actual —</p>
             )}
             {depSource && (
               <p className="mt-0.5 text-[10px] text-text-secondary">{depSource}</p>
             )}
           </div>
         </div>
-        {cpt && (
-          <p className={cn('text-xs font-medium', cpt.includes('passed') ? 'text-danger' : 'text-warning')}>
-            {cpt}
-          </p>
-        )}
-        {lateReason && index === 0 && (
+        {cpt && <p className="text-xs font-medium text-danger">{cpt}</p>}
+        {lateReason && (
           <p className="text-xs text-text-secondary">Late reason: {lateReason}</p>
         )}
       </div>

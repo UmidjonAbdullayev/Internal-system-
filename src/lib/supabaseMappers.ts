@@ -266,6 +266,14 @@ export function mapRelayStop(row: Record<string, unknown>): RelayStop {
     eta: row.eta ? str(row.eta) : null,
     scheduledArrivalLocal: row.scheduled_arrival_local ? str(row.scheduled_arrival_local) : null,
     actualArrivalLocal: row.actual_arrival_local ? str(row.actual_arrival_local) : null,
+    scheduledDepartureLocal: row.scheduled_departure_local
+      ? str(row.scheduled_departure_local)
+      : null,
+    actualDepartureLocal: row.actual_departure_local ? str(row.actual_departure_local) : null,
+    etaLocal: row.eta_local ? str(row.eta_local) : null,
+    lateReason: row.late_reason ? str(row.late_reason) : null,
+    arrivalTimeSource: row.arrival_time_source ? str(row.arrival_time_source) : null,
+    departureTimeSource: row.departure_time_source ? str(row.departure_time_source) : null,
     raw: asRecord(row.raw),
     archived: Boolean(row.archived),
     createdAt: str(row.created_at),

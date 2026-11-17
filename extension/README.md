@@ -1,5 +1,12 @@
 # Amazon Relay → Internal Sys Chrome Extension (MV3)
 
+## v1.8.2 — stop times from actions[]
+
+- `epochToIsoUtc` accepts ISO-8601 strings (Relay CHECKIN/CHECKOUT `plannedTime`/`actualTime`) as well as epochs
+- Maps arrival/departure/ETA/late reason/`actualTimeSource` from `stop.actions[]`
+- Popup **Force re-sync** ignores version/hash and re-pushes Upcoming + In Transit + History backfill
+- Does **not** enable Telegram (`TELEGRAM_ALERTS_ENABLED` stays OFF)
+
 ## v1.8.0 — per-tab entitiesV2 templates
 
 - Each tab (UPCOMING / IN_TRANSIT / HISTORY) uses its **own full filter body**

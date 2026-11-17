@@ -200,6 +200,12 @@ $('scan-btn').addEventListener('click', async () => {
   await refresh();
 });
 
+$('resync-btn').addEventListener('click', async () => {
+  // Ignore version/hash; re-save all stops. TELEGRAM_ALERTS_ENABLED stays OFF.
+  await send('FORCE_RESYNC');
+  await refresh();
+});
+
 $('logout-btn').addEventListener('click', async () => {
   const res = await send('LOGOUT');
   if (res?.ok) render(res.state);

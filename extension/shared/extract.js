@@ -8,9 +8,26 @@ function round2(n) {
   return Math.round(Number(n) * 100) / 100;
 }
 
-/** Epoch seconds (or ms if clearly ms) → ISO UTC Z. */
+/**
+ * Normalize Relay timestamps to ISO UTC Z.
+ * Accepts epoch seconds, epoch ms, or ISO-8601 strings (actions use ISO).
+ */
 export function epochToIsoUtc(raw) {
   if (raw == null || raw === '') return null;
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (!s) return null;
+    // Pure numeric string → treat as epoch below
+    if (!/^-?\d+(\.\d+)?$/.test(s)) {
+      const ms = Date.parse(s);
+      if (!Number.isFinite(ms) || ms <= 0) return null;
+      try {
+        return new Date(ms).toISOString();
+      } catch {
+        return null;
+      }
+    }
+  }
   const n = typeof raw === 'number' ? raw : Number(raw);
   if (!Number.isFinite(n) || n <= 0) return null;
   const ms = n > 1e12 ? n : n * 1000; // seconds → ms; already-ms if > 1e12
@@ -74,13 +91,31 @@ function withLocal(iso, timeZone) {
   return { utc: iso, local: formatLocalInZone(iso, timeZone) };
 }
 
+function findAction(actions, type) {
+  if (!Array.isArray(actions)) return null;
+  return (
+    actions.find((x) => String(x?.type || '').toUpperCase() === type) ||
+    actions.find((x) => String(x?.actionType || '').toUpperCase() === type) ||
+    null
+  );
+}
+
 function actionTimes(actions, type) {
-  if (!Array.isArray(actions)) return { planned: null, actual: null };
-  const a = actions.find((x) => String(x?.type || x?.actionType || '').toUpperCase() === type);
-  if (!a) return { planned: null, actual: null };
+  const a = findAction(actions, type);
+  if (!a) {
+    return { planned: null, actual: null, timeSource: null, delayReason: null };
+  }
+  const delayReason =
+    a.delayReport?.delayReason != null
+      ? String(a.delayReport.delayReason).trim() || null
+      : a.delayReport?.reason != null
+        ? String(a.delayReport.reason).trim() || null
+        : null;
   return {
     planned: epochToIsoUtc(a.plannedTime),
     actual: epochToIsoUtc(a.actualTime),
+    timeSource: a.actualTimeSource != null ? String(a.actualTimeSource).trim() || null : null,
+    delayReason,
   };
 }
 
@@ -111,11 +146,12 @@ function mapStop(stop) {
   const schedDep = withLocal(checkout.planned, timeZone);
   const actDep = withLocal(checkout.actual, timeZone);
   const eta = withLocal(etaUtc, timeZone);
+  const lateReason = checkin.delayReason || checkout.delayReason || null;
 
   return {
     seq: stop?.stopSequenceNumber ?? null,
     stopType: stop?.stopType ?? null,
-    facilityCode: stop?.locationCode ?? loc.locationCode ?? null,
+    facilityCode: stop?.locationCode ?? loc.locationCode ?? loc.label ?? null,
     address: loc.line1 ?? null,
     city: loc.city ?? null,
     state: loc.state ?? null,
@@ -131,6 +167,9 @@ function mapStop(stop) {
     actualDepartureLocal: actDep.local,
     eta: eta.utc,
     etaLocal: eta.local,
+    lateReason,
+    arrivalTimeSource: checkin.timeSource,
+    departureTimeSource: checkout.timeSource,
   };
 }
 

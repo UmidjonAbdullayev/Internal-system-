@@ -14,6 +14,7 @@ import {
 } from "./shared.ts";
 import { upsertTrips } from "./upsert.ts";
 import { beginCatchUp, finalizeCatchUp } from "./catchup.ts";
+import { remapStopsFromTripRaw } from "./remap-stops.ts";
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -70,6 +71,17 @@ Deno.serve(async (req: Request) => {
         detail: body.detail != null ? String(body.detail) : null,
       });
       return json({ success: true, alive_at: now, auth_status: authStatus });
+    }
+
+    // Force remap stop times from stored trip.raw actions[] — no Telegram.
+    if (action === "remap_stop_times") {
+      const sections = Array.isArray(body.sections) ? body.sections : undefined;
+      const result = await remapStopsFromTripRaw(sb, { sections });
+      return json({
+        success: true,
+        telegram_alerts: "OFF",
+        ...result,
+      });
     }
 
     const tripsIn = Array.isArray(body.trips) ? body.trips : [];

@@ -107,6 +107,12 @@ export interface RelayStop {
   eta: string | null;
   scheduledArrivalLocal: string | null;
   actualArrivalLocal: string | null;
+  scheduledDepartureLocal: string | null;
+  actualDepartureLocal: string | null;
+  etaLocal: string | null;
+  lateReason: string | null;
+  arrivalTimeSource: string | null;
+  departureTimeSource: string | null;
   raw: Record<string, unknown>;
   archived: boolean;
   createdAt: string;

@@ -24,7 +24,7 @@ export const RELAY_LEG_LIST_COLUMNS =
   'id,load_id,trip_id,facility_sequence,execution_status,equipment_type,miles,payout,tractor_id,trailer_id,driver_name_raw,cpt,content_hash,archived,last_seen_at,created_at,updated_at';
 
 export const RELAY_STOP_LIST_COLUMNS =
-  'id,stop_id,load_id,trip_id,seq,stop_type,facility_code,address,city,state,zip,time_zone,scheduled_arrival,actual_arrival,scheduled_departure,actual_departure,eta,scheduled_arrival_local,actual_arrival_local,archived,created_at,updated_at';
+  'id,stop_id,load_id,trip_id,seq,stop_type,facility_code,address,city,state,zip,time_zone,scheduled_arrival,actual_arrival,scheduled_departure,actual_departure,eta,scheduled_arrival_local,actual_arrival_local,scheduled_departure_local,actual_departure_local,eta_local,late_reason,arrival_time_source,departure_time_source,archived,created_at,updated_at';
 
 type PageResult<T> = {
   data: T[] | null;

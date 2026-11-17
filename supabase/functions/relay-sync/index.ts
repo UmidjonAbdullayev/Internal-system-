@@ -65,6 +65,12 @@ type StopIn = {
   eta?: string | null;
   scheduledArrivalLocal?: string | null;
   actualArrivalLocal?: string | null;
+  scheduledDepartureLocal?: string | null;
+  actualDepartureLocal?: string | null;
+  etaLocal?: string | null;
+  lateReason?: string | null;
+  arrivalTimeSource?: string | null;
+  departureTimeSource?: string | null;
 };
 
 type LegIn = {
@@ -679,6 +685,12 @@ Deno.serve(async (req: Request) => {
             eta: stop.eta ?? null,
             scheduled_arrival_local: stop.scheduledArrivalLocal ?? null,
             actual_arrival_local: stop.actualArrivalLocal ?? null,
+            scheduled_departure_local: stop.scheduledDepartureLocal ?? null,
+            actual_departure_local: stop.actualDepartureLocal ?? null,
+            eta_local: stop.etaLocal ?? null,
+            late_reason: stop.lateReason ?? null,
+            arrival_time_source: stop.arrivalTimeSource ?? null,
+            departure_time_source: stop.departureTimeSource ?? null,
             raw: {},
             archived: false,
             updated_at: now,
