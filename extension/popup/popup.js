@@ -74,33 +74,45 @@ function render(state) {
   const tileSync = state.sectionSync || {};
   const counts = state.sectionCounts || {};
   const globalErr = state.lastFetchError;
+  const tplMeta = state.templateMeta || {};
+  const tplWrong = state.templateWrong || {};
+  const histProg = state.historyBackfillProgress || {};
   $('tile-sync').innerHTML = ['IN_TRANSIT', 'UPCOMING', 'HISTORY']
     .map((tab) => {
       const s = tileSync[tab] || {};
       const c = counts[tab] || {};
+      const meta = tplMeta[tab] || {};
       const when = s.lastSyncAt ? new Date(s.lastSyncAt).toLocaleTimeString() : '—';
-      const fe = s.lastFetchError || (s.lastError ? null : null) || (globalErr?.tab === tab ? globalErr : null);
-      const errShort = s.lastError ? ` · ${s.lastError}` : '';
+      const wrong =
+        (tab === 'UPCOMING' && tplWrong.UPCOMING) ||
+        (tab === 'IN_TRANSIT' && tplWrong.IN_TRANSIT);
+      const fe =
+        s.lastFetchError || (globalErr?.tab === tab ? globalErr : null);
+      const errFull = wrong
+        ? tplWrong.message || s.lastError || 'template wrong'
+        : s.lastError || '';
+      const err = errFull ? ` · ${errFull}` : '';
       const paused = s.paused ? ' · paused' : '';
       const title = fe
         ? [
             `URL: ${fe.url || '—'}`,
             `Context: ${fe.context || '—'}`,
             `HTTP: ${fe.status ?? '—'}`,
-            `Message: ${fe.message || s.lastError || '—'}`,
+            `Message: ${fe.message || errFull || '—'}`,
             `At: ${fe.at || '—'}`,
           ].join('\n')
-        : s.lastError
-          ? String(s.lastError)
-          : '';
+        : errFull;
       const relayN = c.relay ?? s.trips ?? 0;
       const crmN = c.crm ?? '—';
       const mismatch = Boolean(c.mismatch) || (crmN !== '—' && Number(crmN) !== Number(relayN));
-      const countCls = mismatch ? 'mismatch' : 'ok-count';
-      const badgeCls = s.lastError || s.paused ? 'error' : 'collecting';
+      const countCls = mismatch || wrong ? 'mismatch' : 'ok-count';
+      const src = meta.label || (meta.source === 'fallback' ? 'fallback' : meta.source || '—');
+      const histExtra =
+        tab === 'HISTORY' && histProg.label ? ` · ${histProg.label}` : '';
+      const badgeCls = s.lastError || wrong || s.paused ? 'error' : 'collecting';
       return `<li><span>${tab}</span><span class="badge ${badgeCls}" title="${escapeAttr(
         title,
-      )}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when}${errShort}${paused}</span></li>`;
+      )}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when} · ${src}${histExtra}${err}${paused}</span></li>`;
     })
     .join('');
 

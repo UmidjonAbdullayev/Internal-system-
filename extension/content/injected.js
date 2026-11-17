@@ -29,6 +29,7 @@
       const out = {};
       for (const [k, v] of Object.entries(headers)) {
         if (/^cookie$/i.test(k) || /^set-cookie$/i.test(k)) continue;
+        if (/^content-length$/i.test(k)) continue;
         if (v != null) out[k] = String(v);
       }
       return out;
