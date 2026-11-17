@@ -495,6 +495,11 @@ export function filterTrips(
     lateOnly: boolean;
     needsAttentionOnly: boolean;
     now?: number;
+    /** Optional History end-time yyyy-MM-dd range (inclusive), already zoned. */
+    endDateStart?: string | null;
+    endDateEnd?: string | null;
+    endTimeZone?: string;
+    tripEndYmd?: (trip: RelayTrip) => string | null;
   },
 ): RelayTrip[] {
   const now = opts.now ?? Date.now();
@@ -511,8 +516,71 @@ export function filterTrips(
     if (opts.lateOnly && !isTripLate(trip, now)) return false;
     if (opts.needsAttentionOnly && !needsAttention(trip, now)) return false;
     if (q && !searchTripHaystack(trip).includes(q)) return false;
+    if (opts.tab === 'history' && (opts.endDateStart || opts.endDateEnd) && opts.tripEndYmd) {
+      const ymd = opts.tripEndYmd(trip);
+      if (!ymd) return false;
+      if (opts.endDateStart && ymd < opts.endDateStart) return false;
+      if (opts.endDateEnd && ymd > opts.endDateEnd) return false;
+    }
     return true;
   });
+}
+
+export function activeFilterLabels(opts: {
+  search: string;
+  status: string;
+  driver: string;
+  lateOnly: boolean;
+  needsAttentionOnly: boolean;
+  datePresetActive?: boolean;
+  datePresetLabel?: string;
+}): string[] {
+  const labels: string[] = [];
+  if (opts.search.trim()) labels.push(`Search “${opts.search.trim()}”`);
+  if (opts.status) labels.push(`Status: ${opts.status}`);
+  if (opts.driver) labels.push(`Driver: ${opts.driver}`);
+  if (opts.lateOnly) labels.push('Late only');
+  if (opts.needsAttentionOnly) labels.push('Needs attention');
+  if (opts.datePresetActive && opts.datePresetLabel) labels.push(`Date: ${opts.datePresetLabel}`);
+  return labels;
+}
+
+export function historySummary(trips: RelayTrip[], now = Date.now()) {
+  let delivered = 0;
+  let cancelled = 0;
+  let totalMiles = 0;
+  let totalPay = 0;
+  let lateStops = 0;
+  let stopCount = 0;
+  for (const t of trips) {
+    const label = displayStatusLabel(t).toLowerCase();
+    if (label.includes('cancel')) cancelled += 1;
+    else if (label.includes('deliver') || label.includes('complet')) delivered += 1;
+    if (t.totalMiles != null) totalMiles += Number(t.totalMiles) || 0;
+    if (t.payout != null) totalPay += Number(t.payout) || 0;
+    for (const stop of allStops(t)) {
+      stopCount += 1;
+      const sched = stop.scheduledArrival ? Date.parse(stop.scheduledArrival) : NaN;
+      const actual = stop.actualArrival ? Date.parse(stop.actualArrival) : NaN;
+      if (Number.isFinite(sched) && Number.isFinite(actual) && actual - sched > 15 * 60 * 1000) {
+        lateStops += 1;
+      } else if (isTripLate(t, now) && stop.seq === 1) {
+        // counted via trip-level late when stop deltas missing — skip double-count
+      }
+    }
+  }
+  const avgPerMi = totalMiles > 0 ? totalPay / totalMiles : 0;
+  const latePct = stopCount > 0 ? (lateStops / stopCount) * 100 : 0;
+  return {
+    trips: trips.length,
+    delivered,
+    cancelled,
+    totalMiles,
+    totalPay,
+    avgPerMi,
+    lateStops,
+    latePct,
+  };
 }
 
 export function tabCountsFromSnapshots(

@@ -47,6 +47,7 @@ export function SettingsPage() {
                 <option value="America/New_York">America/New_York (ET)</option>
                 <option value="America/Denver">America/Denver (MT)</option>
                 <option value="America/Los_Angeles">America/Los_Angeles (PT)</option>
+                <option value="Asia/Tashkent">Asia/Tashkent (UZT)</option>
               </Select>
             </Field>
             <Field label="Week Starts On">

@@ -14,9 +14,10 @@ import { LiveMirrorBanner } from '@/components/trips/LiveMirrorBanner';
 import { TripLegend } from '@/components/trips/TripLegend';
 import { TripRow } from '@/components/trips/TripRow';
 import {
+  activeFilterLabels,
   displayStatusLabel,
   filterTrips,
-  sectionToTab,
+  historySummary,
   tripDriverName,
   type TripTab,
 } from '@/lib/relayTrips';
@@ -25,10 +26,29 @@ import {
   liveMirrorMode,
   sectionForTab,
   syncStateForSection,
-  withinTripHistoryRetention,
 } from '@/lib/liveMirrors';
-import { downloadCSV, formatCurrency, getDriverFullName } from '@/lib/utils';
-import type { LoadStatus, PaymentStatus, TrailerType } from '@/types';
+import { DateRangeFilter } from '@/components/ui/DateRangeFilter';
+import {
+  downloadCSV,
+  formatCurrency,
+  formatNumber,
+  getDateRangeFromPreset,
+  getDriverFullName,
+  isoToZonedYmd,
+  todayISO,
+} from '@/lib/utils';
+import type { DatePreset, DateRange, LoadStatus, PaymentStatus, TrailerType } from '@/types';
+
+const HISTORY_TZ_DEFAULT = 'Asia/Tashkent';
+const HISTORY_PRESET_LABELS: Partial<Record<DatePreset, string>> = {
+  today: 'Today',
+  yesterday: 'Yesterday',
+  this_week: 'This week',
+  last_week: 'Last week',
+  this_month: 'This month',
+  last_45_days: 'Last 45 days',
+  custom: 'Custom',
+};
 
 const LOAD_STATUSES: LoadStatus[] = [
   'Available',
@@ -93,7 +113,11 @@ export function LoadsPage() {
     dataReady,
   } = useData();
   const [params, setParams] = useSearchParams();
-  const retentionDays = companySettings.historyRetentionDays || 45;
+  // History end-time filter TZ — default Asia/Tashkent (configurable via Settings timezone).
+  const historyTz =
+    companySettings.timezone === 'Asia/Tashkent' || companySettings.timezone === 'Asia/Samarkand'
+      ? companySettings.timezone
+      : HISTORY_TZ_DEFAULT;
   const urlTab = params.get('tab') as TripTab | null;
   const [tab, setTab] = useState<TripTab>(
     urlTab && TRIP_TABS.some((x) => x.id === urlTab) ? urlTab : 'in_transit',
@@ -104,6 +128,10 @@ export function LoadsPage() {
   const [driverFilter, setDriverFilter] = useState(params.get('driver') ?? '');
   const [lateOnly, setLateOnly] = useState(params.get('late') === '1');
   const [needsAttentionOnly, setNeedsAttentionOnly] = useState(params.get('attention') === '1');
+  const [historyPreset, setHistoryPreset] = useState<DatePreset>('this_week');
+  const [historyCustom, setHistoryCustom] = useState<DateRange>(() =>
+    getDateRangeFromPreset('this_week', undefined, todayISO(historyTz)),
+  );
   const [showLastKnown, setShowLastKnown] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [focusedIndex, setFocusedIndex] = useState(0);
@@ -137,6 +165,44 @@ export function LoadsPage() {
 
   const snapshots = sectionSnapshots.length ? sectionSnapshots : relaySnapshots;
 
+  const historyRange = useMemo(
+    () => getDateRangeFromPreset(historyPreset, historyCustom, todayISO(historyTz)),
+    [historyPreset, historyCustom, historyTz],
+  );
+
+  const tripEndYmd = useCallback(
+    (t: Parameters<typeof filterTrips>[0][number]) =>
+      isoToZonedYmd(t.endTime || t.startTime || t.lastSeenAt || t.updatedAt, historyTz),
+    [historyTz],
+  );
+
+  /** ONE selector for tab counts, list, and empty-state (no hidden retention filter). */
+  const selectTrips = useCallback(
+    (
+      forTab: TripTab,
+      filters: {
+        search: string;
+        status: string;
+        driver: string;
+        lateOnly: boolean;
+        needsAttentionOnly: boolean;
+        applyHistoryDates: boolean;
+      },
+    ) =>
+      filterTrips(relayTrips, {
+        tab: forTab,
+        search: filters.search,
+        status: filters.status,
+        driver: filters.driver,
+        lateOnly: filters.lateOnly,
+        needsAttentionOnly: filters.needsAttentionOnly,
+        endDateStart: filters.applyHistoryDates && forTab === 'history' ? historyRange.start : null,
+        endDateEnd: filters.applyHistoryDates && forTab === 'history' ? historyRange.end : null,
+        tripEndYmd,
+      }),
+    [relayTrips, historyRange, tripEndYmd],
+  );
+
   const tabCounts = useMemo(() => {
     const snapCount = (section: 'UPCOMING' | 'IN_TRANSIT' | 'HISTORY') => {
       const snap = snapshots.find((s) => s.section === section);
@@ -146,22 +212,21 @@ export function LoadsPage() {
     };
     const up = snapCount('UPCOMING');
     const it = snapCount('IN_TRANSIT');
-    const counts: Record<TripTab, number> = {
-      upcoming: up ?? 0,
-      in_transit: it ?? 0,
-      history: 0,
-      all: relayTrips.length,
+    const emptyFilters = {
+      search: '',
+      status: '',
+      driver: '',
+      lateOnly: false,
+      needsAttentionOnly: false,
+      applyHistoryDates: false,
     };
-    for (const t of relayTrips) {
-      const b = sectionToTab(t.section);
-      if (b === 'upcoming' && up == null) counts.upcoming += 1;
-      else if (b === 'in_transit' && it == null) counts.in_transit += 1;
-      else if (b === 'history' && withinTripHistoryRetention(t, retentionDays)) counts.history += 1;
-    }
-    if (up != null) counts.upcoming = up;
-    if (it != null) counts.in_transit = it;
-    return counts;
-  }, [relayTrips, snapshots, syncState, retentionDays]);
+    return {
+      upcoming: up ?? selectTrips('upcoming', emptyFilters).length,
+      in_transit: it ?? selectTrips('in_transit', emptyFilters).length,
+      history: selectTrips('history', emptyFilters).length,
+      all: relayTrips.length,
+    } satisfies Record<TripTab, number>;
+  }, [relayTrips, snapshots, syncState, selectTrips]);
 
   useEffect(() => {
     if (tabAutoPicked || !relayTrips.length) return;
@@ -193,22 +258,32 @@ export function LoadsPage() {
   }, [relayTrips]);
 
   const filtered = useMemo(() => {
-    const liveTab = tab === 'upcoming' || tab === 'in_transit';
-    if (liveTab && (mirrorMode === 'paused' || mirrorMode === 'syncing')) {
+    // Syncing: keep last-known trips (never hide all). Paused: empty until "Show last known".
+    if (
+      (tab === 'upcoming' || tab === 'in_transit') &&
+      mirrorMode === 'paused' &&
+      !showLastKnown
+    ) {
       return [];
     }
-    const base = filterTrips(relayTrips, {
-      tab,
+    const rows = selectTrips(tab, {
       search,
       status: statusFilter,
       driver: driverFilter,
       lateOnly,
       needsAttentionOnly,
+      applyHistoryDates: tab === 'history',
     });
-    if (tab !== 'history') return base;
-    return base.filter((t) => withinTripHistoryRetention(t, retentionDays));
+    if (tab === 'history') {
+      return [...rows].sort((a, b) => {
+        const ae = Date.parse(a.endTime || a.startTime || '') || 0;
+        const be = Date.parse(b.endTime || b.startTime || '') || 0;
+        return be - ae;
+      });
+    }
+    return rows;
   }, [
-    relayTrips,
+    selectTrips,
     tab,
     search,
     statusFilter,
@@ -216,20 +291,56 @@ export function LoadsPage() {
     lateOnly,
     needsAttentionOnly,
     mirrorMode,
-    retentionDays,
+    showLastKnown,
   ]);
 
   const inTabCount = useMemo(() => {
     if (tab === 'all') return relayTrips.length;
-    return filterTrips(relayTrips, {
-      tab,
+    return selectTrips(tab, {
       search: '',
       status: '',
       driver: '',
       lateOnly: false,
       needsAttentionOnly: false,
+      applyHistoryDates: false,
     }).length;
-  }, [relayTrips, tab]);
+  }, [relayTrips.length, tab, selectTrips]);
+
+  const historyStats = useMemo(
+    () => (tab === 'history' ? historySummary(filtered) : null),
+    [tab, filtered],
+  );
+
+  const namedFilters = useMemo(
+    () =>
+      activeFilterLabels({
+        search,
+        status: statusFilter,
+        driver: driverFilter,
+        lateOnly,
+        needsAttentionOnly,
+        datePresetActive: tab === 'history',
+        datePresetLabel: HISTORY_PRESET_LABELS[historyPreset],
+      }),
+    [search, statusFilter, driverFilter, lateOnly, needsAttentionOnly, tab, historyPreset],
+  );
+
+  const clearFilters = useCallback(() => {
+    setSearch('');
+    setStatusFilter('');
+    setDriverFilter('');
+    setLateOnly(false);
+    setNeedsAttentionOnly(false);
+    setHistoryPreset('this_week');
+    setHistoryCustom(getDateRangeFromPreset('this_week', undefined, todayISO(historyTz)));
+    const next = new URLSearchParams(params);
+    next.delete('q');
+    next.delete('status');
+    next.delete('driver');
+    next.delete('late');
+    next.delete('attention');
+    setParams(next, { replace: true });
+  }, [params, setParams, historyTz]);
 
   useEffect(() => {
     setFocusedIndex((i) => (filtered.length ? Math.min(i, filtered.length - 1) : 0));
@@ -321,7 +432,7 @@ export function LoadsPage() {
     }
   }, [focusedIndex, filtered]);
 
-  const filtersActive = Boolean(search || statusFilter || driverFilter || lateOnly || needsAttentionOnly);
+  const filtersActive = namedFilters.length > 0;
 
   return (
     <div>
@@ -376,8 +487,40 @@ export function LoadsPage() {
         <LiveMirrorBanner
           mode={mirrorMode}
           relayCount={sectionSnap?.totalRecords}
+          lastSuccessfulSyncAt={sectionSync?.lastSuccessfulSyncAt}
           onShowLastKnown={() => setShowLastKnown(true)}
         />
+      )}
+
+      {tab === 'history' && historyStats && (
+        <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 rounded-md border border-border bg-bg px-3 py-2 text-xs text-text-secondary">
+          <span>
+            <span className="font-semibold text-text">{historyStats.trips}</span> trips
+          </span>
+          <span>
+            <span className="font-semibold text-text">{historyStats.delivered}</span> delivered
+          </span>
+          <span>
+            <span className="font-semibold text-text">{historyStats.cancelled}</span> cancelled
+          </span>
+          <span>
+            <span className="font-semibold text-text">{formatNumber(historyStats.totalMiles, 0)}</span> mi
+          </span>
+          <span>
+            <span className="font-semibold text-text">{formatCurrency(historyStats.totalPay)}</span> pay
+          </span>
+          <span>
+            avg{' '}
+            <span className="font-semibold text-text">{formatCurrency(historyStats.avgPerMi)}</span>/mi
+          </span>
+          <span>
+            late stops{' '}
+            <span className="font-semibold text-text">
+              {historyStats.lateStops} ({formatNumber(historyStats.latePct, 0)}%)
+            </span>
+          </span>
+          <span className="text-text-secondary">End time · {historyTz}</span>
+        </div>
       )}
 
       <Card className="mb-4 p-3">
@@ -423,23 +566,28 @@ export function LoadsPage() {
             Needs attention
           </label>
         </div>
+        {tab === 'history' && (
+          <div className="mt-3">
+            <DateRangeFilter
+              preset={historyPreset}
+              onPresetChange={(p) => {
+                setHistoryPreset(p);
+                if (p !== 'custom') {
+                  setHistoryCustom(getDateRangeFromPreset(p, undefined, todayISO(historyTz)));
+                }
+              }}
+              customRange={historyCustom}
+              onCustomRangeChange={setHistoryCustom}
+            />
+          </div>
+        )}
         {inTabCount > 0 && filtered.length === 0 && filtersActive && (
           <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
             <span>
-              {inTabCount} trip{inTabCount === 1 ? '' : 's'} in this tab, but filters hide them.
+              {inTabCount} trip{inTabCount === 1 ? '' : 's'} in this tab, but filters hide them (
+              {namedFilters.join('; ')}).
             </span>
-            <Button
-              variant="outline"
-              size="sm"
-              type="button"
-              onClick={() => {
-                setSearch('');
-                setStatusFilter('');
-                setDriverFilter('');
-                setLateOnly(false);
-                setNeedsAttentionOnly(false);
-              }}
-            >
+            <Button variant="outline" size="sm" type="button" onClick={clearFilters}>
               Clear filters
             </Button>
           </div>
@@ -486,34 +634,30 @@ export function LoadsPage() {
             title={
               relayTrips.length === 0
                 ? 'No Relay trips synced yet'
-                : inTabCount > 0
+                : filtersActive && inTabCount > 0
                   ? 'Filters hide synced trips'
                   : tab === 'in_transit'
-                    ? 'No In Transit trips'
+                    ? 'No In Transit trips in Relay right now'
                     : tab === 'upcoming'
-                      ? 'No Upcoming trips'
+                      ? 'No upcoming trips in Relay right now'
                       : tab === 'history'
-                        ? 'No History trips'
+                        ? 'No History trips in this date range'
                         : 'No trips in this tab'
             }
             description={
               relayTrips.length === 0
-                ? 'Extension 1.6.0+ writes relay_trips / legs / stops. Open Amazon Relay Trips, GO LIVE, then Refresh. Tab counts will match Relay section snapshots.'
-                : inTabCount > 0
-                  ? `This tab has ${inTabCount} trip(s). Clear search/status/driver/toggles.`
-                  : 'Switch tabs or wait for the next Relay snapshot.'
+                ? 'Extension writes relay_trips / legs / stops. Open Amazon Relay Trips, GO LIVE, then Refresh.'
+                : filtersActive && inTabCount > 0
+                  ? `Active filters: ${namedFilters.join('; ')}.`
+                  : tab === 'upcoming' || tab === 'in_transit'
+                    ? mirrorMode === 'paused'
+                      ? 'Live mirror paused — use Show last known data, or wait for Relay sync.'
+                      : 'Switch tabs or wait for the next Relay snapshot.'
+                    : 'Try another date preset or clear filters.'
             }
-            actionLabel={inTabCount > 0 ? 'Clear filters' : 'Refresh'}
+            actionLabel={filtersActive && inTabCount > 0 ? 'Clear filters' : 'Refresh'}
             onAction={
-              inTabCount > 0
-                ? () => {
-                    setSearch('');
-                    setStatusFilter('');
-                    setDriverFilter('');
-                    setLateOnly(false);
-                    setNeedsAttentionOnly(false);
-                  }
-                : () => void refreshData()
+              filtersActive && inTabCount > 0 ? clearFilters : () => void refreshData()
             }
           />
         )}
