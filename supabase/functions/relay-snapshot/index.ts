@@ -361,6 +361,8 @@ Deno.serve(async (req: Request) => {
       errors,
     });
   } catch (err) {
-    return json({ success: false, error: String(err) }, 500);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ msg: "relay-snapshot fatal", error: message }));
+    return json({ success: false, error: message }, 500);
   }
 });

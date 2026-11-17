@@ -628,9 +628,15 @@ async function postRelaySnapshot(body, extensionApiKey, label) {
     FLUSH_TIMEOUT_MS,
     label,
   );
-  const json = await res.json().catch(() => ({}));
+  const text = await res.text();
+  let json = {};
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    /* non-JSON body — surface raw text below */
+  }
   if (!res.ok || !json.success) {
-    throw new Error(json.error || `HTTP ${res.status}`);
+    throw new Error(json.error || text || `HTTP ${res.status}`);
   }
   return json;
 }
@@ -1043,9 +1049,15 @@ async function postRelaySyncBatch(body, extensionApiKey, timeoutMs, label) {
     timeoutMs,
     label,
   );
-  const json = await res.json().catch(() => ({}));
+  const text = await res.text();
+  let json = {};
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    /* non-JSON body — surface raw text below */
+  }
   if (!res.ok || !json.success) {
-    throw new Error(json.error || `HTTP ${res.status}`);
+    throw new Error(json.error || text || `HTTP ${res.status}`);
   }
   return json;
 }
