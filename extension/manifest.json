@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.3.7",
-  "description": "Fix expand no-op: match blue > / trip-id toggle; never Assign Driver.",
-  "permissions": ["storage", "tabs", "alarms", "scripting", "notifications"],
+  "version": "1.4.0",
+  "description": "Passive Relay JSON API capture → CRM. No DOM scraping or row clicks.",
+  "permissions": ["storage", "tabs", "alarms"],
   "host_permissions": [
     "https://relay.amazon.com/*",
     "https://*.relay.amazon.com/*",
@@ -18,6 +18,10 @@
       "128": "icons/icon128.png"
     }
   },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
   "background": {
     "service_worker": "background/service-worker.js",
     "type": "module"
@@ -25,8 +29,14 @@
   "content_scripts": [
     {
       "matches": ["https://relay.amazon.com/*", "https://*.relay.amazon.com/*"],
-      "js": ["content/relay-collector.js"],
-      "run_at": "document_idle"
+      "js": ["content/injected.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://relay.amazon.com/*", "https://*.relay.amazon.com/*"],
+      "js": ["content/content.js"],
+      "run_at": "document_start"
     }
   ],
   "icons": {

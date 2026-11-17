@@ -44,7 +44,7 @@ function render(state) {
     : '';
   $('sync-detail').textContent =
     (prog.detail ||
-      `Typical full pass ${prog.typicalSeconds || '45–90'}s. Keep using Relay while sync runs.`) +
+      'Passive JSON capture on Relay Trips. Open options to download raw captures.') +
     durationNote +
     weeks;
 
@@ -52,7 +52,7 @@ function render(state) {
     const st = state.sections?.[section.id]?.state || 'Not checked';
     const note =
       st === 'Synced'
-        ? ' <span class="hint-inline" title="Page scrape OK. CRM rows only change when Edge upserts succeed (see Inserted/Updated/Errors).">· scrape OK</span>'
+        ? ' <span class="hint-inline" title="API capture OK. CRM rows only change when Edge upserts succeed (see Inserted/Updated/Errors).">· capture OK</span>'
         : '';
     return `<li><span>${section.label}</span><span class="badge ${badgeClass(st)}">${st}</span>${note}</li>`;
   }).join('');

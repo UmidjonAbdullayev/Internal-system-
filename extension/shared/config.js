@@ -16,11 +16,12 @@ export const RELAY_TELEGRAM_FN = `${SUPABASE_URL}/functions/v1/relay-telegram`;
 export const EXT_USERNAME = 'admin';
 export const EXT_PASSWORD = 'qwerty';
 
+export const DEBUG = true;
+
 export const SECTIONS = [
   {
     id: 'tours',
     label: 'Tours / My Loads',
-    // Relay SPA: /trips, /trips/upcoming|in-transit|history (board — not detail)
     urlHints: [
       '/trips/upcoming',
       '/trips/in-transit',
@@ -38,23 +39,21 @@ export const SECTIONS = [
       '/my-loads',
     ],
     required: true,
-    collects:
-      'trip/load ids, tractor, trailer, driver, pay, trip_bucket, status_bar, CRM dates/locations',
+    collects: 'trip/load ids, tractor, trailer, driver, pay, trip_bucket, stops via API capture',
   },
   {
     id: 'load_detail',
     label: 'Load detail',
-    // True detail URLs only (…/trips/T-XXXX). Board paths handled as tours.
     urlHints: ['/tour/t-', '/tours/t-', '/trip/t-', '/trips/t-', '/load/'],
     required: false,
-    collects: 'trailer, tractor, miles, additional charges, detailed status',
+    collects: 'trailer, tractor, miles, stop detail from captured JSON',
   },
   {
     id: 'payments',
     label: 'Payment information',
     urlHints: ['/payment', '/settlement', '/invoice'],
     required: true,
-    collects: 'payment_status, payment_date, settlement amounts',
+    collects: 'payment_status, payment_date, settlement amounts (when JSON captured)',
   },
 ];
 
@@ -65,66 +64,34 @@ export function isTripsBoardUrl(url) {
   return /\/trips?(?:\/(?:upcoming|in[_-]?transit|history|active|all|list)?)?(?:[/?#]|$)/i.test(u);
 }
 
-export const STALE_AFTER_MS = 36 * 60 * 60 * 1000;
 export const TAB_SCAN_ALARM = 'relay-tab-scan';
 export const SYNC_ALARM = 'relay-sync-flush';
 export const PAYMENTS_SCAN_ALARM = 'relay-payments-scan';
+export const CAPTURE_FLUSH_ALARM = 'relay-capture-flush';
 
-/**
- * Soft / stealth pacing (human-like, non-blocking).
- * Trips scan ~every 4–6 min with jitter; payments ~every 20–30 min.
- * Full Trips+History pass typically takes 45–90s depending on expand count.
- */
-export const TRIPS_SCAN_BASE_MINUTES = 4;
-export const TRIPS_SCAN_JITTER_MINUTES = 2;
-export const PAYMENTS_SCAN_BASE_MINUTES = 20;
-export const PAYMENTS_SCAN_JITTER_MINUTES = 10;
-export const SYNC_FLUSH_MINUTES = 2;
-export const TYPICAL_FULL_SYNC_SECONDS = '45–90';
+/** Raw JSON capture ring buffer. */
+export const MAX_RAW_CAPTURES = 200;
 
-/** Auto-expand Trips rows for trailer/tractor/stop detail.
- * Active boards need a higher budget so ~15 In Transit rows all get places/driver.
- * History keeps a smaller share so it cannot starve active expands.
- */
-/** Safe expand: wait for legs (Trailer/Tractor/Arrival/Sch.) after toggle/chevron. */
-export const EXPAND_DELAY_MS = 650;
-export const EXPAND_COLLAPSE_DELAY_MS = 220;
-export const EXPAND_JITTER_MS = 300;
-export const MAX_EXPAND_PER_SCAN = 28;
-export const MAX_EXPAND_ACTIVE = 22;
-export const MAX_EXPAND_HISTORY = 6;
-export const NEAR_LIVE_MAX_EXPAND = 8;
-export const DETAIL_SCRAPE_TTL_MS = 6 * 60 * 60 * 1000;
-export const TAB_SWITCH_DELAY_MS = 1100;
-export const TAB_SWITCH_JITTER_MS = 500;
-export const HISTORY_WEEK_SETTLE_MS = 1400;
-/** Scroll virtualized Trips lists until row count stabilizes. */
-export const LIST_SCROLL_MAX_PASSES = 28;
-export const LIST_SCROLL_SETTLE_MS = 380;
-export const LIST_SCROLL_STABLE_ROUNDS = 2;
+/** Batch new/changed trips to CRM every 5s or 50 trips. */
+export const CAPTURE_BATCH_MS = 5000;
+export const CAPTURE_BATCH_SIZE = 50;
 
-/** Skip re-scraping payments if last collection was within this window (unless force). */
-export const PAYMENTS_MIN_INTERVAL_MS = 18 * 60 * 1000;
+/** Details refetch for trips missing stops (background, same cookies). */
+export const DETAILS_MAX_PER_SECOND = 1;
 
-/**
- * Soft-scan safety: hard timeouts so a hung Payments scrape / Edge flush
- * cannot leave the popup stuck on "busy" and block Trips forever.
- * Flush was timing out at 45s under concurrent 70+ row payloads (expand→sync).
- */
-export const SOFT_SCAN_HARD_TIMEOUT_MS = 180 * 1000;
-export const COLLECT_TAB_TIMEOUT_MS = 120 * 1000;
+/** Flush / retry. */
+export const SYNC_FLUSH_MINUTES = 1;
 export const FLUSH_TIMEOUT_MS = 90 * 1000;
 export const FLUSH_BATCH_SIZE = 20;
-export const PAYMENTS_COLLECT_TIMEOUT_MS = 60 * 1000;
+export const FLUSH_BACKOFF_BASE_MS = 2000;
+export const FLUSH_BACKOFF_MAX_MS = 60000;
 
-/**
- * Near-live Trips (Upcoming + In Transit only): MutationObserver / network
- * hooks debounce into an incremental sync. History + Payments stay on soft cadence.
- */
-export const NEAR_LIVE_DEBOUNCE_MS = 2800;
-export const NEAR_LIVE_DEBOUNCE_JITTER_MS = 1800;
-export const NEAR_LIVE_MIN_INTERVAL_MS = 8 * 1000;
-export const NEAR_LIVE_FLUSH_DEBOUNCE_MS = 1500;
+export const TYPICAL_FULL_SYNC_SECONDS = 'passive';
 
-/** History skip: keep local cache entries this long before forcing a refresh expand. */
+/** History skip cache TTL. */
 export const HISTORY_SKIP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Storage keys (alongside relayState). */
+export const RAW_CAPTURES_KEY = 'relayRawCaptures';
+export const TRIP_HASH_KEY = 'relayTripHashes';
+export const DETAILS_PATTERN_KEY = 'relayDetailsPatterns';

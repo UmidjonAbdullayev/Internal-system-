@@ -1,0 +1,81 @@
+:root {
+  color-scheme: light;
+  --bg: #f3f5f8;
+  --card: #fff;
+  --ink: #1a2332;
+  --muted: #5a6b7d;
+  --accent: #1f6feb;
+  --line: #d8dee8;
+  font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(160deg, #e8eef6 0%, #f3f5f8 45%, #eef2f7 100%);
+  color: var(--ink);
+  min-height: 100vh;
+}
+
+main {
+  max-width: 40rem;
+  margin: 2.5rem auto;
+  padding: 1.5rem 1.75rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.35rem;
+  font-weight: 650;
+}
+
+.sub {
+  margin: 0 0 1.25rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+p {
+  line-height: 1.45;
+  font-size: 0.92rem;
+}
+
+.stats {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  background: #f0f4fa;
+  padding: 0.65rem 0.75rem;
+  border-radius: 6px;
+}
+
+button {
+  margin-top: 0.5rem;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 0.55rem 1rem;
+  font-size: 0.92rem;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.05);
+}
+
+.status {
+  min-height: 1.2em;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+code {
+  font-size: 0.85em;
+}
