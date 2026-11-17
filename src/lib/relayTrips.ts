@@ -415,6 +415,10 @@ export function ratePerMile(trip: RelayTrip): number | null {
   return null;
 }
 
+/**
+ * CPT risk only when CHECKOUT actualTime is missing AND CPT has passed.
+ * (Spec: no CPT banner while still within CPT window.)
+ */
 export function cptWarning(
   stop: RelayStop,
   leg: RelayLeg | null,
@@ -423,22 +427,34 @@ export function cptWarning(
   const cpt = ms(leg?.cpt || null);
   if (cpt == null) return null;
   if (stop.actualDeparture) return null;
-  const diff = cpt - now;
-  if (diff < 0) return 'CPT passed — not departed';
-  if (diff <= 30 * 60 * 1000) return 'CPT within 30 minutes';
-  return null;
+  if (cpt >= now) return null;
+  return 'CPT passed — not departed';
 }
 
 export function timeSourceLabel(stop: RelayStop, kind: 'arrival' | 'departure'): string {
   if (kind === 'arrival') {
+    if (stop.arrivalTimeSource) return stop.arrivalTimeSource;
     if (stop.actualArrival) return 'Actual';
     if (stop.eta) return 'ETA';
     if (stop.scheduledArrival) return 'Scheduled';
   } else {
+    if (stop.departureTimeSource) return stop.departureTimeSource;
     if (stop.actualDeparture) return 'Actual';
     if (stop.scheduledDeparture) return 'Scheduled';
   }
   return '';
+}
+
+/** Minutes late (positive) when actual is after scheduled; null if not computable. */
+export function minutesLate(
+  actualIso: string | null | undefined,
+  scheduledIso: string | null | undefined,
+): number | null {
+  const a = ms(actualIso || null);
+  const s = ms(scheduledIso || null);
+  if (a == null || s == null) return null;
+  const diffMin = Math.round((a - s) / 60000);
+  return diffMin > 0 ? diffMin : null;
 }
 
 export function legLoadTypeLabel(leg: RelayLeg): string {
