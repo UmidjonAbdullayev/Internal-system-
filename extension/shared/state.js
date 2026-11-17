@@ -81,6 +81,27 @@ const DEFAULT_STATE = {
   },
   hasRequestTemplate: false,
   alwaysOnTabId: null,
+  /** Per-tab template source for popup verify */
+  templateMeta: {
+    IN_TRANSIT: { source: null, at: null, label: null },
+    UPCOMING: { source: null, at: null, label: null },
+    HISTORY: { source: null, at: null, label: null },
+  },
+  /** Set when UPCOMING∩IN_TRANSIT trip IDs overlap */
+  templateWrong: {
+    UPCOMING: false,
+    IN_TRANSIT: false,
+    message: null,
+    overlapIds: [],
+    at: null,
+  },
+  historyBackfillProgress: {
+    week: 0,
+    totalWeeks: 0,
+    trips: 0,
+    label: null,
+  },
+  inTransitCaptureNavAt: null,
   /** Per section { relay, crm, mismatch } from snapshot response */
   sectionCounts: {
     IN_TRANSIT: { relay: 0, crm: 0, mismatch: false },
@@ -139,6 +160,41 @@ export async function getState() {
     startedAt: null,
     ...(merged.catchUp || {}),
   };
+  merged.templateMeta = {
+    IN_TRANSIT: {
+      source: null,
+      at: null,
+      label: null,
+      ...(merged.templateMeta?.IN_TRANSIT || {}),
+    },
+    UPCOMING: {
+      source: null,
+      at: null,
+      label: null,
+      ...(merged.templateMeta?.UPCOMING || {}),
+    },
+    HISTORY: {
+      source: null,
+      at: null,
+      label: null,
+      ...(merged.templateMeta?.HISTORY || {}),
+    },
+  };
+  merged.templateWrong = {
+    UPCOMING: false,
+    IN_TRANSIT: false,
+    message: null,
+    overlapIds: [],
+    at: null,
+    ...(merged.templateWrong || {}),
+  };
+  merged.historyBackfillProgress = {
+    week: 0,
+    totalWeeks: 0,
+    trips: 0,
+    label: null,
+    ...(merged.historyBackfillProgress || {}),
+  };
   return merged;
 }
 
@@ -175,6 +231,22 @@ export async function setState(patch) {
       IN_TRANSIT: { ...current.sectionCounts.IN_TRANSIT, ...(patch.sectionCounts.IN_TRANSIT || {}) },
       UPCOMING: { ...current.sectionCounts.UPCOMING, ...(patch.sectionCounts.UPCOMING || {}) },
       HISTORY: { ...current.sectionCounts.HISTORY, ...(patch.sectionCounts.HISTORY || {}) },
+    };
+  }
+  if (patch.templateMeta) {
+    next.templateMeta = {
+      IN_TRANSIT: { ...current.templateMeta.IN_TRANSIT, ...(patch.templateMeta.IN_TRANSIT || {}) },
+      UPCOMING: { ...current.templateMeta.UPCOMING, ...(patch.templateMeta.UPCOMING || {}) },
+      HISTORY: { ...current.templateMeta.HISTORY, ...(patch.templateMeta.HISTORY || {}) },
+    };
+  }
+  if (patch.templateWrong) {
+    next.templateWrong = { ...current.templateWrong, ...patch.templateWrong };
+  }
+  if (patch.historyBackfillProgress) {
+    next.historyBackfillProgress = {
+      ...current.historyBackfillProgress,
+      ...patch.historyBackfillProgress,
     };
   }
   await chrome.storage.local.set({ relayState: next });

@@ -97,8 +97,18 @@ export const HISTORY_SKIP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const RAW_CAPTURES_KEY = 'relayRawCaptures';
 export const TRIP_HASH_KEY = 'relayTripHashes';
+/** @deprecated — single shared template; use REQUEST_TEMPLATES_KEY */
 export const REQUEST_TEMPLATE_KEY = 'relayRequestTemplate';
+/** Per-tab entitiesV2 templates: { UPCOMING|IN_TRANSIT|HISTORY: { body, headers, at, source } } */
+export const REQUEST_TEMPLATES_KEY = 'relayRequestTemplates';
 export const SECTION_SNAPSHOT_KEY = 'relaySectionSnapshots';
+export const SECTION_TRIP_IDS_KEY = 'relaySectionTripIds';
+export const HISTORY_BACKFILL_KEY = 'relayHistoryBackfill';
 export const SYNC_LOCK_KEY = 'relaySyncLock';
-/** @deprecated — migrated into REQUEST_TEMPLATE_KEY */
+/** @deprecated — migrated into REQUEST_TEMPLATE_KEY / REQUEST_TEMPLATES_KEY */
 export const LAST_ENTITIES_REQ_KEY = 'relayLastEntitiesRequest';
+
+/** Default timezone for HISTORY / UPCOMING date windows. */
+export const RELAY_TIMEZONE = 'Asia/Tashkent';
+/** Navigate once to seed IN_TRANSIT template (no built-in fallback). */
+export const RELAY_IN_TRANSIT_URL = 'https://relay.amazon.com/tours/in-transit';

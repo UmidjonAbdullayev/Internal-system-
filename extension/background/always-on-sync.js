@@ -6,6 +6,8 @@ import {
   DEBUG,
   ENTITIES_V2_URL,
   RELAY_TRIPS_URL,
+  RELAY_IN_TRANSIT_URL,
+  RELAY_TIMEZONE,
   PAGE_SIZE,
   MIN_REQUEST_GAP_MS,
   HISTORY_PAGE_GAP_MS,
@@ -19,16 +21,29 @@ import {
   HTTP_BACKOFF_BASE_MS,
   HTTP_BACKOFF_MAX_MS,
   REQUEST_TEMPLATE_KEY,
+  REQUEST_TEMPLATES_KEY,
   SECTION_SNAPSHOT_KEY,
+  SECTION_TRIP_IDS_KEY,
+  HISTORY_BACKFILL_KEY,
   SYNC_LOCK_KEY,
   LAST_ENTITIES_REQ_KEY,
   ALWAYS_ON_ALARM,
 } from '../shared/config.js';
 import { getState, setState } from '../shared/state.js';
 import { extractTrips, tripContentHashPayload, hashString } from '../shared/extract.js';
+import {
+  buildTabRequestBody,
+  fallbackTemplate,
+  listHistoryBackfillWindows,
+  historyWindowContaining,
+  isFirst24hOfHistoryWeek,
+  crossCheckTripSection,
+  DEFAULT_TIMEZONE,
+} from '../shared/templates.js';
 
 const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
 const TABS = ['IN_TRANSIT', 'UPCOMING', 'HISTORY'];
+const TIMEZONE = RELAY_TIMEZONE || DEFAULT_TIMEZONE;
 
 let requestInFlight = false;
 let lastRequestAt = 0;
@@ -84,31 +99,256 @@ export function stripCookieHeaders(headers) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
     if (/^cookie$/i.test(k) || /^set-cookie$/i.test(k)) continue;
+    if (/^content-length$/i.test(k)) continue;
     if (v != null) out[k] = String(v);
   }
   return out;
 }
 
+/** @deprecated Prefer saveTabRequestTemplate — kept for callers during migration. */
 export async function saveRequestTemplate(body, headers, meta = {}) {
-  if (!body || typeof body !== 'object') return false;
+  const tab = body?.tileCountTab;
+  if (tab) return saveTabRequestTemplate(tab, body, headers, meta);
+  return false;
+}
+
+/**
+ * Store one full request body (+ headers) per tab. Never copies another tab's body.
+ */
+export async function saveTabRequestTemplate(tileCountTab, body, headers, meta = {}) {
+  const tab = String(tileCountTab || body?.tileCountTab || '').toUpperCase();
+  if (!TABS.includes(tab) || !body || typeof body !== 'object') return false;
+  const stored = await chrome.storage.local.get([REQUEST_TEMPLATES_KEY]);
+  const map = { ...(stored[REQUEST_TEMPLATES_KEY] || {}) };
   const template = {
     body: JSON.parse(JSON.stringify(body)),
     headers: stripCookieHeaders(headers || {}),
     url: ENTITIES_V2_URL,
     at: meta.at || new Date().toISOString(),
     pageUrl: meta.pageUrl || null,
+    source: 'live',
   };
+  // Ensure stored body keeps its own tileCountTab
+  template.body.tileCountTab = tab;
+  map[tab] = template;
   await chrome.storage.local.set({
+    [REQUEST_TEMPLATES_KEY]: map,
+    // Compat: keep last-written as legacy single key
     [REQUEST_TEMPLATE_KEY]: template,
     [LAST_ENTITIES_REQ_KEY]: template,
   });
-  await setState({ hasRequestTemplate: true });
+  const hasAny = TABS.some((t) => map[t]?.body || fallbackTemplate(t)?.body);
+  await setState({
+    hasRequestTemplate: hasAny,
+    templateMeta: {
+      ...(await getTemplateMetaFromState()),
+      [tab]: {
+        source: 'live',
+        at: template.at,
+        label: formatTemplateSourceLabel('live', template.at),
+      },
+    },
+  });
   return true;
 }
 
+async function getTemplateMetaFromState() {
+  const state = await getState();
+  return state.templateMeta || {};
+}
+
+export function formatTemplateSourceLabel(source, atIso) {
+  if (source === 'fallback') return 'fallback';
+  if (!atIso) return 'live capture';
+  try {
+    const d = new Date(atIso);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `live capture ${hh}:${mm}`;
+  } catch {
+    return 'live capture';
+  }
+}
+
+export async function getAllTabTemplates() {
+  const stored = await chrome.storage.local.get([
+    REQUEST_TEMPLATES_KEY,
+    REQUEST_TEMPLATE_KEY,
+    LAST_ENTITIES_REQ_KEY,
+  ]);
+  return stored[REQUEST_TEMPLATES_KEY] || {};
+}
+
+/**
+ * Resolve template for one tab: live capture → built-in fallback (HISTORY/UPCOMING only).
+ * IN_TRANSIT has no fallback — returns null when missing.
+ */
+export async function resolveTabTemplate(tileCountTab) {
+  const tab = String(tileCountTab || '').toUpperCase();
+  const map = await getAllTabTemplates();
+  if (map[tab]?.body) {
+    return {
+      ...map[tab],
+      source: map[tab].source || 'live',
+    };
+  }
+  const fb = fallbackTemplate(tab);
+  if (fb) return fb;
+  return null;
+}
+
+/** @deprecated Any-template check; prefer resolveTabTemplate per tab. */
 export async function getRequestTemplate() {
+  for (const tab of TABS) {
+    const t = await resolveTabTemplate(tab);
+    if (t?.body) return t;
+  }
   const stored = await chrome.storage.local.get([REQUEST_TEMPLATE_KEY, LAST_ENTITIES_REQ_KEY]);
   return stored[REQUEST_TEMPLATE_KEY] || stored[LAST_ENTITIES_REQ_KEY] || null;
+}
+
+/**
+ * SEAM for transport / other workers: build the exact entitiesV2 POST body for a tab.
+ * Deep-clones template; applies date windows + now-timestamp refresh. Never mutates storage.
+ *
+ * @returns {{ ok: true, body, headers, templateMeta } | { ok: false, error, needCapture?: boolean }}
+ */
+export async function buildRequestBody(tileCountTab, { from = 0, size = PAGE_SIZE, historyWindow = null, now = new Date() } = {}) {
+  const tab = String(tileCountTab || '').toUpperCase();
+  const template = await resolveTabTemplate(tab);
+  if (!template?.body) {
+    return {
+      ok: false,
+      error: 'no_template',
+      needCapture: tab === 'IN_TRANSIT',
+    };
+  }
+  const built = buildTabRequestBody(tab, template, {
+    from,
+    size,
+    now,
+    timeZone: TIMEZONE,
+    historyWindow,
+  });
+  if (!built.ok) return { ok: false, error: built.error || 'build_failed' };
+  return {
+    ok: true,
+    body: built.body,
+    headers: stripCookieHeaders(template.headers || {}),
+    url: template.url || ENTITIES_V2_URL,
+    templateMeta: {
+      source: template.source || 'fallback',
+      at: template.at || null,
+      label: formatTemplateSourceLabel(template.source || 'fallback', template.at),
+    },
+  };
+}
+
+async function loadHistoryBackfill() {
+  const stored = await chrome.storage.local.get([HISTORY_BACKFILL_KEY]);
+  return (
+    stored[HISTORY_BACKFILL_KEY] || {
+      done: false,
+      windowIndex: 0,
+      from: 0,
+      tripsAccum: 0,
+      totalWindows: 0,
+    }
+  );
+}
+
+async function saveHistoryBackfill(progress) {
+  await chrome.storage.local.set({ [HISTORY_BACKFILL_KEY]: progress });
+}
+
+async function loadSectionTripIds() {
+  const stored = await chrome.storage.local.get([SECTION_TRIP_IDS_KEY]);
+  return (
+    stored[SECTION_TRIP_IDS_KEY] || {
+      IN_TRANSIT: [],
+      UPCOMING: [],
+      HISTORY: [],
+    }
+  );
+}
+
+async function saveSectionTripIds(map) {
+  await chrome.storage.local.set({ [SECTION_TRIP_IDS_KEY]: map });
+}
+
+/**
+ * If UPCOMING and IN_TRANSIT share trip IDs → template wrong; flag + request re-capture.
+ * Returns { overlapIds, templateWrong }.
+ */
+export async function checkLiveSectionOverlap(tileCountTab, tripIds) {
+  const map = await loadSectionTripIds();
+  map[tileCountTab] = tripIds.map((id) => String(id || '').toUpperCase()).filter(Boolean);
+  await saveSectionTripIds(map);
+
+  const a = new Set(map.UPCOMING || []);
+  const b = new Set(map.IN_TRANSIT || []);
+  const overlapIds = [...a].filter((id) => b.has(id));
+  const templateWrong = overlapIds.length > 0;
+
+  if (templateWrong) {
+    const wrongFor = [];
+    if (tileCountTab === 'UPCOMING' || tileCountTab === 'IN_TRANSIT') wrongFor.push(tileCountTab);
+    // Flag both live tabs when overlap exists
+    await setState({
+      templateWrong: {
+        UPCOMING: true,
+        IN_TRANSIT: true,
+        message: `template wrong for ${wrongFor.join(' / ') || 'live tabs'} — re-capture; CRM not overwritten`,
+        overlapIds: overlapIds.slice(0, 20),
+        at: new Date().toISOString(),
+      },
+    });
+    // Drop live templates so next tick re-captures
+    const templates = await getAllTabTemplates();
+    delete templates.UPCOMING;
+    delete templates.IN_TRANSIT;
+    await chrome.storage.local.set({ [REQUEST_TEMPLATES_KEY]: templates });
+  } else if (tileCountTab === 'UPCOMING' || tileCountTab === 'IN_TRANSIT') {
+    const state = await getState();
+    if (state.templateWrong?.UPCOMING || state.templateWrong?.IN_TRANSIT) {
+      await setState({
+        templateWrong: {
+          UPCOMING: false,
+          IN_TRANSIT: false,
+          message: null,
+          overlapIds: [],
+          at: null,
+        },
+      });
+    }
+  }
+
+  return { overlapIds, templateWrong };
+}
+
+/** Navigate pinned sync tab to In Transit once so Relay emits a captureable entitiesV2. */
+export async function ensureInTransitCapture(tabId) {
+  const state = await getState();
+  if (state.inTransitCaptureNavAt) {
+    const age = Date.now() - Date.parse(state.inTransitCaptureNavAt);
+    if (Number.isFinite(age) && age < 5 * 60 * 1000) {
+      return { ok: false, skipped: 'recent_nav' };
+    }
+  }
+  try {
+    await chrome.tabs.update(tabId, { url: RELAY_IN_TRANSIT_URL, active: false });
+    await setState({
+      inTransitCaptureNavAt: new Date().toISOString(),
+      syncProgress: {
+        phase: 'waiting-template',
+        detail: 'Navigating Relay In Transit once to capture IN_TRANSIT filter body…',
+        percent: 18,
+      },
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
 }
 
 async function getLock() {
@@ -223,11 +463,23 @@ async function waitRequestGap(extraMs = 0) {
 
 /**
  * Single entitiesV2 POST via page MAIN world.
+ * Body comes from buildRequestBody (per-tab template + windows) — transport unchanged.
  */
-export async function fetchEntitiesPage(tabId, tileCountTab, from, size = PAGE_SIZE) {
-  const template = await getRequestTemplate();
-  if (!template?.body) {
-    return { ok: false, error: 'no_template', authRequired: false };
+export async function fetchEntitiesPage(
+  tabId,
+  tileCountTab,
+  from,
+  size = PAGE_SIZE,
+  { historyWindow = null } = {},
+) {
+  const built = await buildRequestBody(tileCountTab, { from, size, historyWindow });
+  if (!built.ok) {
+    return {
+      ok: false,
+      error: built.error || 'no_template',
+      needCapture: Boolean(built.needCapture),
+      authRequired: false,
+    };
   }
 
   await waitRequestGap();
@@ -238,23 +490,15 @@ export async function fetchEntitiesPage(tabId, tileCountTab, from, size = PAGE_S
   lastRequestAt = Date.now();
 
   try {
-    const body = {
-      ...template.body,
-      tileCountTab,
-      pagination: {
-        ...(template.body.pagination || {}),
-        size,
-        from,
-      },
-    };
+    const body = built.body;
 
     let result;
     try {
       result = await chrome.tabs.sendMessage(tabId, {
         type: 'RELAY_FETCH_ENTITIES_V2',
-        url: template.url || ENTITIES_V2_URL,
+        url: built.url || ENTITIES_V2_URL,
         body,
-        headers: template.headers || {},
+        headers: built.headers || {},
       });
     } catch (err) {
       return { ok: false, error: String(err?.message || err) };
@@ -276,12 +520,24 @@ export async function fetchEntitiesPage(tabId, tileCountTab, from, size = PAGE_S
 
     httpBackoffMs = HTTP_BACKOFF_BASE_MS;
     await hooks.onHealthy();
+
+    // Persist template source label for popup verify
+    if (built.templateMeta) {
+      await setState({
+        templateMeta: {
+          ...(await getTemplateMetaFromState()),
+          [tileCountTab]: built.templateMeta,
+        },
+      });
+    }
+
     return {
       ok: true,
       data: result.data,
       requestBody: body,
       totalRecords: Number(result.data?.totalRecords) || 0,
       entities: Array.isArray(result.data?.entities) ? result.data.entities : [],
+      templateMeta: built.templateMeta,
     };
   } finally {
     requestInFlight = false;
@@ -357,35 +613,68 @@ export async function diffSectionTrips(tileCountTab, trips) {
 }
 
 /**
- * Fetch all pages for a tab (or HISTORY page1-only / backfill / catch-up).
+ * Fetch all pages for a tab (or HISTORY window / catch-up).
  * catchUp: page HISTORY newest-first until older than untilIso or all missing found.
+ * historyWindow: optional { startISO, endISO } for HISTORY date window.
  */
 export async function syncSection(
   tabId,
   tileCountTab,
-  { page1Only = false, catchUp = false, catchUpUntilIso = null, missingTripIds = [] } = {},
+  {
+    page1Only = false,
+    catchUp = false,
+    catchUpUntilIso = null,
+    missingTripIds = [],
+    historyWindow = null,
+    startFrom = 0,
+    onPageProgress = null,
+  } = {},
 ) {
   const state = await getState();
   if (state.health?.pausedUntil && Date.parse(state.health.pausedUntil) > Date.now()) {
     return { ok: false, skipped: 'paused' };
   }
 
+  // Require a real per-tab body (IN_TRANSIT has no fallback)
+  const resolved = await resolveTabTemplate(tileCountTab);
+  if (!resolved?.body) {
+    if (tileCountTab === 'IN_TRANSIT') {
+      await ensureInTransitCapture(tabId);
+    }
+    await setState({
+      sectionSync: {
+        [tileCountTab]: {
+          lastError:
+            tileCountTab === 'IN_TRANSIT'
+              ? 'no IN_TRANSIT template — navigate Relay In Transit to capture'
+              : 'no_template',
+          lastSyncAt: new Date().toISOString(),
+        },
+      },
+    });
+    return { ok: false, error: 'no_template', needCapture: tileCountTab === 'IN_TRANSIT' };
+  }
+
   const allTrips = [];
   let pages = 0;
-  let from = 0;
+  let from = Math.max(0, Number(startFrom) || 0);
   let totalRecords = Infinity;
   const stillMissing = new Set(
     (missingTripIds || []).map((id) => String(id || '').toUpperCase()).filter(Boolean),
   );
   const foundIds = [];
   const untilMs = catchUpUntilIso ? Date.parse(catchUpUntilIso) : null;
+  const mismatches = [];
 
   for (;;) {
     if (!(await getState()).live) return { ok: false, skipped: 'stopped' };
 
     const gap = tileCountTab === 'HISTORY' ? HISTORY_PAGE_GAP_MS : MIN_REQUEST_GAP_MS;
-    const page = await fetchEntitiesPage(tabId, tileCountTab, from, PAGE_SIZE);
+    const page = await fetchEntitiesPage(tabId, tileCountTab, from, PAGE_SIZE, { historyWindow });
     if (!page.ok) {
+      if (page.needCapture && tileCountTab === 'IN_TRANSIT') {
+        await ensureInTransitCapture(tabId);
+      }
       await setState({
         sectionSync: {
           [tileCountTab]: {
@@ -400,7 +689,21 @@ export async function syncSection(
     pages += 1;
     totalRecords = page.totalRecords || totalRecords;
     const trips = extractTrips(ENTITIES_V2_URL, page.data, page.requestBody);
+    for (const t of trips) {
+      // Section assignment = tab whose request returned it
+      t.tab = tileCountTab;
+      t.section = String(tileCountTab || '').toLowerCase();
+      const check = crossCheckTripSection(tileCountTab, t);
+      if (!check.ok) {
+        mismatches.push({ tripId: t.tripId, reason: check.reason });
+        log(`section mismatch ${tileCountTab} trip=${t.tripId}: ${check.reason}`);
+      }
+    }
     allTrips.push(...trips);
+
+    if (typeof onPageProgress === 'function') {
+      await onPageProgress({ from, pages, trips: allTrips.length, totalRecords, page });
+    }
 
     if (catchUp && tileCountTab === 'HISTORY') {
       for (const t of trips) {
@@ -430,27 +733,64 @@ export async function syncSection(
     if (got < PAGE_SIZE) break;
     from += PAGE_SIZE;
     if (from >= totalRecords) break;
-    // HISTORY backfill: enforce 2s between pages (waitRequestGap also applies)
+    // HISTORY: enforce 2s between pages
     await waitRequestGap(gap);
+  }
+
+  const uniqueIds = [
+    ...new Set(allTrips.map((t) => String(t.tripId || '').toUpperCase()).filter(Boolean)),
+  ];
+  const reportedTotal =
+    Number.isFinite(totalRecords) && totalRecords !== Infinity ? Number(totalRecords) : uniqueIds.length;
+
+  // Live overlap → template wrong; do not overwrite CRM
+  let skipCrm = false;
+  if (tileCountTab === 'UPCOMING' || tileCountTab === 'IN_TRANSIT') {
+    const overlap = await checkLiveSectionOverlap(tileCountTab, uniqueIds);
+    if (overlap.templateWrong) {
+      skipCrm = true;
+      await setState({
+        sectionSync: {
+          [tileCountTab]: {
+            lastSyncAt: new Date().toISOString(),
+            lastError: `template wrong for ${tileCountTab} — overlap ${overlap.overlapIds.length} trip(s); re-capture`,
+            trips: uniqueIds.length,
+            pages,
+          },
+        },
+      });
+      return {
+        ok: false,
+        error: 'template_wrong',
+        templateWrong: true,
+        overlapIds: overlap.overlapIds,
+        trips: uniqueIds.length,
+        pages,
+        totalRecords: reportedTotal,
+      };
+    }
   }
 
   const diff = await diffSectionTrips(tileCountTab, allTrips);
   log(
     `tab=${tileCountTab} pages=${pages} trips=${diff.stats.trips} new=${diff.stats.newCount} changed=${diff.stats.changedCount} removed=${diff.stats.removedCount}${
       catchUp ? ` catchUpFound=${foundIds.length} stillMissing=${stillMissing.size}` : ''
-    }`,
+    }${mismatches.length ? ` mismatches=${mismatches.length}` : ''}`,
   );
 
   await setState({
     sectionSync: {
       [tileCountTab]: {
         lastSyncAt: new Date().toISOString(),
-        lastError: null,
+        lastError: mismatches.length
+          ? `section mismatch ×${mismatches.length}: ${mismatches[0].reason}`
+          : null,
         trips: diff.stats.trips,
         pages,
         newCount: diff.stats.newCount,
         changedCount: diff.stats.changedCount,
         removedCount: diff.stats.removedCount,
+        totalRecords: reportedTotal,
       },
     },
     lastTripsScanAt: new Date().toISOString(),
@@ -462,15 +802,9 @@ export async function syncSection(
     });
   }
 
-  const uniqueIds = [
-    ...new Set(allTrips.map((t) => String(t.tripId || '').toUpperCase()).filter(Boolean)),
-  ];
-  const reportedTotal =
-    Number.isFinite(totalRecords) && totalRecords !== Infinity ? Number(totalRecords) : uniqueIds.length;
-
-  // Snapshot only after full pagination (all pages), error-free, counts match — not during catch-up pages
+  // Snapshot only after full pagination, counts match — use totalRecords / entitiesInResponse
   let snapshot = null;
-  if (!page1Only && !catchUp) {
+  if (!page1Only && !catchUp && !skipCrm) {
     if (uniqueIds.length !== reportedTotal) {
       log(
         `snapshot SKIP ${tileCountTab}: unique tripIds=${uniqueIds.length} != totalRecords=${reportedTotal}`,
@@ -489,22 +823,25 @@ export async function syncSection(
     ? allTrips.filter((t) => foundIds.includes(String(t.tripId || '').toUpperCase()))
     : allTrips;
 
-  await hooks.onTripsDiff({
-    tileCountTab,
-    trips: tripsForPush.length ? tripsForPush : allTrips,
-    newTrips: diff.newTrips,
-    changedTrips: diff.changedTrips,
-    removedTripIds: diff.removedTripIds,
-    changedFieldsMap: diff.changedFieldsMap,
-    pages,
-    page1Only: Boolean(page1Only),
-    totalRecords: reportedTotal,
-    snapshot,
-    fetchHadError: false,
-    catchUp: Boolean(catchUp),
-    catchUpFoundIds: foundIds,
-    catchUpStillMissing: [...stillMissing],
-  });
+  if (!skipCrm) {
+    await hooks.onTripsDiff({
+      tileCountTab,
+      trips: tripsForPush.length ? tripsForPush : allTrips,
+      newTrips: diff.newTrips,
+      changedTrips: diff.changedTrips,
+      removedTripIds: diff.removedTripIds,
+      changedFieldsMap: diff.changedFieldsMap,
+      pages,
+      page1Only: Boolean(page1Only),
+      totalRecords: reportedTotal,
+      snapshot,
+      fetchHadError: false,
+      catchUp: Boolean(catchUp),
+      catchUpFoundIds: foundIds,
+      catchUpStillMissing: [...stillMissing],
+      sectionMismatches: mismatches,
+    });
+  }
 
   return {
     ok: true,
@@ -513,8 +850,126 @@ export async function syncSection(
     snapshot,
     catchUpFoundIds: foundIds,
     catchUpStillMissing: [...stillMissing],
+    sectionMismatches: mismatches,
+    skipCrm,
     ...diff.stats,
   };
+}
+
+/**
+ * HISTORY: 7-day windows, 45-day backfill (newest first), resume progress; ongoing current (+ prev week first 24h).
+ */
+export async function syncHistoryWindows(tabId) {
+  const now = new Date();
+  const windows = listHistoryBackfillWindows(now, TIMEZONE);
+  let progress = await loadHistoryBackfill();
+
+  if (!progress.done) {
+    const totalWindows = windows.length;
+    let idx = Math.min(progress.windowIndex || 0, totalWindows - 1);
+    let tripsAccum = progress.tripsAccum || 0;
+
+    for (; idx < totalWindows; idx += 1) {
+      if (!(await getState()).live) return { ok: false, skipped: 'stopped' };
+      const win = windows[idx];
+      const startFrom = idx === (progress.windowIndex || 0) ? progress.from || 0 : 0;
+
+      await setState({
+        syncProgress: {
+          phase: 'history-backfill',
+          detail: `Week ${idx + 1}/${totalWindows} · ${tripsAccum} trips`,
+          percent: Math.min(95, 20 + Math.round(((idx + 0.5) / totalWindows) * 70)),
+          historyWeeks: windows.slice(0, idx + 1).map((w) => w.label),
+        },
+        historyBackfillProgress: {
+          week: idx + 1,
+          totalWeeks: totalWindows,
+          trips: tripsAccum,
+          label: `Week ${idx + 1}/${totalWindows} · ${tripsAccum} trips`,
+        },
+      });
+
+      const res = await syncSection(tabId, 'HISTORY', {
+        historyWindow: win,
+        startFrom,
+        onPageProgress: async ({ from, trips }) => {
+          await saveHistoryBackfill({
+            done: false,
+            windowIndex: idx,
+            from,
+            tripsAccum: tripsAccum + trips,
+            totalWindows,
+          });
+          await setState({
+            historyBackfillProgress: {
+              week: idx + 1,
+              totalWeeks: totalWindows,
+              trips: tripsAccum + trips,
+              label: `Week ${idx + 1}/${totalWindows} · ${tripsAccum + trips} trips`,
+            },
+            syncProgress: {
+              phase: 'history-backfill',
+              detail: `Week ${idx + 1}/${totalWindows} · ${tripsAccum + trips} trips`,
+              percent: Math.min(95, 20 + Math.round(((idx + from / 500) / totalWindows) * 70)),
+            },
+          });
+        },
+      });
+
+      if (!res.ok) {
+        await saveHistoryBackfill({
+          done: false,
+          windowIndex: idx,
+          from: startFrom,
+          tripsAccum,
+          totalWindows,
+        });
+        return res;
+      }
+
+      tripsAccum += res.trips || 0;
+      await saveHistoryBackfill({
+        done: false,
+        windowIndex: idx + 1,
+        from: 0,
+        tripsAccum,
+        totalWindows,
+      });
+      progress = await loadHistoryBackfill();
+    }
+
+    await saveHistoryBackfill({
+      done: true,
+      windowIndex: totalWindows,
+      from: 0,
+      tripsAccum,
+      totalWindows,
+      completedAt: new Date().toISOString(),
+    });
+    await setState({
+      historyBackfillDone: true,
+      historyBackfillProgress: {
+        week: totalWindows,
+        totalWeeks: totalWindows,
+        trips: tripsAccum,
+        label: `Backfill done · ${tripsAccum} trips`,
+      },
+    });
+    return { ok: true, backfill: true, trips: tripsAccum, windows: totalWindows };
+  }
+
+  // Ongoing: current window; previous window during first 24h of a new week
+  const current = historyWindowContaining(now, TIMEZONE);
+  const res = await syncSection(tabId, 'HISTORY', { historyWindow: current });
+  if (!res.ok) return res;
+
+  if (isFirst24hOfHistoryWeek(now, TIMEZONE) && windows.length > 1) {
+    const prev = windows[1];
+    const prevRes = await syncSection(tabId, 'HISTORY', { historyWindow: prev });
+    if (!prevRes.ok) return prevRes;
+    return { ok: true, ongoing: true, pages: (res.pages || 0) + (prevRes.pages || 0) };
+  }
+  return { ok: true, ongoing: true, ...res };
 }
 
 function sectionIsPaused(sectionSyncEntry) {
@@ -557,17 +1012,23 @@ export async function alwaysOnTick({ force = false } = {}) {
     startHeartbeat(lock.tabId);
     await setState({ alwaysOnTabId: lock.tabId });
 
-    const template = await getRequestTemplate();
-    if (!template?.body) {
-      log('always-on: waiting for first entitiesV2 capture to seed template');
+    // Per-tab templates: HISTORY/UPCOMING have fallbacks; IN_TRANSIT needs live capture
+    const upcomingTpl = await resolveTabTemplate('UPCOMING');
+    const historyTpl = await resolveTabTemplate('HISTORY');
+    const inTransitTpl = await resolveTabTemplate('IN_TRANSIT');
+    if (!upcomingTpl?.body && !historyTpl?.body && !inTransitTpl?.body) {
+      log('always-on: waiting for first entitiesV2 capture to seed templates');
       await setState({
         syncProgress: {
           phase: 'waiting-template',
-          detail: 'Pinned Relay tab open — waiting for first entitiesV2 response to seed template.',
+          detail: 'Pinned Relay tab open — waiting for entitiesV2 to seed per-tab templates.',
           percent: 15,
         },
       });
       return;
+    }
+    if (!inTransitTpl?.body) {
+      await ensureInTransitCapture(lock.tabId);
     }
 
     const schedule = enforceScheduleMs(state.scheduleMs);
@@ -590,7 +1051,7 @@ export async function alwaysOnTick({ force = false } = {}) {
       });
     }
 
-    // Live sections first (always full pages)
+    // Live sections first (always full pages) — each uses its own filter body
     const liveOrder = [];
     if (force || wasPaused || !due.IN_TRANSIT || now >= due.IN_TRANSIT) liveOrder.push('IN_TRANSIT');
     if (force || wasPaused || !due.UPCOMING || now >= due.UPCOMING) liveOrder.push('UPCOMING');
@@ -610,6 +1071,9 @@ export async function alwaysOnTick({ force = false } = {}) {
       } else if (res.authRequired) {
         await setState({ nextDueAt: due, scheduleMs: schedule });
         return;
+      } else if (res.templateWrong) {
+        // Do not advance due — re-capture path will clear templates
+        log(`always-on: template wrong for ${tab}, skipping CRM overwrite`);
       }
     }
 
@@ -709,19 +1173,15 @@ export async function alwaysOnTick({ force = false } = {}) {
       });
     }
 
-    // Normal HISTORY: page1 next cycle (picks up trips that left In Transit)
+    // HISTORY: 7-day windows + 45-day backfill, then ongoing current window every ~10 min
     const historyDue = force || !due.HISTORY || now >= due.HISTORY;
     if (historyDue && (await getState()).live) {
-      const histState = await getState();
-      if (!histState.historyBackfillDone) {
-        const res = await syncSection(lock.tabId, 'HISTORY', { page1Only: false });
-        if (res.ok) {
-          await setState({ historyBackfillDone: true });
-          due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
-        }
-      } else {
-        const res = await syncSection(lock.tabId, 'HISTORY', { page1Only: true });
-        if (res.ok) due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
+      const res = await syncHistoryWindows(lock.tabId);
+      if (res.ok) {
+        due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
+      } else if (res.authRequired) {
+        await setState({ nextDueAt: due, scheduleMs: schedule });
+        return;
       }
     }
 
