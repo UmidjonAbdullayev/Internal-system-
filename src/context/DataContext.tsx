@@ -20,11 +20,15 @@ import type {
   SettlementAdjustment,
   AppUser,
   RelayPayment,
+  RelayTrip,
+  RelaySectionSnapshot,
+  RelaySyncHealth,
 } from '@/types';
 import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations';
 import { generateId, getWeekRange } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
 import {
+  assembleRelayTrips,
   loadReportToRow,
   mapActivity,
   mapCharge,
@@ -33,8 +37,10 @@ import {
   mapLoad,
   mapLoadReport,
   mapRelayPayment,
+  mapRelaySectionSnapshot,
   mapSettlement,
 } from '@/lib/supabaseMappers';
+import { computeSyncHealth } from '@/lib/relayTrips';
 import {
   buildReportFromLoad,
   isBadReportLocation,
@@ -75,6 +81,9 @@ const EMPTY_SETTINGS: CompanySettings = {
 interface DataContextValue {
   drivers: Driver[];
   loads: Load[];
+  relayTrips: RelayTrip[];
+  relaySnapshots: RelaySectionSnapshot[];
+  relaySyncHealth: RelaySyncHealth;
   loadReports: LoadReport[];
   payments: RelayPayment[];
   driverFees: DriverFee[];
@@ -148,6 +157,13 @@ function now() {
 export function DataProvider({ children }: { children: ReactNode }) {
   const [drivers, setDrivers] = useState<Driver[]>([]);
   const [loads, setLoads] = useState<Load[]>([]);
+  const [relayTrips, setRelayTrips] = useState<RelayTrip[]>([]);
+  const [relaySnapshots, setRelaySnapshots] = useState<RelaySectionSnapshot[]>([]);
+  const [relaySyncHealth, setRelaySyncHealth] = useState<RelaySyncHealth>({
+    status: 'unknown',
+    lastSyncedAt: null,
+    detail: null,
+  });
   const [loadReports, setLoadReports] = useState<LoadReport[]>([]);
   const [payments, setPayments] = useState<RelayPayment[]>([]);
   const [driverFees, setDriverFees] = useState<DriverFee[]>([]);
@@ -165,6 +181,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const [
       driversRes,
       loadsRes,
+      relayTripsRes,
+      relayLegsRes,
+      relayStopsRes,
+      relaySnapshotsRes,
+      syncRunsRes,
       loadReportsRes,
       feesRes,
       chargesRes,
@@ -176,6 +197,15 @@ export function DataProvider({ children }: { children: ReactNode }) {
     ] = await Promise.all([
       supabase.from('drivers').select('*').order('created_at', { ascending: true }),
       supabase.from('loads').select('*').order('created_at', { ascending: false }),
+      supabase.from('relay_trips').select('*').eq('archived', false).order('last_seen_at', { ascending: false }),
+      supabase.from('relay_legs').select('*').eq('archived', false),
+      supabase.from('relay_stops').select('*').eq('archived', false).order('seq', { ascending: true }),
+      supabase.from('relay_section_snapshots').select('*'),
+      supabase
+        .from('relay_sync_runs')
+        .select('finished_at, status, error_count')
+        .order('started_at', { ascending: false })
+        .limit(5),
       supabase.from('load_reports').select('*').order('pickup_date', { ascending: true }),
       supabase.from('driver_fees').select('*'),
       supabase.from('one_time_charges').select('*'),
@@ -197,11 +227,21 @@ export function DataProvider({ children }: { children: ReactNode }) {
       settlementChargesRes.error ||
       paymentsRes.error ||
       activityRes.error;
+    // Relay tables are required for Trips; surface but still hydrate other CRM data if present.
+    const relayErr =
+      relayTripsRes.error ||
+      relayLegsRes.error ||
+      relayStopsRes.error ||
+      relaySnapshotsRes.error ||
+      syncRunsRes.error;
     if (err) {
       console.error('Supabase CRM hydrate failed', err.message);
       setDataError(err.message);
       setDataReady(true);
       return;
+    }
+    if (relayErr) {
+      console.warn('Relay trips hydrate warning', relayErr.message);
     }
 
     setDataError(null);
@@ -254,6 +294,23 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
     setDrivers((driversRes.data || []).map((r) => mapDriver(r as Record<string, unknown>)));
     setLoads((loadsRes.data || []).map((r) => mapLoad(r as Record<string, unknown>)));
+
+    const assembledTrips = assembleRelayTrips(
+      (relayTripsRes.data || []) as Record<string, unknown>[],
+      (relayLegsRes.data || []) as Record<string, unknown>[],
+      (relayStopsRes.data || []) as Record<string, unknown>[],
+    );
+    const snapshots = (relaySnapshotsRes.data || [])
+      .map((r) => mapRelaySectionSnapshot(r as Record<string, unknown>))
+      .filter((s): s is RelaySectionSnapshot => Boolean(s));
+    const lastRunFinished =
+      (syncRunsRes.data || [])
+        .map((r) => (r as { finished_at?: string | null }).finished_at)
+        .find((v) => Boolean(v)) || null;
+    setRelayTrips(assembledTrips);
+    setRelaySnapshots(snapshots);
+    setRelaySyncHealth(computeSyncHealth(snapshots, assembledTrips, lastRunFinished));
+
     setLoadReports(
       (loadReportsRes.data || []).map((r) => mapLoadReport(r as Record<string, unknown>)),
     );
@@ -1032,6 +1089,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
     () => ({
       drivers,
       loads,
+      relayTrips,
+      relaySnapshots,
+      relaySyncHealth,
       loadReports,
       payments,
       driverFees,
@@ -1077,6 +1137,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
     [
       drivers,
       loads,
+      relayTrips,
+      relaySnapshots,
+      relaySyncHealth,
       loadReports,
       payments,
       driverFees,
