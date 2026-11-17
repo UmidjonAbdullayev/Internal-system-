@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Relay Sync — Options</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <main>
+    <h1>Amazon Relay Sync</h1>
+    <p class="sub">API capture diagnostics (extension v1.4.1) — POST /api/tours/entitiesV2</p>
+
+    <section>
+      <h2>Raw captures</h2>
+      <p>
+        Last <strong>20</strong> entitiesV2 responses (url, timestamp, requestBody, json).
+        Driver phone/email are stripped before storage.
+      </p>
+      <p id="capture-stats" class="stats">Loading…</p>
+      <button id="download-captures" type="button">Download raw captures</button>
+      <p id="download-status" class="status" aria-live="polite"></p>
+    </section>
+
+    <section>
+      <h2>History sync</h2>
+      <label class="check">
+        <input id="sync-all-history" type="checkbox" />
+        Sync all History (paginate entitiesV2 with <code>tileCountTab=HISTORY</code>, default off)
+      </label>
+      <p class="hint">
+        When enabled, replays the last captured POST body with HISTORY + <code>from += 100</code>
+        until a page returns fewer than 100 entities. Max 1 request / 2 seconds. Uses the open
+        Relay tab’s credentials and copied request headers.
+      </p>
+      <p id="history-status" class="status" aria-live="polite"></p>
+    </section>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

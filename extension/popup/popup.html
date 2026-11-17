@@ -29,7 +29,7 @@
       <div class="row actions">
         <button id="live-btn" class="primary">GO LIVE</button>
         <button id="stop-btn" class="danger">STOP</button>
-        <button id="scan-btn" class="ghost">Scan now</button>
+        <button id="scan-btn" class="ghost">Flush now</button>
         <button id="logout-btn" class="ghost">Logout</button>
       </div>
 
@@ -44,11 +44,11 @@
 
       <div id="sync-progress" class="sync-progress" aria-live="polite">
         <div class="sync-progress-head">
-          <span class="k">Soft sync</span>
+          <span class="k">API capture</span>
           <span id="sync-phase" class="v">idle</span>
         </div>
         <div class="sync-bar"><div id="sync-bar-fill" class="sync-bar-fill"></div></div>
-        <div id="sync-detail" class="sync-detail">Typical full pass 45–90s. Keep using Relay while sync runs.</div>
+        <div id="sync-detail" class="sync-detail">Captures POST /api/tours/entitiesV2. Browse Trips — no row clicks.</div>
       </div>
 
       <h2>Relay sections</h2>

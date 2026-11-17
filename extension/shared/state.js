@@ -16,35 +16,34 @@ const DEFAULT_STATE = {
   pendingLoads: {},
   pendingPayments: {},
   collectionLocks: {},
-  /** load_id → { at, hasTrailer, hasTractor } — skip re-expand across tabs */
   detailScraped: {},
   extensionApiKey: '',
   clientId: null,
-  /** Soft-sync progress (popup only — never hijacks the Relay page). */
   syncProgress: {
     phase: 'idle',
     detail: '',
     percent: 0,
     startedAt: null,
     lastDurationMs: null,
-    typicalSeconds: '45–90',
+    typicalSeconds: 'passive',
     historyWeeks: [],
   },
   lastPaymentsScanAt: null,
   lastTripsScanAt: null,
-  /** UI aggregate — true if trips OR payments soft scan is running. */
   scanInProgress: false,
   tripsScanInProgress: false,
   paymentsScanInProgress: false,
   tripsScanStartedAt: null,
   paymentsScanStartedAt: null,
   lastNearLiveAt: null,
-  /**
-   * load_id → { trip_bucket, load_status, payment_status, content_hash, at }
-   * Used to skip unchanged History expands / re-upserts.
-   */
+  lastCaptureAt: null,
+  lastCaptureUrl: null,
+  lastCaptureTab: null,
+  capturesSeen: 0,
+  tripsExtracted: 0,
+  /** Optional: replay entitiesV2 with HISTORY pagination. Default OFF. */
+  syncAllHistory: false,
   syncedLoadCache: {},
-  /** Last full Upcoming+In Transit id set (for reconcile). */
   lastActiveLoadIds: [],
 };
 
