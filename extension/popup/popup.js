@@ -102,13 +102,24 @@ function render(state) {
             `At: ${fe.at || '—'}`,
           ].join('\n')
         : errFull;
-      const relayN = c.relay ?? s.trips ?? 0;
-      const crmN = c.crm ?? '—';
+      let relayN = c.relay ?? s.trips ?? 0;
+      let crmN = c.crm ?? '—';
+      let histExtra = '';
+      if (tab === 'HISTORY') {
+        // Cumulative across backfill weeks (not current window only)
+        const cumRelay = Number(histProg.trips) || Number(relayN) || 0;
+        const cumCrm = Number(histProg.crmTrips) || (crmN === '—' ? cumRelay : Number(crmN)) || 0;
+        relayN = cumRelay;
+        crmN = cumCrm;
+        if (histProg.week && histProg.totalWeeks) {
+          histExtra = ` · backfill week ${histProg.week}/${histProg.totalWeeks}`;
+        } else if (histProg.label) {
+          histExtra = ` · ${histProg.label}`;
+        }
+      }
       const mismatch = Boolean(c.mismatch) || (crmN !== '—' && Number(crmN) !== Number(relayN));
       const countCls = mismatch || wrong ? 'mismatch' : 'ok-count';
       const src = meta.label || (meta.source === 'fallback' ? 'fallback' : meta.source || '—');
-      const histExtra =
-        tab === 'HISTORY' && histProg.label ? ` · ${histProg.label}` : '';
       const badgeCls = s.lastError || wrong || s.paused ? 'error' : 'collecting';
       return `<li><span>${tab}</span><span class="badge ${badgeCls}" title="${escapeAttr(
         title,

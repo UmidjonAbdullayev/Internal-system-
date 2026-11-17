@@ -105,6 +105,7 @@ export function LoadsPage() {
     relaySnapshots,
     activityLogs,
     syncState,
+    extensionHeartbeat,
     sectionSnapshots,
     companySettings,
     addLoad,
@@ -147,7 +148,10 @@ export function LoadsPage() {
     relaySnapshots.find((s) => s.section === liveSection);
   const mirrorMode =
     tab === 'upcoming' || tab === 'in_transit'
-      ? liveMirrorMode(sectionSync, { showLastKnown })
+      ? liveMirrorMode(sectionSync, {
+          showLastKnown,
+          heartbeat: extensionHeartbeat,
+        })
       : 'live';
 
   useEffect(() => {
@@ -261,7 +265,10 @@ export function LoadsPage() {
     // Syncing: keep last-known trips (never hide all). Paused: empty until "Show last known".
     if (
       (tab === 'upcoming' || tab === 'in_transit') &&
-      mirrorMode === 'paused' &&
+      (mirrorMode === 'paused' ||
+        mirrorMode === 'delayed' ||
+        mirrorMode === 'offline' ||
+        mirrorMode === 'auth') &&
       !showLastKnown
     ) {
       return [];
@@ -440,7 +447,12 @@ export function LoadsPage() {
         title="Loads / Trips"
         subtitle={
           <span className="block">
-            <SyncStatusLine syncState={sectionSync} showLastKnown={showLastKnown} />
+            <SyncStatusLine
+              syncState={sectionSync}
+              showLastKnown={showLastKnown}
+              heartbeat={extensionHeartbeat}
+              sectionLabel={liveSection || 'IN_TRANSIT'}
+            />
             <span className="mt-0.5 block text-xs text-text-secondary">
               {filtered.length} shown · {dataSource}
               {snapshots.some((s) => s.mismatch) ? ' · snapshot mismatch — check extension popup' : ''}
@@ -487,7 +499,9 @@ export function LoadsPage() {
         <LiveMirrorBanner
           mode={mirrorMode}
           relayCount={sectionSnap?.totalRecords}
+          sectionLabel={liveSection || 'IN_TRANSIT'}
           lastSuccessfulSyncAt={sectionSync?.lastSuccessfulSyncAt}
+          extensionAliveAt={extensionHeartbeat?.aliveAt}
           onShowLastKnown={() => setShowLastKnown(true)}
         />
       )}
@@ -650,9 +664,13 @@ export function LoadsPage() {
                 : filtersActive && inTabCount > 0
                   ? `Active filters: ${namedFilters.join('; ')}.`
                   : tab === 'upcoming' || tab === 'in_transit'
-                    ? mirrorMode === 'paused'
-                      ? 'Live mirror paused — use Show last known data, or wait for Relay sync.'
-                      : 'Switch tabs or wait for the next Relay snapshot.'
+                    ? mirrorMode === 'auth'
+                      ? 'Log in to Amazon Relay in the extension tab, then wait for sync.'
+                      : mirrorMode === 'offline' ||
+                          mirrorMode === 'delayed' ||
+                          mirrorMode === 'paused'
+                        ? 'Use Show last known data, or wait for Relay sync.'
+                        : 'Switch tabs or wait for the next Relay snapshot.'
                     : 'Try another date preset or clear filters.'
             }
             actionLabel={filtersActive && inTabCount > 0 ? 'Clear filters' : 'Refresh'}

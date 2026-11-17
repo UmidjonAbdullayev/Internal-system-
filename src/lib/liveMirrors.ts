@@ -1,4 +1,5 @@
 import type {
+  ExtensionHeartbeat,
   Load,
   LiveMirrorMode,
   RelaySection,
@@ -8,6 +9,7 @@ import type {
 } from '@/types';
 
 export const LIVE_PAUSE_MS = 5 * 60 * 1000;
+export const EXTENSION_OFFLINE_MS = 3 * 60 * 1000;
 export const DEFAULT_HISTORY_RETENTION_DAYS = 45;
 
 export function sectionForTab(tab: TripBucket | 'all'): RelaySection | null {
@@ -24,17 +26,34 @@ export function syncStateForSection(
   return rows.find((r) => r.section === section);
 }
 
+/** Sync-paused only for live sections — never driven by HISTORY. */
 export function isSectionPaused(row: SyncStateRow | undefined, nowMs = Date.now()): boolean {
   if (!row?.lastSuccessfulSyncAt) return true;
   return nowMs - Date.parse(row.lastSuccessfulSyncAt) > LIVE_PAUSE_MS;
 }
 
+export function isExtensionOffline(
+  heartbeat: ExtensionHeartbeat | null | undefined,
+  nowMs = Date.now(),
+): boolean {
+  if (!heartbeat?.aliveAt) return true;
+  const at = Date.parse(heartbeat.aliveAt);
+  if (!Number.isFinite(at)) return true;
+  return nowMs - at > EXTENSION_OFFLINE_MS;
+}
+
 export function liveMirrorMode(
   row: SyncStateRow | undefined,
-  opts: { showLastKnown: boolean; reconnectSyncing?: boolean } = { showLastKnown: false },
+  opts: {
+    showLastKnown: boolean;
+    reconnectSyncing?: boolean;
+    heartbeat?: ExtensionHeartbeat | null;
+  } = { showLastKnown: false },
 ): LiveMirrorMode {
+  if (opts.heartbeat?.authStatus === 'auth_required') return 'auth';
   if (opts.reconnectSyncing || row?.syncing) return 'syncing';
-  if (isSectionPaused(row)) return opts.showLastKnown ? 'last_known' : 'paused';
+  if (isExtensionOffline(opts.heartbeat)) return opts.showLastKnown ? 'last_known' : 'offline';
+  if (isSectionPaused(row)) return opts.showLastKnown ? 'last_known' : 'delayed';
   return 'live';
 }
 
@@ -90,4 +109,18 @@ export function formatSyncAge(iso: string | null | undefined): string {
   if (min < 60) return `${min}m ago`;
   const hr = Math.round(min / 60);
   return `${hr}h ago`;
+}
+
+export function formatClockHHMM(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return '';
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(ms));
+  } catch {
+    return '';
+  }
 }

@@ -108,6 +108,7 @@ const DEFAULT_STATE = {
     week: 0,
     totalWeeks: 0,
     trips: 0,
+    crmTrips: 0,
     label: null,
   },
   inTransitCaptureNavAt: null,

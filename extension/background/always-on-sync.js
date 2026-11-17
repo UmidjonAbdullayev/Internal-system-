@@ -719,6 +719,10 @@ export async function syncSection(
     historyWindow = null,
     startFrom = 0,
     onPageProgress = null,
+    /** Cap pages this call (History backfill steps use 1). */
+    maxPages = null,
+    /** Return early between pages when live IN_TRANSIT/UPCOMING is due. */
+    shouldYield = null,
   } = {},
 ) {
   const state = await getState();
@@ -818,6 +822,14 @@ export async function syncSection(
       const done =
         !stillMissing.size || pastLookback || got < PAGE_SIZE || from + PAGE_SIZE >= totalRecords;
       if (done) break;
+      if (maxPages != null && pages >= maxPages) {
+        from += PAGE_SIZE;
+        break;
+      }
+      if (typeof shouldYield === 'function' && (await shouldYield())) {
+        from += PAGE_SIZE;
+        break;
+      }
       from += PAGE_SIZE;
       await waitRequestGap(gap);
       continue;
@@ -828,6 +840,8 @@ export async function syncSection(
     if (got < PAGE_SIZE) break;
     from += PAGE_SIZE;
     if (from >= totalRecords) break;
+    if (maxPages != null && pages >= maxPages) break;
+    if (typeof shouldYield === 'function' && (await shouldYield())) break;
     // HISTORY: enforce 2s between pages
     await waitRequestGap(gap);
   }
@@ -956,119 +970,177 @@ export async function syncSection(
 }
 
 /**
- * HISTORY: 7-day windows, 45-day backfill (newest first), resume progress; ongoing current (+ prev week first 24h).
+ * One HISTORY step only (P3): a single backfill page, or one ongoing window pass.
+ * Live IN_TRANSIT/UPCOMING must interleave between steps — never run full multi-week loop here.
  */
-export async function syncHistoryWindows(tabId) {
+export async function syncHistoryOneStep(tabId, { shouldYield = null } = {}) {
   const now = new Date();
   const windows = listHistoryBackfillWindows(now, TIMEZONE);
-  let progress = await loadHistoryBackfill();
+  const progress = await loadHistoryBackfill();
+  const st = await getState();
+  const crmAccum = Number(st.historyBackfillProgress?.crmTrips) || Number(progress.crmAccum) || 0;
 
   if (!progress.done) {
-    const totalWindows = windows.length;
-    let idx = Math.min(progress.windowIndex || 0, totalWindows - 1);
-    let tripsAccum = progress.tripsAccum || 0;
-
-    for (; idx < totalWindows; idx += 1) {
-      if (!(await getState()).live) return { ok: false, skipped: 'stopped' };
-      const win = windows[idx];
-      const startFrom = idx === (progress.windowIndex || 0) ? progress.from || 0 : 0;
-
-      await setState({
-        syncProgress: {
-          phase: 'history-backfill',
-          detail: `Week ${idx + 1}/${totalWindows} · ${tripsAccum} trips`,
-          percent: Math.min(95, 20 + Math.round(((idx + 0.5) / totalWindows) * 70)),
-          historyWeeks: windows.slice(0, idx + 1).map((w) => w.label),
-        },
-        historyBackfillProgress: {
-          week: idx + 1,
-          totalWeeks: totalWindows,
-          trips: tripsAccum,
-          label: `Week ${idx + 1}/${totalWindows} · ${tripsAccum} trips`,
-        },
-      });
-
-      const res = await syncSection(tabId, 'HISTORY', {
-        historyWindow: win,
-        startFrom,
-        onPageProgress: async ({ from, trips }) => {
-          await saveHistoryBackfill({
-            done: false,
-            windowIndex: idx,
-            from,
-            tripsAccum: tripsAccum + trips,
-            totalWindows,
-          });
-          await setState({
-            historyBackfillProgress: {
-              week: idx + 1,
-              totalWeeks: totalWindows,
-              trips: tripsAccum + trips,
-              label: `Week ${idx + 1}/${totalWindows} · ${tripsAccum + trips} trips`,
-            },
-            syncProgress: {
-              phase: 'history-backfill',
-              detail: `Week ${idx + 1}/${totalWindows} · ${tripsAccum + trips} trips`,
-              percent: Math.min(95, 20 + Math.round(((idx + from / 500) / totalWindows) * 70)),
-            },
-          });
-        },
-      });
-
-      if (!res.ok) {
-        await saveHistoryBackfill({
-          done: false,
-          windowIndex: idx,
-          from: startFrom,
-          tripsAccum,
-          totalWindows,
-        });
-        return res;
-      }
-
-      tripsAccum += res.trips || 0;
+    const totalWindows = windows.length || 1;
+    const idx = Math.min(progress.windowIndex || 0, totalWindows - 1);
+    const win = windows[idx];
+    if (!win) {
       await saveHistoryBackfill({
-        done: false,
-        windowIndex: idx + 1,
+        done: true,
+        windowIndex: totalWindows,
         from: 0,
-        tripsAccum,
+        tripsAccum: progress.tripsAccum || 0,
+        crmAccum,
         totalWindows,
+        completedAt: new Date().toISOString(),
       });
-      progress = await loadHistoryBackfill();
+      return { ok: true, backfill: true, done: true };
     }
 
-    await saveHistoryBackfill({
-      done: true,
-      windowIndex: totalWindows,
-      from: 0,
-      tripsAccum,
-      totalWindows,
-      completedAt: new Date().toISOString(),
-    });
+    const startFrom = progress.from || 0;
+    let tripsAccum = progress.tripsAccum || 0;
+    const weekLabel = `backfill week ${idx + 1}/${totalWindows}`;
+
     await setState({
-      historyBackfillDone: true,
+      syncProgress: {
+        phase: 'history-backfill',
+        detail: `Week ${idx + 1}/${totalWindows} · ${tripsAccum} trips`,
+        percent: Math.min(95, 20 + Math.round(((idx + 0.5) / totalWindows) * 70)),
+        historyWeeks: windows.slice(0, idx + 1).map((w) => w.label),
+      },
       historyBackfillProgress: {
-        week: totalWindows,
+        week: idx + 1,
         totalWeeks: totalWindows,
         trips: tripsAccum,
-        label: `Backfill done · ${tripsAccum} trips`,
+        crmTrips: crmAccum,
+        label: weekLabel,
       },
     });
-    return { ok: true, backfill: true, trips: tripsAccum, windows: totalWindows };
+
+    const res = await syncSection(tabId, 'HISTORY', {
+      historyWindow: win,
+      startFrom,
+      maxPages: 1,
+      shouldYield,
+    });
+
+    if (!res.ok) {
+      await saveHistoryBackfill({
+        done: false,
+        windowIndex: idx,
+        from: startFrom,
+        tripsAccum,
+        crmAccum,
+        totalWindows,
+      });
+      return { ...res, backfillPaused: { week: idx + 1, page: Math.floor(startFrom / PAGE_SIZE) + 1 } };
+    }
+
+    const pageTrips = res.trips || 0;
+    tripsAccum += pageTrips;
+    const nextFrom = startFrom + PAGE_SIZE;
+    const windowDone =
+      pageTrips < PAGE_SIZE ||
+      nextFrom >= (res.totalRecords || nextFrom) ||
+      (res.pages || 0) === 0;
+
+    const nextCrm = crmAccum + pageTrips;
+    if (windowDone) {
+      const nextIdx = idx + 1;
+      if (nextIdx >= totalWindows) {
+        await saveHistoryBackfill({
+          done: true,
+          windowIndex: totalWindows,
+          from: 0,
+          tripsAccum,
+          crmAccum: nextCrm,
+          totalWindows,
+          completedAt: new Date().toISOString(),
+        });
+        await setState({
+          historyBackfillDone: true,
+          historyBackfillProgress: {
+            week: totalWindows,
+            totalWeeks: totalWindows,
+            trips: tripsAccum,
+            crmTrips: nextCrm,
+            label: `Backfill done · ${tripsAccum} trips`,
+          },
+          sectionCounts: {
+            HISTORY: { relay: tripsAccum, crm: nextCrm, mismatch: false },
+          },
+        });
+        return { ok: true, backfill: true, done: true, trips: tripsAccum };
+      }
+      await saveHistoryBackfill({
+        done: false,
+        windowIndex: nextIdx,
+        from: 0,
+        tripsAccum,
+        crmAccum: nextCrm,
+        totalWindows,
+      });
+    } else {
+      await saveHistoryBackfill({
+        done: false,
+        windowIndex: idx,
+        from: nextFrom,
+        tripsAccum,
+        crmAccum: nextCrm,
+        totalWindows,
+      });
+    }
+
+    await setState({
+      historyBackfillProgress: {
+        week: idx + 1,
+        totalWeeks: totalWindows,
+        trips: tripsAccum,
+        crmTrips: nextCrm,
+        label: weekLabel,
+      },
+      sectionCounts: {
+        HISTORY: { relay: tripsAccum, crm: nextCrm, mismatch: false },
+      },
+    });
+
+    return {
+      ok: true,
+      backfill: true,
+      done: false,
+      trips: tripsAccum,
+      backfillPaused: {
+        week: idx + 1,
+        page: Math.floor((windowDone ? 0 : nextFrom) / PAGE_SIZE) + (windowDone ? 1 : 0),
+      },
+    };
   }
 
-  // Ongoing: current window; previous window during first 24h of a new week
+  // Ongoing: current window only (yield-aware multi-page via shouldYield)
   const current = historyWindowContaining(now, TIMEZONE);
-  const res = await syncSection(tabId, 'HISTORY', { historyWindow: current });
+  const res = await syncSection(tabId, 'HISTORY', {
+    historyWindow: current,
+    shouldYield,
+    maxPages: shouldYield ? 2 : null,
+  });
   if (!res.ok) return res;
 
-  if (isFirst24hOfHistoryWeek(now, TIMEZONE) && windows.length > 1) {
+  if (isFirst24hOfHistoryWeek(now, TIMEZONE) && windows.length > 1 && !(shouldYield && (await shouldYield()))) {
     const prev = windows[1];
-    const prevRes = await syncSection(tabId, 'HISTORY', { historyWindow: prev });
+    const prevRes = await syncSection(tabId, 'HISTORY', {
+      historyWindow: prev,
+      shouldYield,
+      maxPages: 1,
+    });
     if (!prevRes.ok) return prevRes;
     return { ok: true, ongoing: true, pages: (res.pages || 0) + (prevRes.pages || 0) };
   }
   return { ok: true, ongoing: true, ...res };
+}
+
+/** @deprecated — use syncHistoryOneStep so live sync can interleave */
+export async function syncHistoryWindows(tabId) {
+  return syncHistoryOneStep(tabId);
 }
 
 function sectionIsPaused(sectionSyncEntry) {
@@ -1150,7 +1222,7 @@ export async function alwaysOnTick({ force = false } = {}) {
     }
 
     const schedule = enforceScheduleMs(state.scheduleMs);
-    const now = Date.now();
+    let now = Date.now();
     const due = { ...(state.nextDueAt || {}) };
 
     const wasPaused =
@@ -1169,46 +1241,108 @@ export async function alwaysOnTick({ force = false } = {}) {
       });
     }
 
-    // Live sections first (always full pages) — each uses its own filter body
-    const liveOrder = [];
-    if (force || wasPaused || !due.IN_TRANSIT || now >= due.IN_TRANSIT) liveOrder.push('IN_TRANSIT');
-    if (force || wasPaused || !due.UPCOMING || now >= due.UPCOMING) liveOrder.push('UPCOMING');
+    // Force live once on reconnect/GO LIVE by zeroing due; do not keep wasPaused sticky in isLiveDue
+    if (force || wasPaused) {
+      due.IN_TRANSIT = 0;
+      due.UPCOMING = 0;
+    }
+
+    const isLiveDue = (tab, t = Date.now()) => {
+      if (!due[tab] || t >= due[tab]) return true;
+      return false;
+    };
+
+    const backfillPauseLabel = async () => {
+      const p = await loadHistoryBackfill();
+      if (p.done) return 'backfill done';
+      const week = (p.windowIndex || 0) + 1;
+      const page = Math.floor((p.from || 0) / PAGE_SIZE) + 1;
+      return `backfill paused at week ${week} page ${page}`;
+    };
+
+    /** Priority queue: P1 IN_TRANSIT → P2 UPCOMING → P3 HISTORY (only if no live due). */
+    const pickNext = async () => {
+      const t = Date.now();
+      if (isLiveDue('IN_TRANSIT', t)) return 'IN_TRANSIT';
+      if (isLiveDue('UPCOMING', t)) return 'UPCOMING';
+      const histDue = force || !due.HISTORY || t >= due.HISTORY;
+      const bf = await loadHistoryBackfill();
+      if (histDue || !bf.done) return 'HISTORY';
+      return null;
+    };
 
     let liveSnapshotsOk = 0;
     if (wasPaused) {
       await setState({ pendingCatchUpMissing: [] });
     }
 
-    for (const tab of liveOrder) {
+    // Drain priority queue for this tick (live first; at most one HISTORY page when idle)
+    let historySteps = 0;
+    const maxHistoryStepsPerTick = 1;
+    for (;;) {
       if (!(await getState()).live) break;
-      const sec = (await getState()).sectionSync?.[tab];
-      if (
-        !force &&
-        sec?.paused &&
-        sec.pausedUntil &&
-        Date.parse(sec.pausedUntil) > Date.now()
-      ) {
-        log(`section ${tab} paused until`, sec.pausedUntil);
+      const next = await pickNext();
+      if (!next) break;
+
+      const pauseLbl = await backfillPauseLabel();
+      if (next === 'IN_TRANSIT' || next === 'UPCOMING') {
+        log(`[Queue] next=${next} (due) | ${pauseLbl}`);
+      } else {
+        log(`[Queue] next=HISTORY | ${pauseLbl}`);
+      }
+
+      if (next === 'IN_TRANSIT' || next === 'UPCOMING') {
+        const sec = (await getState()).sectionSync?.[next];
+        if (
+          !force &&
+          sec?.paused &&
+          sec.pausedUntil &&
+          Date.parse(sec.pausedUntil) > Date.now()
+        ) {
+          log(`section ${next} paused until`, sec.pausedUntil);
+          due[next] = Date.parse(sec.pausedUntil);
+          continue;
+        }
+        const res = await syncSection(lock.tabId, next, { page1Only: false });
+        now = Date.now();
+        if (res.ok) {
+          if (next === 'IN_TRANSIT') due.IN_TRANSIT = now + jitter(schedule.IN_TRANSIT_MS);
+          if (next === 'UPCOMING') due.UPCOMING = now + jitter(schedule.UPCOMING_MS);
+          if (res.snapshot) liveSnapshotsOk += 1;
+        } else if (res.authRequired) {
+          await setState({ nextDueAt: due, scheduleMs: schedule });
+          return;
+        } else if (res.templateWrong) {
+          log(`always-on: template wrong for ${next}, skipping CRM overwrite`);
+          due[next] = now + jitter(schedule[`${next}_MS`] || schedule.IN_TRANSIT_MS);
+        } else {
+          due[next] = now + SECTION_PAUSE_RETRY_MS;
+        }
         continue;
       }
-      const res = await syncSection(lock.tabId, tab, { page1Only: false });
-      if (res.ok) {
-        if (tab === 'IN_TRANSIT') due.IN_TRANSIT = now + jitter(schedule.IN_TRANSIT_MS);
-        if (tab === 'UPCOMING') due.UPCOMING = now + jitter(schedule.UPCOMING_MS);
-        if (res.snapshot) liveSnapshotsOk += 1;
-      } else if (res.authRequired) {
+
+      // P3 HISTORY — only reached when no live refresh is due
+      if (historySteps >= maxHistoryStepsPerTick) break;
+      historySteps += 1;
+      const shouldYield = async () => isLiveDue('IN_TRANSIT') || isLiveDue('UPCOMING');
+      const res = await syncHistoryOneStep(lock.tabId, { shouldYield });
+      now = Date.now();
+      if (res.authRequired) {
         await setState({ nextDueAt: due, scheduleMs: schedule });
         return;
-      } else if (res.templateWrong) {
-        // Do not advance due — re-capture path will clear templates
-        log(`always-on: template wrong for ${tab}, skipping CRM overwrite`);
-      } else {
-        // Retries exhausted → yellow paused; next attempt in ~1 min
-        due[tab] = now + SECTION_PAUSE_RETRY_MS;
       }
+      if (res.ok && (res.done || res.ongoing)) {
+        due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
+      } else if (res.ok && res.backfill) {
+        // More backfill pages remain — keep HISTORY "due" so next idle tick continues
+        due.HISTORY = 0;
+      }
+      // Re-loop: if live became due during HISTORY page, pickNext returns live next
+      if (await shouldYield()) continue;
+      break;
     }
 
-    // After live Upcoming+In Transit on reconnect/pause: HISTORY catch-up
+    // After live Upcoming+In Transit on reconnect/pause: HISTORY catch-up (yield-aware pages)
     const stAfterLive = await getState();
     const liveMissing = [
       ...new Set(
@@ -1228,9 +1362,7 @@ export async function alwaysOnTick({ force = false } = {}) {
       const missing = begin?.missingTripIds?.length ? begin.missingTripIds : liveMissing;
       const untilIso =
         begin?.untilIso ||
-        new Date(
-          Date.now() - CATCH_UP_LOOKBACK_MS - LIVE_PAUSE_MS,
-        ).toISOString();
+        new Date(Date.now() - CATCH_UP_LOOKBACK_MS - LIVE_PAUSE_MS).toISOString();
 
       if (missing.length) {
         await setState({
@@ -1247,34 +1379,43 @@ export async function alwaysOnTick({ force = false } = {}) {
             percent: 55,
           },
         });
+        log(`[Queue] next=HISTORY (catch-up) | ${await backfillPauseLabel()}`);
         const catchRes = await syncSection(lock.tabId, 'HISTORY', {
           catchUp: true,
           catchUpUntilIso: untilIso,
           missingTripIds: missing,
+          shouldYield: async () => isLiveDue('IN_TRANSIT') || isLiveDue('UPCOMING'),
+          maxPages: 3,
         });
         if (catchRes.authRequired) {
           await setState({ nextDueAt: due, scheduleMs: schedule });
           return;
         }
-        await hooks.onFinalizeCatchUp({
-          foundIds: catchRes.catchUpFoundIds || [],
-          stillMissing: catchRes.catchUpStillMissing || [],
-        });
-        await setState({
-          catchUp: {
-            active: false,
-            missingTripIds: [],
-            foundTripIds: catchRes.catchUpFoundIds || [],
-            untilIso: null,
-            startedAt: null,
-          },
-          reconnectSyncing: false,
-          syncProgress: {
-            phase: 'always-on',
-            detail: 'Catch-up complete — live mirrors restored.',
-            percent: 100,
-          },
-        });
+        // Finalize when catch-up finished or yielded with no still-missing urgency this tick
+        const still = catchRes.catchUpStillMissing || [];
+        if (!still.length || catchRes.ok) {
+          await hooks.onFinalizeCatchUp({
+            foundIds: catchRes.catchUpFoundIds || [],
+            stillMissing: still,
+          });
+          await setState({
+            catchUp: {
+              active: false,
+              missingTripIds: [],
+              foundTripIds: catchRes.catchUpFoundIds || [],
+              untilIso: null,
+              startedAt: null,
+            },
+            reconnectSyncing: false,
+            syncProgress: {
+              phase: 'always-on',
+              detail: still.length
+                ? `Catch-up partial — ${still.length} still missing; live mirrors resume.`
+                : 'Catch-up complete — live mirrors restored.',
+              percent: 100,
+            },
+          });
+        }
       } else {
         await hooks.onFinalizeCatchUp({ foundIds: [], stillMissing: [] });
         await setState({
@@ -1293,7 +1434,7 @@ export async function alwaysOnTick({ force = false } = {}) {
           },
         });
       }
-    } else if (stAfterLive.reconnectSyncing && liveSnapshotsOk >= liveOrder.length && liveOrder.length) {
+    } else if (stAfterLive.reconnectSyncing && liveSnapshotsOk >= 1) {
       await setState({
         reconnectSyncing: false,
         syncProgress: {
@@ -1302,18 +1443,6 @@ export async function alwaysOnTick({ force = false } = {}) {
           percent: 100,
         },
       });
-    }
-
-    // HISTORY: 7-day windows + 45-day backfill, then ongoing current window every ~10 min
-    const historyDue = force || !due.HISTORY || now >= due.HISTORY;
-    if (historyDue && (await getState()).live) {
-      const res = await syncHistoryWindows(lock.tabId);
-      if (res.ok) {
-        due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
-      } else if (res.authRequired) {
-        await setState({ nextDueAt: due, scheduleMs: schedule });
-        return;
-      }
     }
 
     await setState({ nextDueAt: due, scheduleMs: schedule });

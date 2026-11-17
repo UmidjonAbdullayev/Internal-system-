@@ -219,7 +219,22 @@ export interface TripSummary {
   summarizedAt: string;
 }
 
-export type LiveMirrorMode = 'live' | 'paused' | 'syncing' | 'last_known';
+export type LiveMirrorMode =
+  | 'live'
+  | 'paused'
+  | 'syncing'
+  | 'last_known'
+  | 'offline'
+  | 'delayed'
+  | 'auth';
+
+export interface ExtensionHeartbeat {
+  aliveAt: string | null;
+  authStatus: 'ok' | 'auth_required' | 'unknown';
+  clientId: string | null;
+  detail: string | null;
+  updatedAt: string | null;
+}
 
 export interface Load {
   id: string;

@@ -7,6 +7,8 @@ import {
   SECTIONS,
   SYNC_ALARM,
   ALWAYS_ON_ALARM,
+  QUEUE_TICK_MS,
+  EXTENSION_ALIVE_INTERVAL_MS,
   DEBUG,
   MAX_RAW_CAPTURES,
   SYNC_FLUSH_MINUTES,
@@ -51,6 +53,8 @@ const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
 
 let flushRunning = false;
 let flushBackoffMs = FLUSH_BACKOFF_BASE_MS;
+let queueTickTimer = null;
+let extensionAliveTimer = null;
 
 function log(...args) {
   if (DEBUG) console.log('[RelayCapture]', ...args);
@@ -143,6 +147,7 @@ configureAlwaysOn({
       },
     });
     await updateBadge();
+    void pushExtensionAlive('auth_required', 'Log in to Relay');
   },
   onHealthy: async () => {
     const state = await getState();
@@ -175,6 +180,53 @@ configureAlwaysOn({
   },
 });
 
+async function pushExtensionAlive(authStatus = 'ok', detail = null) {
+  const state = await getState();
+  if (!state.live || !state.extensionApiKey) return;
+  try {
+    const clientId = await ensureClientId();
+    await postRelaySnapshot(
+      {
+        action: 'heartbeat',
+        client_id: clientId,
+        auth_status: authStatus,
+        detail,
+      },
+      state.extensionApiKey,
+      'extension heartbeat',
+    );
+  } catch (err) {
+    log('extension heartbeat failed', err?.message || err);
+  }
+}
+
+function stopQueueTimers() {
+  if (queueTickTimer) {
+    clearInterval(queueTickTimer);
+    queueTickTimer = null;
+  }
+  if (extensionAliveTimer) {
+    clearInterval(extensionAliveTimer);
+    extensionAliveTimer = null;
+  }
+}
+
+function startQueueTimers() {
+  stopQueueTimers();
+  queueTickTimer = setInterval(() => {
+    void alwaysOnTick({ force: false });
+  }, QUEUE_TICK_MS);
+  extensionAliveTimer = setInterval(() => {
+    void (async () => {
+      const st = await getState();
+      const auth =
+        st.health?.status === 'auth' ? 'auth_required' : 'ok';
+      await pushExtensionAlive(auth);
+    })();
+  }, EXTENSION_ALIVE_INTERVAL_MS);
+  void pushExtensionAlive('ok');
+}
+
 async function ensureAlarms() {
   await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_FLUSH_MINUTES });
   await ensureAlarmsAlwaysOn();
@@ -193,6 +245,7 @@ chrome.runtime.onStartup?.addListener?.(async () => {
   await ensureAlarms();
   const state = await getState();
   if (state.live && state.loggedIn) {
+    startQueueTimers();
     void alwaysOnTick({ force: true });
   }
   await updateBadge();
@@ -236,6 +289,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       if (msg?.type === 'LOGOUT') {
         stopHeartbeat();
+        stopQueueTimers();
         await setState({ loggedIn: false, live: false });
         await updateBadge();
         sendResponse({ ok: true, state: await getState() });
@@ -297,6 +351,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           },
         });
         await ensureAlarms();
+        startQueueTimers();
         await refreshOpenTabs();
         sendResponse({ ok: true, state: await getState() });
         await updateBadge();
@@ -307,6 +362,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg?.type === 'STOP') {
         flushRunning = false;
         stopHeartbeat();
+        stopQueueTimers();
         await setState({
           live: false,
           health: { status: 'idle', message: '' },

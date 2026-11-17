@@ -93,6 +93,11 @@ export const SECTION_PAUSE_RETRY_MS = 60 * 1000;
 /** No page heartbeat for this long → reload sync tab. */
 export const PAGE_HEARTBEAT_STALE_MS = 2 * 60 * 1000;
 export const PAGE_HEARTBEAT_INTERVAL_MS = 30 * 1000;
+/** Priority queue poll (alarms are ≥1m; this keeps IN_TRANSIT ~45s + backfill steps). */
+export const QUEUE_TICK_MS = 15 * 1000;
+/** Write extension_alive_at to Supabase on this interval. */
+export const EXTENSION_ALIVE_INTERVAL_MS = 30 * 1000;
+export const EXTENSION_OFFLINE_MS = 3 * 60 * 1000;
 
 export const SYNC_FLUSH_MINUTES = 1;
 export const FLUSH_TIMEOUT_MS = 90 * 1000;

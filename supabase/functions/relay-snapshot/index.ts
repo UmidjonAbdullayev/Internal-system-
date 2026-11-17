@@ -57,6 +57,24 @@ Deno.serve(async (req: Request) => {
       return json({ success: true, ...result });
     }
 
+    if (action === "heartbeat") {
+      const authStatus = ["ok", "auth_required", "unknown"].includes(String(body.auth_status || ""))
+        ? String(body.auth_status)
+        : "ok";
+      await sb.from("extension_heartbeat").upsert(
+        {
+          id: 1,
+          alive_at: now,
+          auth_status: authStatus,
+          client_id: body.client_id != null ? String(body.client_id) : null,
+          detail: body.detail != null ? String(body.detail).slice(0, 500) : null,
+          updated_at: now,
+        },
+        { onConflict: "id" },
+      );
+      return json({ success: true, alive_at: now, auth_status: authStatus });
+    }
+
     const tripsIn = Array.isArray(body.trips) ? body.trips : [];
     const snapshot = body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null;
     const catchUp = Boolean(body.catchUp);
