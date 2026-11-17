@@ -204,8 +204,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
     let relayTripsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
     let relayLegsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
     let relayStopsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
+    let heartbeatEarly: {
+      data: Record<string, unknown> | null;
+      error: { message: string } | null;
+    } | null = null;
     try {
-      [relayTripsRes, relayLegsRes, relayStopsRes] = await Promise.all([
+      [relayTripsRes, relayLegsRes, relayStopsRes, heartbeatEarly] = await Promise.all([
         fetchAllPages<Record<string, unknown>>((from, to) =>
           supabase
             .from('relay_trips')
@@ -229,6 +233,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
             .order('seq', { ascending: true })
             .range(from, to),
         ),
+        supabase.from('extension_heartbeat').select('*').eq('id', 1).maybeSingle(),
       ]);
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Relay hydrate failed';
@@ -236,6 +241,16 @@ export function DataProvider({ children }: { children: ReactNode }) {
       setDataError(message);
       setDataReady(true);
       // Keep previous relayTrips — never blank the Trips page on error.
+      // Still refresh liveness so offline chip stays honest during hydrate failures.
+      void supabase
+        .from('extension_heartbeat')
+        .select('*')
+        .eq('id', 1)
+        .maybeSingle()
+        .then(({ data, error }) => {
+          if (error) return;
+          setExtensionHeartbeat(data ? mapExtensionHeartbeat(data as Record<string, unknown>) : null);
+        });
       return;
     }
 
@@ -255,7 +270,6 @@ export function DataProvider({ children }: { children: ReactNode }) {
       syncStateRes,
       summariesRes,
       retentionRes,
-      heartbeatRes,
     ] = await Promise.all([
       supabase.from('drivers').select('*').order('created_at', { ascending: true }),
       supabase.from('loads').select('*').order('created_at', { ascending: false }),
@@ -276,8 +290,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
       supabase.from('sync_state').select('*'),
       supabase.from('trip_summaries').select('*').order('end_time', { ascending: false }).limit(500),
       supabase.from('retention_settings').select('*').eq('id', 1).maybeSingle(),
-      supabase.from('extension_heartbeat').select('*').eq('id', 1).maybeSingle(),
     ]);
+    const heartbeatRes = heartbeatEarly;
 
     const err =
       driversRes.error ||
@@ -307,6 +321,17 @@ export function DataProvider({ children }: { children: ReactNode }) {
       setDataError(relayErr.message);
       setDataReady(true);
       // Keep previous relayTrips / snapshots — never replace with [] on error.
+      // Still apply heartbeat + sync_state so offline/delayed banners stay accurate.
+      if (heartbeatRes && !heartbeatRes.error) {
+        setExtensionHeartbeat(
+          heartbeatRes.data
+            ? mapExtensionHeartbeat(heartbeatRes.data as Record<string, unknown>)
+            : null,
+        );
+      }
+      if (!syncStateRes.error) {
+        setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
+      }
       return;
     }
 

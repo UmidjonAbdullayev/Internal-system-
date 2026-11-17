@@ -22,7 +22,11 @@ export function SyncStatusLine({
   const mode = liveMirrorMode(syncState, { showLastKnown, reconnectSyncing, heartbeat });
   const age = formatSyncAge(syncState?.lastSuccessfulSyncAt);
   const lastHH = formatClockHHMM(syncState?.lastSuccessfulSyncAt);
-  const aliveHH = formatClockHHMM(heartbeat?.aliveAt);
+  const aliveSource =
+    [heartbeat?.aliveAt, syncState?.lastSuccessfulSyncAt]
+      .filter(Boolean)
+      .sort((a, b) => Date.parse(String(b)) - Date.parse(String(a)))[0] || null;
+  const aliveHH = formatClockHHMM(aliveSource);
 
   if (mode === 'syncing') {
     return (

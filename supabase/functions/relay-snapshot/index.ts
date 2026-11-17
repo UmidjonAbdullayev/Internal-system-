@@ -7,6 +7,7 @@ import {
   normalizeSection,
   isValidRelayId,
   markSyncAttempt,
+  touchExtensionAlive,
   LIVE_SECTIONS,
   REMOVED_AFTER_MS,
   recordTripEvent,
@@ -62,23 +63,28 @@ Deno.serve(async (req: Request) => {
       const authStatus = ["ok", "auth_required", "unknown"].includes(String(body.auth_status || ""))
         ? String(body.auth_status)
         : "ok";
-      await sb.from("extension_heartbeat").upsert(
-        {
-          id: 1,
-          alive_at: now,
-          auth_status: authStatus,
-          client_id: body.client_id != null ? String(body.client_id) : null,
-          detail: body.detail != null ? String(body.detail).slice(0, 500) : null,
-          updated_at: now,
-        },
-        { onConflict: "id" },
-      );
+      await touchExtensionAlive(sb, {
+        now,
+        authStatus,
+        clientId: body.client_id != null ? String(body.client_id) : null,
+        detail: body.detail != null ? String(body.detail) : null,
+      });
       return json({ success: true, alive_at: now, auth_status: authStatus });
     }
 
     const tripsIn = Array.isArray(body.trips) ? body.trips : [];
     const snapshot = body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null;
     const catchUp = Boolean(body.catchUp);
+
+    // Successful authenticated sync traffic counts as liveness (MV3 setInterval heartbeats are unreliable).
+    if (tripsIn.length > 0 || snapshot) {
+      await touchExtensionAlive(sb, {
+        now,
+        authStatus: "ok",
+        clientId: body.client_id != null ? String(body.client_id) : null,
+        detail: snapshot?.section ? `sync:${snapshot.section}` : "sync",
+      }).catch(() => null);
+    }
     const errors: string[] = [];
     let snapshotMoved = 0;
     let snapshotRemoved = 0;
