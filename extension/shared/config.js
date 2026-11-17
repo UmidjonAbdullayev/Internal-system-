@@ -106,6 +106,10 @@ export const FLUSH_TIMEOUT_MS = 90 * 1000;
 export const FLUSH_BATCH_SIZE = 20;
 export const FLUSH_BACKOFF_BASE_MS = 2000;
 export const FLUSH_BACKOFF_MAX_MS = 60000;
+/** Max trips per relay-snapshot request (History + large live pushes). */
+export const HISTORY_PUSH_BATCH_SIZE = 25;
+/** Retries per batch before isolating failure. */
+export const HISTORY_PUSH_RETRIES = 3;
 
 export const TYPICAL_FULL_SYNC_SECONDS = 'always-on';
 export const HISTORY_SKIP_TTL_MS = 7 * 24 * 60 * 60 * 1000;

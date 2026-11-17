@@ -723,6 +723,8 @@ export async function syncSection(
     maxPages = null,
     /** Return early between pages when live IN_TRANSIT/UPCOMING is due. */
     shouldYield = null,
+    /** Ignore version/hash — push every trip in this fetch. */
+    forceResync = false,
   } = {},
 ) {
   const state = await getState();
@@ -937,6 +939,7 @@ export async function syncSection(
     : allTrips;
 
   if (!skipCrm) {
+    const stForce = (await getState()).forceResync;
     await hooks.onTripsDiff({
       tileCountTab,
       trips: tripsForPush.length ? tripsForPush : allTrips,
@@ -953,6 +956,7 @@ export async function syncSection(
       catchUpFoundIds: foundIds,
       catchUpStillMissing: [...stillMissing],
       sectionMismatches: mismatches,
+      forceResync: Boolean(forceResync || stForce),
     });
   }
 
@@ -973,11 +977,12 @@ export async function syncSection(
  * One HISTORY step only (P3): a single backfill page, or one ongoing window pass.
  * Live IN_TRANSIT/UPCOMING must interleave between steps — never run full multi-week loop here.
  */
-export async function syncHistoryOneStep(tabId, { shouldYield = null } = {}) {
+export async function syncHistoryOneStep(tabId, { shouldYield = null, forceResync = false } = {}) {
   const now = new Date();
   const windows = listHistoryBackfillWindows(now, TIMEZONE);
   const progress = await loadHistoryBackfill();
   const st = await getState();
+  const force = Boolean(forceResync || st.forceResync);
   const crmAccum = Number(st.historyBackfillProgress?.crmTrips) || Number(progress.crmAccum) || 0;
 
   if (!progress.done) {
@@ -1022,6 +1027,7 @@ export async function syncHistoryOneStep(tabId, { shouldYield = null } = {}) {
       startFrom,
       maxPages: 1,
       shouldYield,
+      forceResync: force,
     });
 
     if (!res.ok) {
@@ -1059,6 +1065,7 @@ export async function syncHistoryOneStep(tabId, { shouldYield = null } = {}) {
         });
         await setState({
           historyBackfillDone: true,
+          forceResync: false,
           historyBackfillProgress: {
             week: totalWindows,
             totalWeeks: totalWindows,
@@ -1122,6 +1129,7 @@ export async function syncHistoryOneStep(tabId, { shouldYield = null } = {}) {
     historyWindow: current,
     shouldYield,
     maxPages: shouldYield ? 2 : null,
+    forceResync: force,
   });
   if (!res.ok) return res;
 
@@ -1131,6 +1139,7 @@ export async function syncHistoryOneStep(tabId, { shouldYield = null } = {}) {
       historyWindow: prev,
       shouldYield,
       maxPages: 1,
+      forceResync: force,
     });
     if (!prevRes.ok) return prevRes;
     return { ok: true, ongoing: true, pages: (res.pages || 0) + (prevRes.pages || 0) };
@@ -1156,7 +1165,7 @@ export async function ensureAlarmsAlwaysOn() {
 /**
  * Main tick: ensure tab, acquire lock, run due sections.
  */
-export async function alwaysOnTick({ force = false } = {}) {
+export async function alwaysOnTick({ force = false, forceResync = false } = {}) {
   if (tickRunning) return;
   tickRunning = true;
   try {
@@ -1303,7 +1312,11 @@ export async function alwaysOnTick({ force = false } = {}) {
           due[next] = Date.parse(sec.pausedUntil);
           continue;
         }
-        const res = await syncSection(lock.tabId, next, { page1Only: false });
+        const tickForceResync = Boolean(forceResync || (await getState()).forceResync);
+        const res = await syncSection(lock.tabId, next, {
+          page1Only: false,
+          forceResync: tickForceResync,
+        });
         now = Date.now();
         if (res.ok) {
           if (next === 'IN_TRANSIT') due.IN_TRANSIT = now + jitter(schedule.IN_TRANSIT_MS);
@@ -1325,13 +1338,20 @@ export async function alwaysOnTick({ force = false } = {}) {
       if (historySteps >= maxHistoryStepsPerTick) break;
       historySteps += 1;
       const shouldYield = async () => isLiveDue('IN_TRANSIT') || isLiveDue('UPCOMING');
-      const res = await syncHistoryOneStep(lock.tabId, { shouldYield });
+      const histForce = Boolean(forceResync || (await getState()).forceResync);
+      const res = await syncHistoryOneStep(lock.tabId, {
+        shouldYield,
+        forceResync: histForce,
+      });
       now = Date.now();
       if (res.authRequired) {
         await setState({ nextDueAt: due, scheduleMs: schedule });
         return;
       }
-      if (res.ok && (res.done || res.ongoing)) {
+      if (res.ok && res.done) {
+        due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
+        if ((await getState()).forceResync) await setState({ forceResync: false });
+      } else if (res.ok && res.ongoing) {
         due.HISTORY = now + jitter(schedule.HISTORY_PAGE1_MS);
       } else if (res.ok && res.backfill) {
         // More backfill pages remain — keep HISTORY "due" so next idle tick continues
