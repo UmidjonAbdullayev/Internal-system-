@@ -136,6 +136,8 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
 .badge.collecting { background: #3a2e12; color: #f5c26b; }
 .badge.synced { background: #143528; color: #7ddea8; }
 .badge.error { background: #3a1512; color: #f3a39a; }
+.mismatch { color: #f3a39a; font-weight: 700; }
+.ok-count { color: #7ddea8; }
 
 .prompts, .tabs, .error-list { margin-top: 10px; font-size: 11px; }
 .prompt {

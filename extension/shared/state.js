@@ -81,6 +81,12 @@ const DEFAULT_STATE = {
   },
   hasRequestTemplate: false,
   alwaysOnTabId: null,
+  /** Per section { relay, crm, mismatch } from snapshot response */
+  sectionCounts: {
+    IN_TRANSIT: { relay: 0, crm: 0, mismatch: false },
+    UPCOMING: { relay: 0, crm: 0, mismatch: false },
+    HISTORY: { relay: 0, crm: 0, mismatch: false },
+  },
 };
 
 export async function getState() {
@@ -94,6 +100,26 @@ export async function getState() {
     IN_TRANSIT: { ...DEFAULT_SECTION_SYNC, ...(merged.sectionSync?.IN_TRANSIT || {}) },
     UPCOMING: { ...DEFAULT_SECTION_SYNC, ...(merged.sectionSync?.UPCOMING || {}) },
     HISTORY: { ...DEFAULT_SECTION_SYNC, ...(merged.sectionSync?.HISTORY || {}) },
+  };
+  merged.sectionCounts = {
+    IN_TRANSIT: {
+      relay: 0,
+      crm: 0,
+      mismatch: false,
+      ...(merged.sectionCounts?.IN_TRANSIT || {}),
+    },
+    UPCOMING: {
+      relay: 0,
+      crm: 0,
+      mismatch: false,
+      ...(merged.sectionCounts?.UPCOMING || {}),
+    },
+    HISTORY: {
+      relay: 0,
+      crm: 0,
+      mismatch: false,
+      ...(merged.sectionCounts?.HISTORY || {}),
+    },
   };
   return merged;
 }

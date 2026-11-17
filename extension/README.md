@@ -1,16 +1,15 @@
 # Amazon Relay → Internal Sys Chrome Extension (MV3)
 
-## Method (v1.5.0) — always-on entitiesV2
+## v1.6.0 — snapshot accuracy (stacked on always-on 1.5.0)
 
-Captures and **schedules** `POST /api/tours/entitiesV2` for `IN_TRANSIT` / `UPCOMING` / `HISTORY` without opening section tabs or clicking rows.
+- Always-on `entitiesV2` for IN_TRANSIT / UPCOMING / HISTORY
+- CRM: UPSERT `relay_trips` by `trip_id` (= entity.id); legs/stops separate
+- After full section pagination: snapshot `{ section, tripIds, totalRecords }` when unique count matches
+- Popup: **Relay: N | CRM: N** (red if mismatch)
 
-1. Passive capture seeds a request **template** (body + headers, no cookies).
-2. Always-on keeps a pinned inactive Relay tab; MAIN-world fetch replays the template.
-3. Schedules (mins enforced): In Transit 45s, Upcoming 90s, History full backfill then page1/10min.
-4. Change detection → immediate CRM flush. Badge: green = in-transit count; `!` = log in to Relay.
+## Verify
 
-## Load / verify
-
-1. Load unpacked `extension/` → version **1.5.0** → refresh Relay tabs
-2. Popup login → API key → **GO LIVE**
-3. Console: MAIN `entitiesV2 hooks installed` / SW `[RelayCapture] tab=IN_TRANSIT pages=N trips=N new=N changed=N removed=N`
+1. Load unpacked **1.6.0** → GO LIVE
+2. SW: `[RelayCapture] tab=IN_TRANSIT pages=N trips=N new=N changed=N removed=N`
+3. Popup section rows show Relay vs CRM counts
+4. On mismatch / skip: `snapshot SKIP … unique tripIds=… != totalRecords=…`
