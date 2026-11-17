@@ -25,6 +25,7 @@ import type {
   RelaySyncHealth,
   SyncStateRow,
   TripSummary,
+  ExtensionHeartbeat,
 } from '@/types';
 import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations';
 import { generateId, getWeekRange } from '@/lib/utils';
@@ -41,6 +42,7 @@ import {
   mapRelayPayment,
   mapRelaySectionSnapshot,
   mapSettlement,
+  mapExtensionHeartbeat,
   mapSyncState,
   mapTripSummary,
 } from '@/lib/supabaseMappers';
@@ -99,6 +101,7 @@ interface DataContextValue {
   activityLogs: ActivityLog[];
   grossAdjustments: GrossAdjustment[];
   syncState: SyncStateRow[];
+  extensionHeartbeat: ExtensionHeartbeat | null;
   sectionSnapshots: RelaySectionSnapshot[];
   tripSummaries: TripSummary[];
   currentUser: AppUser;
@@ -182,6 +185,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
   const [grossAdjustments, setGrossAdjustments] = useState<GrossAdjustment[]>([]);
   const [syncState, setSyncState] = useState<SyncStateRow[]>([]);
+  const [extensionHeartbeat, setExtensionHeartbeat] = useState<ExtensionHeartbeat | null>(null);
   const [sectionSnapshots, setSectionSnapshots] = useState<RelaySectionSnapshot[]>([]);
   const [tripSummaries, setTripSummaries] = useState<TripSummary[]>([]);
   const [currentUser] = useState<AppUser>(EMPTY_USER);
@@ -210,6 +214,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       syncStateRes,
       summariesRes,
       retentionRes,
+      heartbeatRes,
     ] = await Promise.all([
       supabase.from('drivers').select('*').order('created_at', { ascending: true }),
       supabase.from('loads').select('*').order('created_at', { ascending: false }),
@@ -233,6 +238,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       supabase.from('sync_state').select('*'),
       supabase.from('trip_summaries').select('*').order('end_time', { ascending: false }).limit(500),
       supabase.from('retention_settings').select('*').eq('id', 1).maybeSingle(),
+      supabase.from('extension_heartbeat').select('*').eq('id', 1).maybeSingle(),
     ]);
 
     const err =
@@ -333,6 +339,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
     if (!syncStateRes.error) {
       setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
+    }
+    if (!heartbeatRes.error) {
+      setExtensionHeartbeat(
+        heartbeatRes.data
+          ? mapExtensionHeartbeat(heartbeatRes.data as Record<string, unknown>)
+          : null,
+      );
     }
     if (!summariesRes.error) {
       setTripSummaries(
@@ -1152,6 +1165,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       activityLogs,
       grossAdjustments,
       syncState,
+      extensionHeartbeat,
       sectionSnapshots,
       tripSummaries,
       currentUser,
@@ -1203,6 +1217,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       activityLogs,
       grossAdjustments,
       syncState,
+      extensionHeartbeat,
       sectionSnapshots,
       tripSummaries,
       currentUser,

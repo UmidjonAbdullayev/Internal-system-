@@ -1,17 +1,28 @@
-import type { SyncStateRow } from '@/types';
-import { formatSyncAge, isSectionPaused, liveMirrorMode } from '@/lib/liveMirrors';
+import type { ExtensionHeartbeat, SyncStateRow } from '@/types';
+import {
+  formatClockHHMM,
+  formatSyncAge,
+  isSectionPaused,
+  liveMirrorMode,
+} from '@/lib/liveMirrors';
 
 export function SyncStatusLine({
   syncState,
   showLastKnown = false,
   reconnectSyncing = false,
+  heartbeat = null,
+  sectionLabel = 'IN_TRANSIT',
 }: {
   syncState?: SyncStateRow;
   showLastKnown?: boolean;
   reconnectSyncing?: boolean;
+  heartbeat?: ExtensionHeartbeat | null;
+  sectionLabel?: string;
 }) {
-  const mode = liveMirrorMode(syncState, { showLastKnown, reconnectSyncing });
+  const mode = liveMirrorMode(syncState, { showLastKnown, reconnectSyncing, heartbeat });
   const age = formatSyncAge(syncState?.lastSuccessfulSyncAt);
+  const lastHH = formatClockHHMM(syncState?.lastSuccessfulSyncAt);
+  const aliveHH = formatClockHHMM(heartbeat?.aliveAt);
 
   if (mode === 'syncing') {
     return (
@@ -20,17 +31,31 @@ export function SyncStatusLine({
       </p>
     );
   }
-  if (mode === 'paused' || isSectionPaused(syncState)) {
+  if (mode === 'auth') {
     return (
       <p className="text-sm text-red-700" role="status">
-        Sync paused — last successful sync {age}. Log in to Relay / resume extension.
+        Logged out of Relay. Log in again.
+      </p>
+    );
+  }
+  if (mode === 'offline') {
+    return (
+      <p className="text-sm text-red-700" role="status">
+        Extension offline{aliveHH ? ` since ${aliveHH}` : ''}.
+      </p>
+    );
+  }
+  if (mode === 'delayed' || mode === 'paused' || isSectionPaused(syncState)) {
+    return (
+      <p className="text-sm text-amber-800" role="status">
+        Relay sync delayed ({sectionLabel} last {lastHH || age}). Retrying…
       </p>
     );
   }
   if (mode === 'last_known') {
     return (
       <p className="text-sm text-text-secondary" role="status">
-        Showing last known data (sync paused · {age}).
+        Showing last known data (sync delayed · {age}).
       </p>
     );
   }

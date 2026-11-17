@@ -3,6 +3,7 @@ import type {
   Driver,
   DriverFee,
   DriverStatus,
+  ExtensionHeartbeat,
   Load,
   LoadReport,
   LoadStatus,
@@ -366,6 +367,19 @@ export function mapSyncState(row: Record<string, unknown>): SyncStateRow {
     lastError: row.last_error ? str(row.last_error) : null,
     syncing: Boolean(row.syncing),
     updatedAt: str(row.updated_at),
+  };
+}
+
+export function mapExtensionHeartbeat(row: Record<string, unknown> | null | undefined): ExtensionHeartbeat {
+  const authRaw = row?.auth_status ? str(row.auth_status) : 'unknown';
+  const authStatus =
+    authRaw === 'ok' || authRaw === 'auth_required' ? authRaw : 'unknown';
+  return {
+    aliveAt: row?.alive_at ? str(row.alive_at) : null,
+    authStatus,
+    clientId: row?.client_id ? str(row.client_id) : null,
+    detail: row?.detail ? str(row.detail) : null,
+    updatedAt: row?.updated_at ? str(row.updated_at) : null,
   };
 }
 
