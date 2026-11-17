@@ -1,9 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Internal Sys — Amazon Relay Sync",
+  "name": "Internal Sys \u2014 Amazon Relay Sync",
   "version": "1.8.1",
   "description": "Per-tab entitiesV2 sync; alarm-backed extension_alive heartbeat; HISTORY 7-day windows.",
-  "permissions": ["storage", "tabs", "alarms"],
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "unlimitedStorage"
+  ],
   "host_permissions": [
     "https://relay.amazon.com/*",
     "https://*.relay.amazon.com/*",
@@ -28,14 +33,24 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://relay.amazon.com/*", "https://*.relay.amazon.com/*"],
-      "js": ["content/injected.js"],
+      "matches": [
+        "https://relay.amazon.com/*",
+        "https://*.relay.amazon.com/*"
+      ],
+      "js": [
+        "content/injected.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://relay.amazon.com/*", "https://*.relay.amazon.com/*"],
-      "js": ["content/content.js"],
+      "matches": [
+        "https://relay.amazon.com/*",
+        "https://*.relay.amazon.com/*"
+      ],
+      "js": [
+        "content/content.js"
+      ],
       "run_at": "document_start"
     }
   ],
