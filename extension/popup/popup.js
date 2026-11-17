@@ -66,17 +66,30 @@ function render(state) {
 
   const tileSync = state.sectionSync || {};
   const counts = state.sectionCounts || {};
+  const tplMeta = state.templateMeta || {};
+  const tplWrong = state.templateWrong || {};
+  const histProg = state.historyBackfillProgress || {};
   $('tile-sync').innerHTML = ['IN_TRANSIT', 'UPCOMING', 'HISTORY']
     .map((tab) => {
       const s = tileSync[tab] || {};
       const c = counts[tab] || {};
+      const meta = tplMeta[tab] || {};
       const when = s.lastSyncAt ? new Date(s.lastSyncAt).toLocaleTimeString() : '—';
-      const err = s.lastError ? ` · ${s.lastError}` : '';
+      const wrong =
+        (tab === 'UPCOMING' && tplWrong.UPCOMING) ||
+        (tab === 'IN_TRANSIT' && tplWrong.IN_TRANSIT);
+      const errFull = wrong
+        ? tplWrong.message || s.lastError || 'template wrong'
+        : s.lastError || '';
+      const err = errFull ? ` · ${errFull}` : '';
       const relayN = c.relay ?? s.trips ?? 0;
       const crmN = c.crm ?? '—';
       const mismatch = Boolean(c.mismatch) || (crmN !== '—' && Number(crmN) !== Number(relayN));
-      const countCls = mismatch ? 'mismatch' : 'ok-count';
-      return `<li><span>${tab}</span><span class="badge ${s.lastError ? 'error' : 'collecting'}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when}${err}</span></li>`;
+      const countCls = mismatch || wrong ? 'mismatch' : 'ok-count';
+      const src = meta.label || (meta.source === 'fallback' ? 'fallback' : meta.source || '—');
+      const histExtra =
+        tab === 'HISTORY' && histProg.label ? ` · ${histProg.label}` : '';
+      return `<li><span>${tab}</span><span class="badge ${s.lastError || wrong ? 'error' : 'collecting'}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when} · ${src}${histExtra}${err}</span></li>`;
     })
     .join('');
 

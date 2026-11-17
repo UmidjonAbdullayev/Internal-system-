@@ -11,7 +11,12 @@ const upcomingEl = document.getElementById('sched-upcoming');
 const historyEl = document.getElementById('sched-history');
 
 async function loadStats() {
-  const stored = await chrome.storage.local.get([RAW_CAPTURES_KEY, 'relayState', 'relayRequestTemplate']);
+  const stored = await chrome.storage.local.get([
+    RAW_CAPTURES_KEY,
+    'relayState',
+    'relayRequestTemplate',
+    'relayRequestTemplates',
+  ]);
   const captures = stored[RAW_CAPTURES_KEY] || [];
   const state = stored.relayState || {};
   const sched = state.scheduleMs || {};
@@ -25,9 +30,14 @@ async function loadStats() {
     `Health: ${state.health?.status || '—'} ${state.health?.message || ''}`,
     `Last tab: ${state.lastCaptureTab || '—'}`,
   ].join('\n');
-  templateStatus.textContent = stored.relayRequestTemplate?.body
-    ? `Request template: seeded (${stored.relayRequestTemplate.at || '—'})`
-    : 'Request template: not seeded yet (open Relay / GO LIVE)';
+  const map = stored.relayRequestTemplates || {};
+  const lines = ['UPCOMING', 'IN_TRANSIT', 'HISTORY'].map((tab) => {
+    const t = map[tab];
+    if (t?.body) return `${tab}: live capture (${t.at || '—'})`;
+    if (tab === 'IN_TRANSIT') return `${tab}: missing — open Relay In Transit to capture`;
+    return `${tab}: fallback (built-in) until live capture`;
+  });
+  templateStatus.textContent = lines.join('\n');
 }
 
 btn.addEventListener('click', async () => {

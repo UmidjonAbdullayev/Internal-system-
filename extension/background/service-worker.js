@@ -38,8 +38,8 @@ import { extractTrips, countTripStats, tripContentHashPayload, hashString } from
 import { tripsToCrmLoads, tripsToEdgePayload } from '../shared/map-to-crm.js';
 import {
   configureAlwaysOn,
-  saveRequestTemplate,
-  getRequestTemplate,
+  saveTabRequestTemplate,
+  resolveTabTemplate,
   stripCookieHeaders,
   enforceScheduleMs,
   ensureAlarmsAlwaysOn,
@@ -269,7 +269,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return;
         }
         flushRunning = false;
-        const hasTpl = Boolean(await getRequestTemplate());
+        const hasUpcoming = Boolean((await resolveTabTemplate('UPCOMING'))?.body);
+        const hasHistory = Boolean((await resolveTabTemplate('HISTORY'))?.body);
+        const hasInTransit = Boolean((await resolveTabTemplate('IN_TRANSIT'))?.body);
+        const hasTpl = hasUpcoming || hasHistory || hasInTransit;
         await setState({
           live: true,
           syncErrors: [],
@@ -280,8 +283,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           syncProgress: {
             phase: 'always-on',
             detail: hasTpl
-              ? 'Always-on sync starting — IN_TRANSIT / UPCOMING / HISTORY.'
-              : 'Opening Relay tab to seed entitiesV2 request template…',
+              ? `Always-on sync — per-tab bodies (UPCOMING ${hasUpcoming ? 'ok' : 'fallback/missing'}, IN_TRANSIT ${hasInTransit ? 'ok' : 'needs capture'}, HISTORY ${hasHistory ? 'ok' : 'fallback/missing'}).`
+              : 'Opening Relay tab to seed per-tab entitiesV2 templates…',
             percent: 10,
             startedAt: new Date().toISOString(),
             typicalSeconds: TYPICAL_FULL_SYNC_SECONDS,
@@ -385,22 +388,15 @@ async function handleCapture(msg) {
     const capturedAt = msg.capturedAt || new Date().toISOString();
     const tab = requestBody?.tileCountTab || '?';
 
-    if (requestBody && typeof requestBody === 'object') {
-      const existing = await getRequestTemplate();
-      if (!existing?.body) {
-        await saveRequestTemplate(requestBody, headers, {
-          at: capturedAt,
-          pageUrl: msg.pageUrl || null,
-        });
-        log('request template seeded from capture', tab);
-        if (state.live) void alwaysOnTick({ force: true });
-      } else {
-        // Refresh headers/body from latest successful capture
-        await saveRequestTemplate(requestBody, headers, {
-          at: capturedAt,
-          pageUrl: msg.pageUrl || null,
-        });
-      }
+    if (requestBody && typeof requestBody === 'object' && tab && tab !== '?') {
+      // Per-tab overwrite only — never reuse another tab's filter body
+      const existed = Boolean((await resolveTabTemplate(tab))?.body);
+      await saveTabRequestTemplate(tab, requestBody, headers, {
+        at: capturedAt,
+        pageUrl: msg.pageUrl || null,
+      });
+      log(`request template ${existed ? 'updated' : 'seeded'} for`, tab);
+      if (state.live && !existed) void alwaysOnTick({ force: true });
     }
 
     if (!state.live || !state.loggedIn) return;
@@ -459,7 +455,12 @@ async function handleCapture(msg) {
 }
 
 async function handleTripsDiff(diff) {
-  const { tileCountTab, newTrips, changedTrips, removedTripIds, trips, snapshot, catchUp } = diff;
+  const { tileCountTab, newTrips, changedTrips, removedTripIds, trips, snapshot, catchUp, skipCrm } =
+    diff;
+  if (skipCrm || diff.templateWrong) {
+    log(`skip CRM push for ${tileCountTab}: template wrong / overlap`);
+    return;
+  }
   const toPush = [...newTrips, ...changedTrips];
 
   // Always send full section trip payloads + optional snapshot to new CRM model
