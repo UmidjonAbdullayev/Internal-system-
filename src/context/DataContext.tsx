@@ -23,6 +23,8 @@ import type {
   RelayTrip,
   RelaySectionSnapshot,
   RelaySyncHealth,
+  SyncStateRow,
+  TripSummary,
 } from '@/types';
 import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations';
 import { generateId, getWeekRange } from '@/lib/utils';
@@ -39,8 +41,11 @@ import {
   mapRelayPayment,
   mapRelaySectionSnapshot,
   mapSettlement,
+  mapSyncState,
+  mapTripSummary,
 } from '@/lib/supabaseMappers';
 import { computeSyncHealth } from '@/lib/relayTrips';
+import { DEFAULT_HISTORY_RETENTION_DAYS } from '@/lib/liveMirrors';
 import {
   buildReportFromLoad,
   isBadReportLocation,
@@ -57,6 +62,7 @@ interface CompanySettings {
   defaultDispatchFeePercent: number;
   currency: string;
   timezone: string;
+  historyRetentionDays: number;
 }
 
 /** Clean-start defaults — no sample drivers/loads (sampleData kept for scripts only). */
@@ -76,6 +82,7 @@ const EMPTY_SETTINGS: CompanySettings = {
   defaultDispatchFeePercent: 10,
   currency: 'USD',
   timezone: 'America/Chicago',
+  historyRetentionDays: DEFAULT_HISTORY_RETENTION_DAYS,
 };
 
 interface DataContextValue {
@@ -91,6 +98,9 @@ interface DataContextValue {
   settlements: Settlement[];
   activityLogs: ActivityLog[];
   grossAdjustments: GrossAdjustment[];
+  syncState: SyncStateRow[];
+  sectionSnapshots: RelaySectionSnapshot[];
+  tripSummaries: TripSummary[];
   currentUser: AppUser;
   companySettings: CompanySettings;
   dataSource: 'supabase' | 'local';
@@ -171,6 +181,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
   const [grossAdjustments, setGrossAdjustments] = useState<GrossAdjustment[]>([]);
+  const [syncState, setSyncState] = useState<SyncStateRow[]>([]);
+  const [sectionSnapshots, setSectionSnapshots] = useState<RelaySectionSnapshot[]>([]);
+  const [tripSummaries, setTripSummaries] = useState<TripSummary[]>([]);
   const [currentUser] = useState<AppUser>(EMPTY_USER);
   const [companySettings, setCompanySettings] = useState<CompanySettings>(EMPTY_SETTINGS);
   const [dataReady, setDataReady] = useState(false);
@@ -194,6 +207,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
       settlementChargesRes,
       paymentsRes,
       activityRes,
+      syncStateRes,
+      summariesRes,
+      retentionRes,
     ] = await Promise.all([
       supabase.from('drivers').select('*').order('created_at', { ascending: true }),
       supabase.from('loads').select('*').order('created_at', { ascending: false }),
@@ -214,6 +230,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
       supabase.from('settlement_charges').select('*'),
       supabase.from('payments').select('*').order('payment_date', { ascending: false }),
       supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
+      supabase.from('sync_state').select('*'),
+      supabase.from('trip_summaries').select('*').order('end_time', { ascending: false }).limit(500),
+      supabase.from('retention_settings').select('*').eq('id', 1).maybeSingle(),
     ]);
 
     const err =
@@ -309,7 +328,25 @@ export function DataProvider({ children }: { children: ReactNode }) {
         .find((v) => Boolean(v)) || null;
     setRelayTrips(assembledTrips);
     setRelaySnapshots(snapshots);
+    setSectionSnapshots(snapshots);
     setRelaySyncHealth(computeSyncHealth(snapshots, assembledTrips, lastRunFinished));
+
+    if (!syncStateRes.error) {
+      setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
+    }
+    if (!summariesRes.error) {
+      setTripSummaries(
+        (summariesRes.data || []).map((r) => mapTripSummary(r as Record<string, unknown>)),
+      );
+    }
+    if (!retentionRes.error && retentionRes.data) {
+      const days = Number(
+        (retentionRes.data as { history_retention_days?: number }).history_retention_days,
+      );
+      if (Number.isFinite(days) && days >= 1) {
+        setCompanySettings((prev) => ({ ...prev, historyRetentionDays: days }));
+      }
+    }
 
     setLoadReports(
       (loadReportsRes.data || []).map((r) => mapLoadReport(r as Record<string, unknown>)),
@@ -1081,7 +1118,22 @@ export function DataProvider({ children }: { children: ReactNode }) {
   );
 
   const updateSettings = useCallback((patch: Partial<CompanySettings>) => {
-    setCompanySettings((prev) => ({ ...prev, ...patch }));
+    setCompanySettings((prev) => {
+      const next = { ...prev, ...patch };
+      if (patch.historyRetentionDays != null) {
+        void supabase
+          .from('retention_settings')
+          .upsert({
+            id: 1,
+            history_retention_days: Math.max(1, Number(patch.historyRetentionDays) || 45),
+            updated_at: now(),
+          })
+          .then(({ error }) => {
+            if (error) console.error('retention_settings update failed', error.message);
+          });
+      }
+      return next;
+    });
     toast.success('Settings saved');
   }, []);
 
@@ -1099,6 +1151,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
       settlements,
       activityLogs,
       grossAdjustments,
+      syncState,
+      sectionSnapshots,
+      tripSummaries,
       currentUser,
       companySettings,
       dataSource: 'supabase',
@@ -1147,6 +1202,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
       settlements,
       activityLogs,
       grossAdjustments,
+      syncState,
+      sectionSnapshots,
+      tripSummaries,
       currentUser,
       companySettings,
       dataReady,

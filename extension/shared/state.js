@@ -87,6 +87,16 @@ const DEFAULT_STATE = {
     UPCOMING: { relay: 0, crm: 0, mismatch: false },
     HISTORY: { relay: 0, crm: 0, mismatch: false },
   },
+  /** After pause: Syncing… until first complete live snapshots + HISTORY catch-up */
+  reconnectSyncing: false,
+  pendingCatchUpMissing: [],
+  catchUp: {
+    active: false,
+    missingTripIds: [],
+    foundTripIds: [],
+    untilIso: null,
+    startedAt: null,
+  },
 };
 
 export async function getState() {
@@ -121,6 +131,14 @@ export async function getState() {
       ...(merged.sectionCounts?.HISTORY || {}),
     },
   };
+  merged.catchUp = {
+    active: false,
+    missingTripIds: [],
+    foundTripIds: [],
+    untilIso: null,
+    startedAt: null,
+    ...(merged.catchUp || {}),
+  };
   return merged;
 }
 
@@ -147,6 +165,16 @@ export async function setState(patch) {
       IN_TRANSIT: { ...current.sectionSync.IN_TRANSIT, ...(patch.sectionSync.IN_TRANSIT || {}) },
       UPCOMING: { ...current.sectionSync.UPCOMING, ...(patch.sectionSync.UPCOMING || {}) },
       HISTORY: { ...current.sectionSync.HISTORY, ...(patch.sectionSync.HISTORY || {}) },
+    };
+  }
+  if (patch.catchUp) {
+    next.catchUp = { ...current.catchUp, ...patch.catchUp };
+  }
+  if (patch.sectionCounts) {
+    next.sectionCounts = {
+      IN_TRANSIT: { ...current.sectionCounts.IN_TRANSIT, ...(patch.sectionCounts.IN_TRANSIT || {}) },
+      UPCOMING: { ...current.sectionCounts.UPCOMING, ...(patch.sectionCounts.UPCOMING || {}) },
+      HISTORY: { ...current.sectionCounts.HISTORY, ...(patch.sectionCounts.HISTORY || {}) },
     };
   }
   await chrome.storage.local.set({ relayState: next });
