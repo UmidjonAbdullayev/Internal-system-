@@ -124,10 +124,32 @@ export function getDateRangeFromPreset(
         end: format(endOfMonth(lastMonth), 'yyyy-MM-dd'),
       };
     }
+    case 'last_45_days':
+      return {
+        start: format(subDays(today, 44), 'yyyy-MM-dd'),
+        end: format(endOfDay(today), 'yyyy-MM-dd'),
+      };
     case 'custom':
       return custom ?? getWeekRange(today);
     default:
       return getWeekRange(today);
+  }
+}
+
+/** Calendar yyyy-MM-dd for an instant in a timezone (History end-time filter). */
+export function isoToZonedYmd(iso: string | null | undefined, timeZone = 'Asia/Tashkent'): string | null {
+  if (!iso) return null;
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d);
+  } catch {
+    return null;
   }
 }
 

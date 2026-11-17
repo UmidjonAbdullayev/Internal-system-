@@ -92,66 +92,16 @@ export async function resolveDispatchChatId(sb: SupabaseClient): Promise<string 
   );
 }
 
+/** Spec: NO automatic system messages (sync restored / catch-up). Always no-op. */
 export async function sendRestoreSummary(
-  sb: SupabaseClient,
-  summary: {
+  _sb: SupabaseClient,
+  _summary: {
     found: number;
     removed: number;
     gapStart: string | null;
     gapEnd: string | null;
   },
 ): Promise<{ sent: boolean; error?: string }> {
-  const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN");
-  if (!botToken) return { sent: false, error: "no_bot_token" };
-  const chatId = await resolveDispatchChatId(sb);
-  if (!chatId) return { sent: false, error: "no_chat_id" };
-
-  const gapMins =
-    summary.gapStart && summary.gapEnd
-      ? Math.max(
-        1,
-        Math.round(
-          (Date.parse(summary.gapEnd) - Date.parse(summary.gapStart)) / 60000,
-        ),
-      )
-      : null;
-  const lines = [
-    `<b>Sync restored</b> · Relay catch-up done`,
-    gapMins != null
-      ? `Gap ~${gapMins}m · found ${summary.found} · review ${summary.removed}`
-      : `Found ${summary.found} · review ${summary.removed}`,
-    `No overdue alerts for resolved gap`,
-  ];
-  const text = lines.join("\n").slice(0, 900);
-
-  try {
-    const tg = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      }),
-    });
-    if (!tg.ok) return { sent: false, error: await tg.text() };
-
-    await sb.from("alerts_sent").upsert(
-      {
-        trip_id: "_sync_",
-        stop_id: "",
-        alert_type: "sync_restored",
-        level: "catch_up",
-        chat_id: chatId,
-        meta: summary,
-      },
-      { onConflict: "trip_id,stop_id,alert_type,level", ignoreDuplicates: true },
-    ).catch(() => null);
-
-    return { sent: true };
-  } catch (err) {
-    return { sent: false, error: String(err) };
-  }
+  return { sent: false, error: "system_messages_disabled" };
 }
 

@@ -37,7 +37,36 @@ export type StatusEvent = {
   facility?: string | null;
   startTime?: string | null;
   timing?: "late" | "early" | "on_time" | null;
+  /** Relay driverList[].id / entity.drivers[].id */
+  relayDriverIds?: string[];
 };
+
+export function extractRelayDriverIds(raw: unknown): string[] {
+  const ids: string[] = [];
+  const push = (v: unknown) => {
+    const s = String(v || "").trim();
+    if (s) ids.push(s);
+  };
+  if (!raw || typeof raw !== "object") return ids;
+  const obj = raw as Record<string, unknown>;
+  if (Array.isArray(obj.drivers)) {
+    for (const d of obj.drivers) {
+      if (d && typeof d === "object") push((d as Record<string, unknown>).id);
+    }
+  }
+  if (Array.isArray(obj.loads)) {
+    for (const load of obj.loads) {
+      if (!load || typeof load !== "object") continue;
+      const list = (load as Record<string, unknown>).driverList;
+      if (Array.isArray(list)) {
+        for (const d of list) {
+          if (d && typeof d === "object") push((d as Record<string, unknown>).id);
+        }
+      }
+    }
+  }
+  return [...new Set(ids)];
+}
 
 function esc(s: string): string {
   return s
@@ -194,6 +223,7 @@ export async function processStatusEvents(
       level: built.level,
       html: built.html,
       meta: { kind: ev.kind },
+      relayDriverIds: ev.relayDriverIds || [],
     };
     results.push({ tripId: ev.tripId, alertType: ev.kind, ...(await dispatchAlert(sb, botToken, config, settings, out)) });
   }
@@ -230,53 +260,46 @@ export async function runCronChecks(
     : 0;
   const stale = !lastOk || now - lastOk > SYNC_STALE_MS;
 
+  // Spec: NO automatic system messages (sync lost/restored). Still pause time-based alerts.
   if (stale) {
     if (!config.sync_stale_notified) {
-      const html =
-        `🛑 Sync stopped\nNo successful Relay sync in 5m\nTime-based alerts paused`;
-      const r = await dispatchAlert(sb, botToken, config, settings, {
-        tripId: "SYNC",
-        alertType: "sync_stopped",
-        level: String(Math.floor(now / SYNC_STALE_MS)),
-        html,
-        force: false,
-        meta: { lastOk },
-      });
-      results.push({ alertType: "sync_stopped", ...r });
       await sb
         .from("telegram_alert_config")
         .update({ sync_stale_notified: true, updated_at: new Date().toISOString() })
         .eq("id", 1);
+      results.push({ alertType: "sync_stopped", status: "suppressed_no_system_msgs" });
     }
     return { paused: true, reason: "sync_stale", results };
   }
 
   if (config.sync_stale_notified) {
-    const html = `🟢 Sync restored\nRelay sync is healthy again\nTime-based alerts resumed`;
-    const r = await dispatchAlert(sb, botToken, config, settings, {
-      tripId: "SYNC",
-      alertType: "sync_restored",
-      level: String(Math.floor(now / SYNC_STALE_MS)),
-      html,
-      meta: { lastOk },
-    });
-    results.push({ alertType: "sync_restored", ...r });
     await sb
       .from("telegram_alert_config")
       .update({ sync_stale_notified: false, updated_at: new Date().toISOString() })
       .eq("id", 1);
+    results.push({ alertType: "sync_restored", status: "suppressed_no_system_msgs" });
   }
 
   // Prefer relay_trips / relay_stops when present
   const { data: trips } = await sb
     .from("relay_trips")
     .select(
-      "trip_id, section, status, driver_name_raw, start_time, execution_status, tour_state",
+      "trip_id, section, status, driver_name_raw, start_time, execution_status, tour_state, raw",
     )
     .eq("archived", false)
     .in("section", ["UPCOMING", "IN_TRANSIT"]);
 
   const tripIds = (trips || []).map((t) => t.trip_id);
+  const tripById = new Map((trips || []).map((t) => [t.trip_id, t]));
+  const driverIdsFor = (tripId: string) =>
+    extractRelayDriverIds(tripById.get(tripId)?.raw ?? null);
+  const dispatch = (alert: OutgoingAlert) =>
+    dispatchAlert(sb, botToken, config, settings, {
+      ...alert,
+      relayDriverIds: alert.relayDriverIds?.length
+        ? alert.relayDriverIds
+        : driverIdsFor(alert.tripId),
+    });
   let stops: Array<Record<string, unknown>> = [];
   let legs: Array<Record<string, unknown>> = [];
   if (tripIds.length) {
@@ -295,8 +318,6 @@ export async function runCronChecks(
       .eq("archived", false);
     legs = legRows || [];
   }
-
-  const tripById = new Map((trips || []).map((t) => [t.trip_id, t]));
 
   // Fallback: loads upcoming/in_transit when no relay_trips yet
   if (!trips?.length) {
@@ -324,7 +345,7 @@ export async function runCronChecks(
             config.timezone,
           );
           results.push({
-            ...(await dispatchAlert(sb, botToken, config, settings, {
+            ...(await dispatch( {
               tripId,
               alertType: "no_driver",
               level: built.level,
@@ -363,7 +384,7 @@ export async function runCronChecks(
             `Sch ${formatLocal(String(stop.scheduled_arrival), tz)}`,
           );
           results.push({
-            ...(await dispatchAlert(sb, botToken, config, settings, {
+            ...(await dispatch( {
               tripId,
               stopId,
               alertType: "not_at_stop",
@@ -382,7 +403,7 @@ export async function runCronChecks(
       if (slip > LATE_GRACE_MS) {
         const baseLevel = "15";
         results.push({
-          ...(await dispatchAlert(sb, botToken, config, settings, {
+          ...(await dispatch( {
             tripId,
             stopId,
             alertType: "running_late",
@@ -401,7 +422,7 @@ export async function runCronChecks(
         const buckets = Math.floor(extra / ETA_RESLIP_MS);
         if (buckets >= 1) {
           results.push({
-            ...(await dispatchAlert(sb, botToken, config, settings, {
+            ...(await dispatch( {
               tripId,
               stopId,
               alertType: "running_late",
@@ -424,7 +445,7 @@ export async function runCronChecks(
       const waited = now - actual;
       if (waited >= LATE_REASON_WAIT_MS && !stop.late_reason) {
         results.push({
-          ...(await dispatchAlert(sb, botToken, config, settings, {
+          ...(await dispatch( {
             tripId,
             stopId,
             alertType: "late_no_reason",
@@ -462,7 +483,7 @@ export async function runCronChecks(
     if (untilCpt <= CPT_RISK_MS) {
       const level = untilCpt <= 0 ? "passed" : "20";
       results.push({
-        ...(await dispatchAlert(sb, botToken, config, settings, {
+        ...(await dispatch( {
           tripId,
           stopId: String(pickup.stop_id),
           alertType: "cpt_risk",
@@ -497,7 +518,7 @@ export async function runCronChecks(
       config.timezone,
     );
     results.push({
-      ...(await dispatchAlert(sb, botToken, config, settings, {
+      ...(await dispatch({
         tripId: trip.trip_id,
         alertType: "no_driver",
         level: built.level,
@@ -514,8 +535,10 @@ export async function sendAllTestAlerts(
   botToken: string,
   config: AlertConfig,
   settings: Map<string, AlertSetting>,
+  opts?: { chatIds?: string[] },
 ): Promise<Array<Record<string, unknown>>> {
   const tripId = "TEST-TRIP";
+  const chatIds = opts?.chatIds;
   const tz = config.timezone;
   const samples: StatusEvent[] = [
     { kind: "trip_booked", tripId, driver: "Test Driver", section: "UPCOMING" },
@@ -565,6 +588,7 @@ export async function sendAllTestAlerts(
         html: `[TEST] ${built.html}`,
         force: true,
         meta: { test: true },
+        chatIds,
       })),
     });
   }
@@ -592,32 +616,12 @@ export async function sendAllTestAlerts(
         html: `[TEST] ${buildTimeHtml(t.kind, tripId, t.l2, t.l3)}`,
         force: true,
         meta: { test: true },
+        chatIds,
       })),
     });
   }
 
-  out.push({
-    alertType: "sync_stopped",
-    ...(await dispatchAlert(sb, botToken, config, settings, {
-      tripId: "SYNC",
-      alertType: "sync_stopped",
-      level: "test",
-      html: `[TEST] 🛑 Sync stopped\nNo successful Relay sync in 5m\nTime-based alerts paused`,
-      force: true,
-      meta: { test: true },
-    })),
-  });
-  out.push({
-    alertType: "sync_restored",
-    ...(await dispatchAlert(sb, botToken, config, settings, {
-      tripId: "SYNC",
-      alertType: "sync_restored",
-      level: "test",
-      html: `[TEST] 🟢 Sync restored\nRelay sync is healthy again\nTime-based alerts resumed`,
-      force: true,
-      meta: { test: true },
-    })),
-  });
+  // No sync_stopped / sync_restored — system autos removed from product.
 
   return out;
 }

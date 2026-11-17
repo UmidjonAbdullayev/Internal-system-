@@ -34,11 +34,20 @@ function authOk(req: Request): boolean {
   return Boolean(expected && provided && provided === expected);
 }
 
+/** Env TELEGRAM_ALERTS_ENABLED default OFF — hard check before every automatic send. */
+function isTelegramAlertsEnabled(): boolean {
+  const v = (Deno.env.get("TELEGRAM_ALERTS_ENABLED") || "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 async function sendTelegram(
   botToken: string,
   chatId: string,
   text: string,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; skipped?: boolean }> {
+  if (!isTelegramAlertsEnabled()) {
+    return { ok: false, skipped: true, error: "TELEGRAM_ALERTS_ENABLED is OFF" };
+  }
   try {
     const tg = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: "POST",

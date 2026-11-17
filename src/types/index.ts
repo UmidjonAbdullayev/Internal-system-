@@ -392,6 +392,7 @@ export type DatePreset =
   | 'last_week'
   | 'this_month'
   | 'last_month'
+  | 'last_45_days'
   | 'custom';
 
 /** Spreadsheet row for Reports tab (persisted ops sheet). */

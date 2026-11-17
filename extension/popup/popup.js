@@ -2,6 +2,13 @@ import { SECTIONS } from '../shared/config.js';
 
 const $ = (id) => document.getElementById(id);
 
+function escapeAttr(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;');
+}
+
 async function send(type, payload = {}) {
   return chrome.runtime.sendMessage({ type, ...payload });
 }
@@ -66,6 +73,7 @@ function render(state) {
 
   const tileSync = state.sectionSync || {};
   const counts = state.sectionCounts || {};
+  const globalErr = state.lastFetchError;
   const tplMeta = state.templateMeta || {};
   const tplWrong = state.templateWrong || {};
   const histProg = state.historyBackfillProgress || {};
@@ -78,10 +86,22 @@ function render(state) {
       const wrong =
         (tab === 'UPCOMING' && tplWrong.UPCOMING) ||
         (tab === 'IN_TRANSIT' && tplWrong.IN_TRANSIT);
+      const fe =
+        s.lastFetchError || (globalErr?.tab === tab ? globalErr : null);
       const errFull = wrong
         ? tplWrong.message || s.lastError || 'template wrong'
         : s.lastError || '';
       const err = errFull ? ` · ${errFull}` : '';
+      const paused = s.paused ? ' · paused' : '';
+      const title = fe
+        ? [
+            `URL: ${fe.url || '—'}`,
+            `Context: ${fe.context || '—'}`,
+            `HTTP: ${fe.status ?? '—'}`,
+            `Message: ${fe.message || errFull || '—'}`,
+            `At: ${fe.at || '—'}`,
+          ].join('\n')
+        : errFull;
       const relayN = c.relay ?? s.trips ?? 0;
       const crmN = c.crm ?? '—';
       const mismatch = Boolean(c.mismatch) || (crmN !== '—' && Number(crmN) !== Number(relayN));
@@ -89,7 +109,10 @@ function render(state) {
       const src = meta.label || (meta.source === 'fallback' ? 'fallback' : meta.source || '—');
       const histExtra =
         tab === 'HISTORY' && histProg.label ? ` · ${histProg.label}` : '';
-      return `<li><span>${tab}</span><span class="badge ${s.lastError || wrong ? 'error' : 'collecting'}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when} · ${src}${histExtra}${err}</span></li>`;
+      const badgeCls = s.lastError || wrong || s.paused ? 'error' : 'collecting';
+      return `<li><span>${tab}</span><span class="badge ${badgeCls}" title="${escapeAttr(
+        title,
+      )}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when} · ${src}${histExtra}${err}${paused}</span></li>`;
     })
     .join('');
 

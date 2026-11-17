@@ -25,6 +25,9 @@ import {
   setDispatchChat,
   crmBaseUrl,
   openCrmMarkup,
+  listRelayDriversForLink,
+  linkDriverKeyboard,
+  linkDriverGroup,
 } from "./helpers.ts";
 
 Deno.serve(async (req: Request) => {
@@ -68,49 +71,129 @@ Deno.serve(async (req: Request) => {
     const cmdBase = cmd.replace(/@\w+$/i, "").toLowerCase();
 
     if (isGroupChat(chat)) {
-      const link = text.match(/^\/link(?:@\w+)?\s+(\S+)/i);
-      if (link) {
-        const driverCode = link[1].trim();
-        const { data: driver } = await sb
-          .from("drivers")
-          .select("id, driver_id, first_name, last_name")
-          .eq("driver_id", driverCode)
-          .maybeSingle();
-        if (!driver) {
-          await reply(botToken, chatId, `No CRM driver found for code \`${driverCode}\`.`);
-          return json({ success: true, linked: false });
+      // /link — admins: show Relay driver buttons (or link by Relay id / DRV code)
+      if (cmdBase === "/link") {
+        const arg = text.replace(/^\/link(?:@\w+)?\s*/i, "").trim();
+        if (arg) {
+          // Prefer Relay id; fall back to CRM DRV-xxxx → match name into recent Relay drivers
+          let relayId = arg;
+          let driverName: string | null = null;
+          if (/^DRV-/i.test(arg)) {
+            const { data: crm } = await sb
+              .from("drivers")
+              .select("first_name, last_name, driver_id")
+              .eq("driver_id", arg.toUpperCase())
+              .maybeSingle();
+            if (!crm) {
+              await reply(botToken, chatId, `No CRM driver for ${arg}. Use /link and pick from the list.`);
+              return json({ success: true, linked: false });
+            }
+            const drivers = await listRelayDriversForLink(sb, 80);
+            const needle = `${crm.first_name} ${crm.last_name}`.trim().toLowerCase();
+            const hit = drivers.find((d) => d.name.toLowerCase() === needle) ||
+              drivers.find((d) => d.name.toLowerCase().includes(String(crm.last_name || "").toLowerCase()));
+            if (!hit) {
+              await reply(
+                botToken,
+                chatId,
+                `CRM ${crm.driver_id} found but no matching Relay driver id yet. Pick from the list:`,
+                linkDriverKeyboard(drivers),
+              );
+              return json({ success: true, linked: false, need_pick: true });
+            }
+            relayId = hit.id;
+            driverName = hit.name;
+          }
+          const { error } = await linkDriverGroup(
+            sb,
+            chatId,
+            relayId,
+            chatTitle,
+            userId != null ? String(userId) : null,
+            driverName,
+          );
+          if (error) {
+            await reply(botToken, chatId, `Link failed: ${error.message}`);
+            return json({ success: false, error: error.message }, 500);
+          }
+          await reply(
+            botToken,
+            chatId,
+            `Linked to Relay driver ${driverName || relayId}.\n/whoami · /test · /unlink`,
+          );
+          return json({ success: true, linked: true, relay_driver_id: relayId });
         }
-        const { error } = await sb.from("driver_telegram_groups").upsert(
-          {
-            telegram_chat_id: chatId,
-            driver_id: driver.id,
-            group_title: chatTitle,
-            active: true,
-            bot_can_post: true,
-            last_error: null,
-            last_error_at: null,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "telegram_chat_id" },
-        );
-        if (error) {
-          await reply(botToken, chatId, `Link failed: ${error.message}`);
-          return json({ success: false, error: error.message }, 500);
-        }
+        const drivers = await listRelayDriversForLink(sb, 24);
         await reply(
           botToken,
           chatId,
-          `Linked to ${driver.driver_id} (${driver.first_name} ${driver.last_name}).\nThis group only receives facility-arrival alerts (no slash menu). Use the bot DM for status menus.`,
+          "Pick a Relay driver to link this group (admins). Trip alerts for that driver go here.",
+          linkDriverKeyboard(drivers),
         );
-        return json({ success: true, linked: true });
+        return json({ success: true, link_menu: true });
       }
       if (cmdBase === "/unlink") {
+        await sb
+          .from("driver_groups")
+          .update({ active: false, updated_at: new Date().toISOString() })
+          .eq("chat_id", chatId);
+        // Keep legacy table in sync when present
         await sb
           .from("driver_telegram_groups")
           .update({ active: false, updated_at: new Date().toISOString() })
           .eq("telegram_chat_id", chatId);
-        await reply(botToken, chatId, "Group unlinked (set inactive). Type /link DRV-xxxx to re-link.");
+        await reply(botToken, chatId, "Group unlinked. /link to re-link.");
         return json({ success: true, unlinked: true });
+      }
+      if (cmdBase === "/whoami") {
+        const { data: g } = await sb
+          .from("driver_groups")
+          .select("relay_driver_id, driver_name, active, group_title")
+          .eq("chat_id", chatId)
+          .maybeSingle();
+        if (!g || !g.active) {
+          await reply(botToken, chatId, "Not linked. Use /link to choose a Relay driver.");
+          return json({ success: true, whoami: false });
+        }
+        await reply(
+          botToken,
+          chatId,
+          `This group → ${g.driver_name || "Relay driver"}\n<code>${g.relay_driver_id}</code>`,
+          undefined,
+          "HTML",
+        );
+        return json({ success: true, whoami: true, relay_driver_id: g.relay_driver_id });
+      }
+      if (cmdBase === "/test") {
+        const { data: g } = await sb
+          .from("driver_groups")
+          .select("relay_driver_id, active")
+          .eq("chat_id", chatId)
+          .maybeSingle();
+        if (!g?.active) {
+          await reply(botToken, chatId, "Link this group with /link before /test.");
+          return json({ success: true, test: false });
+        }
+        // Invoke trip-alerts test for THIS chat only (force bypasses kill switch)
+        const projectUrl = Deno.env.get("SUPABASE_URL")!;
+        const service = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+        const res = await fetch(`${projectUrl}/functions/v1/trip-alerts`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${service}`,
+          },
+          body: JSON.stringify({ action: "test", chat_id: chatId }),
+        });
+        const body = await res.json().catch(() => ({}));
+        await reply(
+          botToken,
+          chatId,
+          res.ok
+            ? "[TEST] samples queued to this group only. Kill switch stays OFF until you enable TELEGRAM_ALERTS_ENABLED."
+            : `Test failed: ${JSON.stringify(body).slice(0, 400)}`,
+        );
+        return json({ success: res.ok, test: true, body });
       }
       // Dispatch trip alert commands (typed; no group slash menu)
       if (cmdBase === "/setdispatch") {
@@ -266,8 +349,12 @@ Deno.serve(async (req: Request) => {
       await reply(botToken, chatId, await buildTourText(sb, session.selected_driver_id), mainMenuKeyboard());
       return json({ success: true, tour: true });
     }
-    if (cmdBase === "/link" || cmdBase === "/unlink") {
-      await reply(botToken, chatId, "Use /link DRV-xxxx inside the driver Telegram group (not in this DM).");
+    if (cmdBase === "/link" || cmdBase === "/unlink" || cmdBase === "/whoami" || cmdBase === "/test") {
+      await reply(
+        botToken,
+        chatId,
+        "Use /link (button list), /unlink, /whoami, /test inside the driver Telegram group — not in this DM.",
+      );
       return json({ success: true });
     }
     return json({ success: true, processed: false });
