@@ -18,6 +18,9 @@ import {
   SYNC_LOCK_STALE_MS,
   HTTP_BACKOFF_BASE_MS,
   HTTP_BACKOFF_MAX_MS,
+  FETCH_RETRY_DELAYS_MS,
+  SECTION_PAUSE_RETRY_MS,
+  PAGE_HEARTBEAT_STALE_MS,
   REQUEST_TEMPLATE_KEY,
   SECTION_SNAPSHOT_KEY,
   SYNC_LOCK_KEY,
@@ -198,7 +201,11 @@ export async function ensureRelayTab() {
     relayTabs.find((t) => /\/tours?|\/trips?/i.test(t.url || '')) || relayTabs[0];
   if (preferred) {
     try {
-      await chrome.tabs.update(preferred.id, { pinned: true, active: false });
+      await chrome.tabs.update(preferred.id, {
+        pinned: true,
+        active: false,
+        autoDiscardable: false,
+      });
     } catch {
       /* ignore */
     }
@@ -211,8 +218,60 @@ export async function ensureRelayTab() {
     pinned: true,
     active: false,
   });
+  if (created?.id != null) {
+    try {
+      await chrome.tabs.update(created.id, { autoDiscardable: false });
+    } catch {
+      /* ignore */
+    }
+  }
   await setState({ alwaysOnTabId: created.id });
   return created.id;
+}
+
+/**
+ * Stub wrapping CURRENT entitiesV2 body-building.
+ * IS-34 owns per-tab templates/filters/windows — do not change shape here.
+ */
+export function buildRequestBody(tab, options = {}) {
+  const template = options.template;
+  const from = options.from ?? 0;
+  const size = options.size ?? PAGE_SIZE;
+  if (!template?.body || typeof template.body !== 'object') {
+    return null;
+  }
+  return {
+    ...template.body,
+    tileCountTab: tab,
+    pagination: {
+      ...(template.body.pagination || {}),
+      size,
+      from,
+    },
+  };
+}
+
+function makeFetchError({ url, context, status, message, tab }) {
+  return {
+    url: url || ENTITIES_V2_URL,
+    context: context || 'background',
+    status: status ?? null,
+    message: String(message || 'fetch failed'),
+    tab: tab || null,
+    at: new Date().toISOString(),
+  };
+}
+
+async function recordFetchError(tileCountTab, errObj) {
+  await setState({
+    lastFetchError: errObj,
+    sectionSync: {
+      [tileCountTab]: {
+        lastError: errObj.message,
+        lastFetchError: errObj,
+      },
+    },
+  });
 }
 
 async function waitRequestGap(extraMs = 0) {
@@ -222,7 +281,8 @@ async function waitRequestGap(extraMs = 0) {
 }
 
 /**
- * Single entitiesV2 POST via page MAIN world.
+ * Single entitiesV2 POST via page MAIN world (never from SW fetch).
+ * Retries 3× with 2s / 5s / 15s backoff before caller marks section paused.
  */
 export async function fetchEntitiesPage(tabId, tileCountTab, from, size = PAGE_SIZE) {
   const template = await getRequestTemplate();
@@ -230,63 +290,111 @@ export async function fetchEntitiesPage(tabId, tileCountTab, from, size = PAGE_S
     return { ok: false, error: 'no_template', authRequired: false };
   }
 
-  await waitRequestGap();
-  if (requestInFlight) {
-    return { ok: false, error: 'in_flight' };
+  const body = buildRequestBody(tileCountTab, { template, from, size });
+  if (!body) {
+    return { ok: false, error: 'no_template', authRequired: false };
   }
-  requestInFlight = true;
-  lastRequestAt = Date.now();
+  const url = template.url || ENTITIES_V2_URL;
+  const delays = FETCH_RETRY_DELAYS_MS;
+  let lastFail = null;
 
-  try {
-    const body = {
-      ...template.body,
-      tileCountTab,
-      pagination: {
-        ...(template.body.pagination || {}),
-        size,
-        from,
-      },
-    };
-
-    let result;
-    try {
-      result = await chrome.tabs.sendMessage(tabId, {
-        type: 'RELAY_FETCH_ENTITIES_V2',
-        url: template.url || ENTITIES_V2_URL,
-        body,
-        headers: template.headers || {},
-      });
-    } catch (err) {
-      return { ok: false, error: String(err?.message || err) };
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    await waitRequestGap();
+    if (requestInFlight) {
+      return { ok: false, error: 'in_flight' };
     }
-
-    if (result?.authRequired || result?.status === 401 || result?.status === 403) {
-      await hooks.onAuthRequired(result);
-      return { ok: false, authRequired: true, status: result.status, error: result.error };
-    }
-
-    if (!result?.ok) {
-      const status = result?.status || 0;
-      if (status === 429 || status >= 500) {
-        await hooks.onBackoff(status, httpBackoffMs);
-        httpBackoffMs = Math.min(HTTP_BACKOFF_MAX_MS, httpBackoffMs * 2);
-      }
-      return { ok: false, status, error: result?.error || 'fetch_failed' };
-    }
-
-    httpBackoffMs = HTTP_BACKOFF_BASE_MS;
-    await hooks.onHealthy();
-    return {
-      ok: true,
-      data: result.data,
-      requestBody: body,
-      totalRecords: Number(result.data?.totalRecords) || 0,
-      entities: Array.isArray(result.data?.entities) ? result.data.entities : [],
-    };
-  } finally {
-    requestInFlight = false;
+    requestInFlight = true;
     lastRequestAt = Date.now();
+    try {
+      let result;
+      try {
+        result = await chrome.tabs.sendMessage(tabId, {
+          type: 'RELAY_FETCH_ENTITIES_V2',
+          url,
+          body,
+          headers: template.headers || {},
+        });
+      } catch (err) {
+        lastFail = makeFetchError({
+          url,
+          context: 'content',
+          status: null,
+          message: err?.message || err,
+          tab: tileCountTab,
+        });
+        await recordFetchError(tileCountTab, lastFail);
+        if (attempt < delays.length) {
+          await new Promise((r) => setTimeout(r, delays[attempt]));
+          continue;
+        }
+        return { ok: false, error: lastFail.message, lastFetchError: lastFail };
+      }
+
+      if (result?.authRequired || result?.status === 401 || result?.status === 403) {
+        await hooks.onAuthRequired(result);
+        const errObj = makeFetchError({
+          url,
+          context: result?.context || 'page',
+          status: result?.status,
+          message: result?.error || 'Log in to Relay',
+          tab: tileCountTab,
+        });
+        await recordFetchError(tileCountTab, errObj);
+        return {
+          ok: false,
+          authRequired: true,
+          status: result.status,
+          error: result.error,
+          lastFetchError: errObj,
+        };
+      }
+
+      if (!result?.ok) {
+        const status = result?.status || 0;
+        lastFail = makeFetchError({
+          url,
+          context: result?.context || 'page',
+          status,
+          message: result?.error || 'fetch_failed',
+          tab: tileCountTab,
+        });
+        await recordFetchError(tileCountTab, lastFail);
+        if (status === 429 || status >= 500) {
+          await hooks.onBackoff(status, httpBackoffMs);
+          httpBackoffMs = Math.min(HTTP_BACKOFF_MAX_MS, httpBackoffMs * 2);
+        }
+        if (attempt < delays.length) {
+          await new Promise((r) => setTimeout(r, delays[attempt]));
+          continue;
+        }
+        return {
+          ok: false,
+          status,
+          error: lastFail.message,
+          lastFetchError: lastFail,
+        };
+      }
+
+      httpBackoffMs = HTTP_BACKOFF_BASE_MS;
+      await hooks.onHealthy();
+      return {
+        ok: true,
+        data: result.data,
+        requestBody: body,
+        totalRecords: Number(result.data?.totalRecords) || 0,
+        entities: Array.isArray(result.data?.entities) ? result.data.entities : [],
+      };
+    } finally {
+      requestInFlight = false;
+      lastRequestAt = Date.now();
+    }
   }
+
+  return {
+    ok: false,
+    error: lastFail?.message || 'fetch_failed',
+    lastFetchError: lastFail,
+  };
 }
 
 async function loadSnapshots() {
@@ -386,11 +494,15 @@ export async function syncSection(
     const gap = tileCountTab === 'HISTORY' ? HISTORY_PAGE_GAP_MS : MIN_REQUEST_GAP_MS;
     const page = await fetchEntitiesPage(tabId, tileCountTab, from, PAGE_SIZE);
     if (!page.ok) {
+      const pausedUntil = new Date(Date.now() + SECTION_PAUSE_RETRY_MS).toISOString();
       await setState({
         sectionSync: {
           [tileCountTab]: {
             lastError: page.error || 'fetch failed',
+            lastFetchError: page.lastFetchError || null,
             lastSyncAt: new Date().toISOString(),
+            paused: true,
+            pausedUntil,
           },
         },
       });
@@ -446,6 +558,9 @@ export async function syncSection(
       [tileCountTab]: {
         lastSyncAt: new Date().toISOString(),
         lastError: null,
+        lastFetchError: null,
+        paused: false,
+        pausedUntil: null,
         trips: diff.stats.trips,
         pages,
         newCount: diff.stats.newCount,
@@ -453,6 +568,7 @@ export async function syncSection(
         removedCount: diff.stats.removedCount,
       },
     },
+    lastFetchError: null,
     lastTripsScanAt: new Date().toISOString(),
   });
 
@@ -543,6 +659,25 @@ export async function alwaysOnTick({ force = false } = {}) {
     }
 
     const tabId = await ensureRelayTab();
+
+    // Keep sync tab alive; reload if page heartbeat missing for 2 minutes.
+    try {
+      await chrome.tabs.update(tabId, { autoDiscardable: false });
+    } catch {
+      /* ignore */
+    }
+    const hbAt = state.pageHeartbeatAt ? Date.parse(state.pageHeartbeatAt) : 0;
+    if (hbAt && Date.now() - hbAt > PAGE_HEARTBEAT_STALE_MS) {
+      log('page heartbeat stale — reloading sync tab', tabId);
+      try {
+        await chrome.tabs.reload(tabId);
+        await setState({ pageHeartbeatAt: new Date().toISOString() });
+        await new Promise((r) => setTimeout(r, 4000));
+      } catch (err) {
+        log('tab reload failed', err?.message || err);
+      }
+    }
+
     const lock = await acquireSyncLock(tabId);
     if (!lock.ok) {
       log('always-on: could not acquire lock');
@@ -602,6 +737,16 @@ export async function alwaysOnTick({ force = false } = {}) {
 
     for (const tab of liveOrder) {
       if (!(await getState()).live) break;
+      const sec = (await getState()).sectionSync?.[tab];
+      if (
+        !force &&
+        sec?.paused &&
+        sec.pausedUntil &&
+        Date.parse(sec.pausedUntil) > Date.now()
+      ) {
+        log(`section ${tab} paused until`, sec.pausedUntil);
+        continue;
+      }
       const res = await syncSection(lock.tabId, tab, { page1Only: false });
       if (res.ok) {
         if (tab === 'IN_TRANSIT') due.IN_TRANSIT = now + jitter(schedule.IN_TRANSIT_MS);
@@ -610,6 +755,9 @@ export async function alwaysOnTick({ force = false } = {}) {
       } else if (res.authRequired) {
         await setState({ nextDueAt: due, scheduleMs: schedule });
         return;
+      } else {
+        // Retries exhausted → yellow paused; next attempt in ~1 min
+        due[tab] = now + SECTION_PAUSE_RETRY_MS;
       }
     }
 

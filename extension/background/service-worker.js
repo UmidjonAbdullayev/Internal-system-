@@ -212,6 +212,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
+      if (msg?.type === 'RELAY_PAGE_HEARTBEAT') {
+        await setState({ pageHeartbeatAt: new Date().toISOString() });
+        sendResponse({ ok: true });
+        return;
+      }
       if (msg?.type === 'GET_STATE') {
         sendResponse({ ok: true, state: await getState() });
         return;
@@ -597,7 +602,19 @@ async function pushTripsModelImmediate(trips, snapshot, tileCountTab, opts = {})
     });
     return json;
   } catch (err) {
-    log('pushTripsModelImmediate failed', err?.message || err);
+    const friendly = `CRM push failed: ${err?.message || err}`;
+    log(friendly);
+    const st = await getState();
+    await setState({
+      syncErrors: [
+        ...(st.syncErrors || []).slice(-19),
+        { at: new Date().toISOString(), error: friendly },
+      ],
+    });
+    await updateSection('tours', {
+      state: 'Error',
+      lastError: friendly,
+    });
     if (loads.length) {
       await ingestCollection({ section: 'tours', loads, detail_detected: true });
     }
@@ -945,7 +962,7 @@ async function flushToEdge() {
         for (const n of json.notifications || []) allNotifications.push(n);
       } catch (err) {
         lastErr = err;
-        const friendly = `CRM flush failed on batch ${i + 1}/${loadChunks.length}: ${err?.message || err}`;
+        const friendly = `CRM push failed: batch ${i + 1}/${loadChunks.length}: ${err?.message || err}`;
         syncErrors = [...syncErrors.slice(-19), { at: new Date().toISOString(), error: friendly }];
         await setState({
           pendingLoads: remainingLoads,

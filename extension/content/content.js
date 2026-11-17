@@ -67,7 +67,13 @@
           const result = await new Promise((resolve) => {
             const timer = setTimeout(() => {
               pendingFetches.delete(requestId);
-              resolve({ ok: false, error: 'entitiesV2 fetch timed out' });
+              resolve({
+                ok: false,
+                context: 'content',
+                url: msg.url || '',
+                error: 'entitiesV2 fetch timed out',
+                at: new Date().toISOString(),
+              });
             }, 45000);
             pendingFetches.set(requestId, (res) => {
               clearTimeout(timer);
@@ -86,11 +92,30 @@
           });
           sendResponse(result);
         } catch (err) {
-          sendResponse({ ok: false, error: String(err?.message || err) });
+          sendResponse({
+            ok: false,
+            context: 'content',
+            url: msg.url || '',
+            error: String(err?.message || err),
+            at: new Date().toISOString(),
+          });
         }
       })();
       return true;
     });
+
+    // Page heartbeat every 30s so SW can reload stale sync tabs.
+    const beat = () => {
+      try {
+        chrome.runtime.sendMessage({ type: 'RELAY_PAGE_HEARTBEAT', pageUrl: location.href }, () => {
+          void chrome.runtime.lastError;
+        });
+      } catch {
+        /* ignore */
+      }
+    };
+    beat();
+    setInterval(beat, 30000);
 
     if (DEBUG) {
       // eslint-disable-next-line no-console

@@ -86,6 +86,14 @@ export const SYNC_LOCK_STALE_MS = 2 * 60 * 1000;
 export const HTTP_BACKOFF_BASE_MS = 2000;
 export const HTTP_BACKOFF_MAX_MS = 10 * 60 * 1000;
 
+/** Per-request retry ladder before section pause. */
+export const FETCH_RETRY_DELAYS_MS = [2000, 5000, 15000];
+/** After retries exhausted, section stays paused and retries on this interval. */
+export const SECTION_PAUSE_RETRY_MS = 60 * 1000;
+/** No page heartbeat for this long → reload sync tab. */
+export const PAGE_HEARTBEAT_STALE_MS = 2 * 60 * 1000;
+export const PAGE_HEARTBEAT_INTERVAL_MS = 30 * 1000;
+
 export const SYNC_FLUSH_MINUTES = 1;
 export const FLUSH_TIMEOUT_MS = 90 * 1000;
 export const FLUSH_BATCH_SIZE = 20;

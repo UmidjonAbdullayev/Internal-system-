@@ -8,6 +8,7 @@ const PRESETS: { key: DatePreset; label: string }[] = [
   { key: 'this_week', label: 'This Week' },
   { key: 'last_week', label: 'Last Week' },
   { key: 'this_month', label: 'This Month' },
+  { key: 'last_45_days', label: 'Last 45 days' },
   { key: 'custom', label: 'Custom' },
 ];
 

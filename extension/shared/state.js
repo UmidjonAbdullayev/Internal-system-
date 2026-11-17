@@ -3,6 +3,11 @@ import { SCHEDULE_DEFAULTS } from './config.js';
 const DEFAULT_SECTION_SYNC = {
   lastSyncAt: null,
   lastError: null,
+  /** Structured last Relay fetch error for popup hover. */
+  lastFetchError: null,
+  /** Yellow "paused" after retries exhausted. */
+  paused: false,
+  pausedUntil: null,
   trips: 0,
   pages: 0,
   newCount: 0,
@@ -81,6 +86,10 @@ const DEFAULT_STATE = {
   },
   hasRequestTemplate: false,
   alwaysOnTabId: null,
+  /** Last page-context heartbeat from sync tab (ISO). */
+  pageHeartbeatAt: null,
+  /** Full last Relay fetch error (URL, context, status, message, at). */
+  lastFetchError: null,
   /** Per section { relay, crm, mismatch } from snapshot response */
   sectionCounts: {
     IN_TRANSIT: { relay: 0, crm: 0, mismatch: false },

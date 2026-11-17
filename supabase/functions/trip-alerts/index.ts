@@ -149,12 +149,17 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "test") {
-      const results = await sendAllTestAlerts(sb, botToken, config, settings);
+      const chatId = String(body.chat_id || "").trim();
+      const results = await sendAllTestAlerts(sb, botToken, config, settings, {
+        chatIds: chatId ? [chatId] : undefined,
+      });
       return json({
         success: true,
         results,
-        resolved_chat: resolveChatId("trip_booked", settings, config),
+        resolved_chat: chatId || resolveChatId("trip_booked", settings, config),
         env_chat_sources: chatSourcesPresent(),
+        kill_switch: chatSourcesPresent().TELEGRAM_ALERTS_ENABLED,
+        note: "TEST bypasses kill switch; leave TELEGRAM_ALERTS_ENABLED OFF until confirmed",
       });
     }
 

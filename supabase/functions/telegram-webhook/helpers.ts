@@ -8,7 +8,7 @@ export const corsHeaders = {
     "Content-Type, Authorization, X-Telegram-Bot-Api-Secret-Token",
 };
 export const BOT_COMMANDS_PRIVATE = [
-  { command: "menu", description: "Open status menu" },
+  { command: "menu", description: "Admin menu (sync / late / stats / groups)" },
   { command: "status", description: "Driver status + active loads" },
   { command: "updates", description: "Recent facility arrivals" },
   { command: "tour", description: "Tour / load info" },
@@ -17,6 +17,10 @@ export const BOT_COMMANDS_PRIVATE = [
   { command: "help", description: "List commands" },
   { command: "late", description: "/late <tripId> <reason>" },
   { command: "mute", description: "/mute <tripId> [hours]" },
+  { command: "link", description: "Link this group to a Relay driver (admins)" },
+  { command: "unlink", description: "Unlink this group" },
+  { command: "whoami", description: "Show linked driver for this group" },
+  { command: "test", description: "Send [TEST] alerts to this linked group" },
 ];
 export const ACTIVE_LOAD_EXCLUDE = '("Completed","Cancelled","Rejected","Delivered")';
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -233,15 +237,80 @@ export function mainMenuKeyboard() {
   return {
     inline_keyboard: [
       [
-        { text: "Driver status", callback_data: "menu:status" },
-        { text: "Updates", callback_data: "menu:updates" },
+        { text: "Sync status", callback_data: "menu:sync" },
+        { text: "Late trips now", callback_data: "menu:late" },
       ],
       [
-        { text: "Tour / loads", callback_data: "menu:tour" },
+        { text: "Today's stats", callback_data: "menu:today" },
+        { text: "Find trip", callback_data: "menu:find" },
+      ],
+      [
+        { text: "Driver groups", callback_data: "menu:groups" },
         { text: "Help", callback_data: "menu:help" },
       ],
     ],
   };
+}
+
+/** Distinct Relay drivers from recent trip raw payloads for /link buttons. */
+export async function listRelayDriversForLink(sb: SupabaseClient, limit = 24) {
+  const { data } = await sb
+    .from("relay_trips")
+    .select("raw, driver_name_raw, last_seen_at")
+    .eq("archived", false)
+    .order("last_seen_at", { ascending: false })
+    .limit(80);
+  const map = new Map<string, string>();
+  for (const row of data || []) {
+    const raw = row.raw as Record<string, unknown> | null;
+    const drivers = Array.isArray(raw?.drivers) ? raw!.drivers : [];
+    for (const d of drivers) {
+      if (!d || typeof d !== "object") continue;
+      const id = String((d as Record<string, unknown>).id || "").trim();
+      if (!id || map.has(id)) continue;
+      const first = String((d as Record<string, unknown>).firstName || "").trim();
+      const last = String((d as Record<string, unknown>).lastName || "").trim();
+      const name = [first, last].filter(Boolean).join(" ") || row.driver_name_raw || id.slice(-8);
+      map.set(id, name);
+      if (map.size >= limit) break;
+    }
+    if (map.size >= limit) break;
+  }
+  return [...map.entries()].map(([id, name]) => ({ id, name }));
+}
+
+export function linkDriverKeyboard(drivers: Array<{ id: string; name: string }>) {
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (const d of drivers) {
+    const label = d.name.slice(0, 40);
+    rows.push([{ text: label, callback_data: `linkdrv:${d.id}` }]);
+  }
+  if (!rows.length) {
+    rows.push([{ text: "No Relay drivers found yet", callback_data: "linkdrv:none" }]);
+  }
+  return { inline_keyboard: rows };
+}
+
+export async function linkDriverGroup(
+  sb: SupabaseClient,
+  chatId: string,
+  relayDriverId: string,
+  groupTitle: string | null,
+  linkedBy: string | null,
+  driverName?: string | null,
+) {
+  return await sb.from("driver_groups").upsert(
+    {
+      chat_id: chatId,
+      relay_driver_id: relayDriverId,
+      driver_name: driverName || null,
+      group_title: groupTitle,
+      active: true,
+      linked_by: linkedBy,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "chat_id" },
+  );
 }
 export function isPrivateChat(chat: { type?: string } | undefined) {
   return chat?.type === "private";
@@ -543,7 +612,7 @@ export async function handleCallback(
     id: string;
     data?: string;
     from?: { id?: number };
-    message?: { chat?: { id?: number | string; type?: string } };
+    message?: { chat?: { id?: number | string; type?: string; title?: string } };
   },
 ) {
   const chat = cq.message?.chat;
@@ -555,8 +624,40 @@ export async function handleCallback(
     return;
   }
   await answerCallback(botToken, cq.id);
+
+  // Group: /link driver button
+  if (data.startsWith("linkdrv:")) {
+    const relayId = data.slice("linkdrv:".length);
+    if (!relayId || relayId === "none") {
+      await reply(botToken, chatId, "No Relay driver to link.");
+      return;
+    }
+    const drivers = await listRelayDriversForLink(sb, 80);
+    const name = drivers.find((d) => d.id === relayId)?.name || null;
+    const { error } = await linkDriverGroup(
+      sb,
+      chatId,
+      relayId,
+      chat?.title || null,
+      userId != null ? String(userId) : null,
+      name,
+    );
+    if (error) {
+      await reply(botToken, chatId, `Link failed: ${error.message}`);
+      return;
+    }
+    await reply(
+      botToken,
+      chatId,
+      `Linked to Relay driver <b>${name || relayId}</b>\n<code>${relayId}</code>\nAlerts for this driver go here. /whoami · /test · /unlink`,
+      undefined,
+      "HTML",
+    );
+    return;
+  }
+
   if (!isPrivateChat(chat)) {
-    await reply(botToken, chatId, "Menus are only available in a private chat with the bot.");
+    await reply(botToken, chatId, "Admin menus are only available in a private chat with the bot.");
     return;
   }
   if (data === "menu:home" || data === "menu:help") {
@@ -570,8 +671,93 @@ export async function handleCallback(
     await reply(botToken, chatId, helpText(session), session ? mainMenuKeyboard() : undefined);
     return;
   }
-  const session = await requirePrivateAdmin(botToken, sb, chatId, userId, true);
-  if (!session?.selected_driver_id) return;
+
+  const session = await requirePrivateAdmin(botToken, sb, chatId, userId, false);
+  if (!session) return;
+
+  if (data === "menu:sync") {
+    const { data: rows } = await sb
+      .from("sync_state")
+      .select("section, last_successful_sync_at, syncing, last_error")
+      .order("section");
+    const lines = ["📡 Sync status", ""];
+    for (const r of rows || []) {
+      lines.push(
+        `${r.section}: ${r.syncing ? "syncing" : "idle"} · last ${r.last_successful_sync_at || "never"}${
+          r.last_error ? ` · err ${r.last_error}` : ""
+        }`,
+      );
+    }
+    const envOn = ["1", "true", "yes", "on"].includes(
+      (Deno.env.get("TELEGRAM_ALERTS_ENABLED") || "").trim().toLowerCase(),
+    );
+    lines.push("", `TELEGRAM_ALERTS_ENABLED: ${envOn ? "ON" : "OFF (default)"}`);
+    await reply(botToken, chatId, lines.join("\n"), mainMenuKeyboard());
+    return;
+  }
+  if (data === "menu:late") {
+    const { data: trips } = await sb
+      .from("relay_trips")
+      .select("trip_id, driver_name_raw, section, status")
+      .eq("archived", false)
+      .in("section", ["UPCOMING", "IN_TRANSIT"])
+      .limit(40);
+    const lines = ["⏰ Late / active trips", ""];
+    for (const t of trips || []) {
+      lines.push(`• ${t.trip_id} [${t.section}] ${t.driver_name_raw || "no driver"} · ${t.status || "—"}`);
+    }
+    if (lines.length === 2) lines.push("None found.");
+    await reply(botToken, chatId, lines.join("\n").slice(0, 3500), mainMenuKeyboard());
+    return;
+  }
+  if (data === "menu:today") {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const { count } = await sb
+      .from("relay_trips")
+      .select("trip_id", { count: "exact", head: true })
+      .gte("last_seen_at", start.toISOString());
+    await reply(
+      botToken,
+      chatId,
+      `📊 Today's stats\nTrips seen today: ${count ?? 0}\n(Kill switch stays OFF until you enable TELEGRAM_ALERTS_ENABLED.)`,
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+  if (data === "menu:find") {
+    await reply(
+      botToken,
+      chatId,
+      "Find trip: send /status <tripId> in a group or DM, or search in CRM Loads.",
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+  if (data === "menu:groups") {
+    const { data: groups } = await sb
+      .from("driver_groups")
+      .select("chat_id, relay_driver_id, driver_name, active, group_title")
+      .order("updated_at", { ascending: false })
+      .limit(30);
+    const lines = ["👥 Driver groups", ""];
+    for (const g of groups || []) {
+      lines.push(
+        `${g.active ? "✓" : "·"} ${g.driver_name || g.relay_driver_id} · chat ${g.chat_id}${
+          g.group_title ? ` (${g.group_title})` : ""
+        }`,
+      );
+    }
+    if (lines.length === 2) lines.push("None linked. In a group: /link then pick a driver.");
+    await reply(botToken, chatId, lines.join("\n").slice(0, 3500), mainMenuKeyboard());
+    return;
+  }
+
+  // Legacy driver-scoped buttons still work when a CRM driver is selected
+  if (!session.selected_driver_id) {
+    await reply(botToken, chatId, "Choose an option:", mainMenuKeyboard());
+    return;
+  }
   if (data === "menu:status") {
     await reply(botToken, chatId, await buildStatusText(sb, session.selected_driver_id), mainMenuKeyboard());
     return;

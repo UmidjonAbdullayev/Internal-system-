@@ -2,6 +2,13 @@ import { SECTIONS } from '../shared/config.js';
 
 const $ = (id) => document.getElementById(id);
 
+function escapeAttr(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;');
+}
+
 async function send(type, payload = {}) {
   return chrome.runtime.sendMessage({ type, ...payload });
 }
@@ -66,17 +73,34 @@ function render(state) {
 
   const tileSync = state.sectionSync || {};
   const counts = state.sectionCounts || {};
+  const globalErr = state.lastFetchError;
   $('tile-sync').innerHTML = ['IN_TRANSIT', 'UPCOMING', 'HISTORY']
     .map((tab) => {
       const s = tileSync[tab] || {};
       const c = counts[tab] || {};
       const when = s.lastSyncAt ? new Date(s.lastSyncAt).toLocaleTimeString() : '—';
-      const err = s.lastError ? ` · ${s.lastError}` : '';
+      const fe = s.lastFetchError || (s.lastError ? null : null) || (globalErr?.tab === tab ? globalErr : null);
+      const errShort = s.lastError ? ` · ${s.lastError}` : '';
+      const paused = s.paused ? ' · paused' : '';
+      const title = fe
+        ? [
+            `URL: ${fe.url || '—'}`,
+            `Context: ${fe.context || '—'}`,
+            `HTTP: ${fe.status ?? '—'}`,
+            `Message: ${fe.message || s.lastError || '—'}`,
+            `At: ${fe.at || '—'}`,
+          ].join('\n')
+        : s.lastError
+          ? String(s.lastError)
+          : '';
       const relayN = c.relay ?? s.trips ?? 0;
       const crmN = c.crm ?? '—';
       const mismatch = Boolean(c.mismatch) || (crmN !== '—' && Number(crmN) !== Number(relayN));
       const countCls = mismatch ? 'mismatch' : 'ok-count';
-      return `<li><span>${tab}</span><span class="badge ${s.lastError ? 'error' : 'collecting'}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when}${err}</span></li>`;
+      const badgeCls = s.lastError || s.paused ? 'error' : 'collecting';
+      return `<li><span>${tab}</span><span class="badge ${badgeCls}" title="${escapeAttr(
+        title,
+      )}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when}${errShort}${paused}</span></li>`;
     })
     .join('');
 

@@ -273,8 +273,11 @@
                 requestId,
                 ok: res.ok,
                 status: res.status,
+                context: 'page',
+                url: url || `https://relay.amazon.com${TARGET}`,
                 data: res.ok ? data : null,
                 error: res.ok ? null : `HTTP ${res.status}`,
+                at: new Date().toISOString(),
               },
               location.origin,
             );
@@ -284,7 +287,11 @@
                 type: FETCH_RES,
                 requestId,
                 ok: false,
+                status: null,
+                context: 'page',
+                url: url || `https://relay.amazon.com${TARGET}`,
                 error: String(err?.message || err),
+                at: new Date().toISOString(),
               },
               location.origin,
             );
