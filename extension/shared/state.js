@@ -38,8 +38,11 @@ const DEFAULT_STATE = {
   lastNearLiveAt: null,
   lastCaptureAt: null,
   lastCaptureUrl: null,
+  lastCaptureTab: null,
   capturesSeen: 0,
   tripsExtracted: 0,
+  /** Optional: replay entitiesV2 with HISTORY pagination. Default OFF. */
+  syncAllHistory: false,
   syncedLoadCache: {},
   lastActiveLoadIds: [],
 };

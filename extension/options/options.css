@@ -79,3 +79,26 @@ button:hover {
 code {
   font-size: 0.85em;
 }
+
+section + section {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--line);
+}
+
+.check {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  font-size: 0.92rem;
+  line-height: 1.4;
+}
+
+.check input {
+  margin-top: 0.2rem;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+}

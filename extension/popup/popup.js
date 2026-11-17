@@ -44,7 +44,7 @@ function render(state) {
     : '';
   $('sync-detail').textContent =
     (prog.detail ||
-      'Passive JSON capture on Relay Trips. Open options to download raw captures.') +
+      'Listening for entitiesV2. Options: download raw captures / optional History sync.') +
     durationNote +
     weeks;
 

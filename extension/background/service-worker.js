@@ -10,7 +10,6 @@ import {
   MAX_RAW_CAPTURES,
   CAPTURE_BATCH_MS,
   CAPTURE_BATCH_SIZE,
-  DETAILS_MAX_PER_SECOND,
   SYNC_FLUSH_MINUTES,
   FLUSH_TIMEOUT_MS,
   FLUSH_BATCH_SIZE,
@@ -19,7 +18,10 @@ import {
   TYPICAL_FULL_SYNC_SECONDS,
   RAW_CAPTURES_KEY,
   TRIP_HASH_KEY,
-  DETAILS_PATTERN_KEY,
+  LAST_ENTITIES_REQ_KEY,
+  ENTITIES_V2_URL,
+  HISTORY_PAGE_SIZE,
+  HISTORY_MIN_INTERVAL_MS,
   isTripsBoardUrl,
   HISTORY_SKIP_TTL_MS,
 } from '../shared/config.js';
@@ -33,26 +35,20 @@ import {
   sanitizeDriverName,
   isGoodLocation,
 } from '../shared/normalize.js';
-import {
-  extractTrips,
-  detectDetailsPattern,
-  tripContentHashPayload,
-  hashString,
-} from '../shared/extract.js';
+import { extractTrips, countTripStats, tripContentHashPayload, hashString } from '../shared/extract.js';
 import { tripsToCrmLoads } from '../shared/map-to-crm.js';
 
 const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
 
 let flushRunning = false;
 let captureFlushTimer = null;
-let pendingTripBatch = new Map(); // tripId → normalized trip
+let pendingTripBatch = new Map(); // dedupeKey → trip
 let flushBackoffMs = FLUSH_BACKOFF_BASE_MS;
-let lastDetailsFetchAt = 0;
-const detailsQueue = [];
-let detailsPumpRunning = false;
+let historySyncRunning = false;
+let lastHistoryPageAt = 0;
 
 function log(...args) {
-  if (DEBUG) console.log('[RelayCapture SW]', ...args);
+  if (DEBUG) console.log('[RelayCapture]', ...args);
 }
 
 function withTimeout(promise, ms, label) {
@@ -66,6 +62,44 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+function tripDedupeKey(trip) {
+  return `${trip.tripId}::${trip.version ?? ''}`;
+}
+
+/** Strip phone/email from raw entity before storage (privacy). */
+function sanitizeEntityForStorage(entity) {
+  try {
+    const clone = JSON.parse(JSON.stringify(entity));
+    const scrubPerson = (p) => {
+      if (!p || typeof p !== 'object') return p;
+      const out = { firstName: p.firstName ?? null, lastName: p.lastName ?? null };
+      return out;
+    };
+    if (Array.isArray(clone.drivers)) clone.drivers = clone.drivers.map(scrubPerson);
+    if (Array.isArray(clone.loads)) {
+      for (const load of clone.loads) {
+        if (Array.isArray(load.driverList)) load.driverList = load.driverList.map(scrubPerson);
+      }
+    }
+    return clone;
+  } catch {
+    return entity;
+  }
+}
+
+function sanitizeCaptureJson(data) {
+  try {
+    if (!data || typeof data !== 'object') return data;
+    if (!Array.isArray(data.entities)) return data;
+    return {
+      ...data,
+      entities: data.entities.map(sanitizeEntityForStorage),
+    };
+  } catch {
+    return data;
+  }
+}
+
 async function ensureAlarms() {
   await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_FLUSH_MINUTES });
   await chrome.alarms.create(CAPTURE_FLUSH_ALARM, { periodInMinutes: 1 });
@@ -74,11 +108,7 @@ async function ensureAlarms() {
 chrome.runtime.onInstalled.addListener(async () => {
   await ensureClientId();
   flushRunning = false;
-  await setState({
-    scanInProgress: false,
-    tripsScanInProgress: false,
-    paymentsScanInProgress: false,
-  });
+  await setState({ scanInProgress: false });
   await ensureAlarms();
 });
 
@@ -127,6 +157,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         });
         return;
       }
+      if (msg?.type === 'SET_SYNC_ALL_HISTORY') {
+        const next = await setState({ syncAllHistory: Boolean(msg.syncAllHistory) });
+        sendResponse({ ok: true, state: next });
+        if (next.live && next.syncAllHistory) void maybeSyncAllHistory();
+        return;
+      }
       if (msg?.type === 'GO_LIVE') {
         const state = await getState();
         if (!state.loggedIn) {
@@ -155,7 +191,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           syncProgress: {
             phase: 'listening',
             detail:
-              'API capture live — browse Relay Trips (Upcoming / In Transit / History). No page clicks.',
+              'Listening for POST /api/tours/entitiesV2. Browse Relay Trips tabs — no clicks needed.',
             percent: 10,
             startedAt: new Date().toISOString(),
             typicalSeconds: TYPICAL_FULL_SYNC_SECONDS,
@@ -166,6 +202,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await refreshOpenTabs();
         sendResponse({ ok: true, state: await getState() });
         void flushToEdge();
+        if ((await getState()).syncAllHistory) void maybeSyncAllHistory();
         return;
       }
       if (msg?.type === 'STOP') {
@@ -189,6 +226,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await refreshOpenTabs();
         scheduleCaptureFlush(0);
         void flushToEdge();
+        if ((await getState()).syncAllHistory) void maybeSyncAllHistory();
         sendResponse({ ok: true, state: await getState() });
         return;
       }
@@ -219,30 +257,19 @@ async function refreshOpenTabs() {
     });
     const hasTrips = relayTabs.some((t) => isTripsBoardUrl(t.url));
     const hasPay = relayTabs.some((t) => /payment|settlement|invoice/i.test(t.url || ''));
-    if (hasTrips) {
-      await updateSection('tours', {
-        state: 'Collecting',
-        lastError: null,
-      });
-    }
-    if (hasPay) {
-      await updateSection('payments', {
-        state: 'Collecting',
-        lastError: null,
-      });
-    }
+    if (hasTrips) await updateSection('tours', { state: 'Collecting', lastError: null });
     const prompts = [];
     if (!hasTrips) {
       prompts.push({
         sectionId: 'tours',
         message:
-          'Open Amazon Relay → Trips (Upcoming, In Transit, or History). The extension captures JSON passively — do not expect row clicks.',
+          'Open Amazon Relay → Trips (Upcoming / In Transit / History). Extension captures entitiesV2 JSON only.',
       });
     }
     if (!hasPay) {
       prompts.push({
         sectionId: 'payments',
-        message: 'Payment information not detected. Open the Payments page to capture settlement JSON.',
+        message: 'Open Payments if you need settlement sync (separate from entitiesV2).',
       });
     }
     await setState({ prompts });
@@ -265,51 +292,43 @@ async function handleCapture(msg) {
     if (!state.live || !state.loggedIn) return;
 
     const url = String(msg.url || '');
-    const data = msg.data;
+    if (!url.includes('/api/tours/entitiesV2')) return;
+
+    const requestBody = msg.requestBody || null;
+    const data = sanitizeCaptureJson(msg.data);
     const capturedAt = msg.capturedAt || new Date().toISOString();
+    const tab = requestBody?.tileCountTab || '?';
 
-    log('captured URL', url.slice(0, 200));
+    await storeRawCapture({
+      url,
+      timestamp: capturedAt,
+      requestBody,
+      json: data,
+      pageUrl: msg.pageUrl || null,
+    });
 
-    await storeRawCapture({ url, timestamp: capturedAt, json: data, pageUrl: msg.pageUrl || null });
+    // Remember last request for optional History pagination (headers left to page-context fetch)
+    if (requestBody && typeof requestBody === 'object') {
+      await chrome.storage.local.set({
+        [LAST_ENTITIES_REQ_KEY]: {
+          body: requestBody,
+          url: ENTITIES_V2_URL,
+          at: capturedAt,
+          pageUrl: msg.pageUrl || null,
+        },
+      });
+    }
+
+    const trips = extractTrips(url, data, requestBody);
+    const stats = countTripStats(trips);
+    log(`tab=${tab} trips=${stats.trips} legs=${stats.legs} stops=${stats.stops}`);
 
     await setState({
       lastCaptureAt: capturedAt,
       lastCaptureUrl: url.slice(0, 300),
+      lastCaptureTab: tab,
       capturesSeen: (state.capturesSeen || 0) + 1,
     });
-
-    // Learn details endpoint patterns
-    const pattern = detectDetailsPattern(url, data);
-    if (pattern) {
-      const stored = await chrome.storage.local.get([DETAILS_PATTERN_KEY]);
-      const patterns = Array.isArray(stored[DETAILS_PATTERN_KEY])
-        ? stored[DETAILS_PATTERN_KEY]
-        : [];
-      if (!patterns.some((p) => p.templateUrl === pattern.templateUrl)) {
-        patterns.push(pattern);
-        while (patterns.length > 20) patterns.shift();
-        await chrome.storage.local.set({ [DETAILS_PATTERN_KEY]: patterns });
-        log('learned details pattern', pattern.templateUrl);
-      }
-    }
-
-    // Payments heuristic: objects with amount + payment-ish keys
-    maybeIngestPayments(url, data);
-
-    const trips = extractTrips(url, data);
-    const emptyStopTrips = trips.filter(
-      (t) => !(t.legs || []).some((l) => (l.stops || []).length > 0),
-    );
-    log(
-      `extractTrips → ${trips.length} trip(s), legs=${trips.reduce((n, t) => n + (t.legs?.length || 0), 0)}, stops=${trips.reduce(
-        (n, t) => n + (t.legs || []).reduce((m, l) => m + (l.stops?.length || 0), 0),
-        0,
-      )}`,
-    );
-    for (const t of emptyStopTrips) {
-      log('trip with empty stops', t.tripId);
-      enqueueDetailsFetch(t.tripId);
-    }
 
     if (!trips.length) return;
 
@@ -318,11 +337,12 @@ async function handleCapture(msg) {
     let changed = 0;
 
     for (const trip of trips) {
+      const key = tripDedupeKey(trip);
       const payload = tripContentHashPayload(trip);
       const hash = await hashString(payload);
-      if (hashes[trip.tripId] === hash) continue;
-      hashes[trip.tripId] = hash;
-      pendingTripBatch.set(trip.tripId, trip);
+      if (hashes[key] === hash) continue;
+      hashes[key] = hash;
+      pendingTripBatch.set(key, trip);
       changed += 1;
     }
 
@@ -335,7 +355,7 @@ async function handleCapture(msg) {
         syncProgress: {
           ...st.syncProgress,
           phase: 'capturing',
-          detail: `Captured ${changed} new/changed trip(s) from API (${pendingTripBatch.size} pending batch).`,
+          detail: `entitiesV2 ${tab}: ${changed} new/changed trip(s); ${pendingTripBatch.size} pending.`,
           percent: Math.min(90, 20 + pendingTripBatch.size),
         },
       });
@@ -354,62 +374,13 @@ async function handleCapture(msg) {
       scheduleCaptureFlush(CAPTURE_BATCH_MS);
       if (pendingTripBatch.size >= CAPTURE_BATCH_SIZE) scheduleCaptureFlush(0);
     }
+
+    // Kick optional history sync when we see a HISTORY page or setting is on
+    if ((await getState()).syncAllHistory) {
+      void maybeSyncAllHistory();
+    }
   } catch (err) {
     log('handleCapture error', err);
-  }
-}
-
-function maybeIngestPayments(url, data) {
-  try {
-    if (!/payment|settlement|invoice|payout/i.test(url) && !looksLikePaymentTree(data)) return;
-    const payments = [];
-    walkPayments(data, payments, 0);
-    if (!payments.length) return;
-    void ingestCollection({ section: 'payments', payments });
-  } catch {
-    /* ignore */
-  }
-}
-
-function looksLikePaymentTree(node, depth = 0) {
-  if (depth > 6 || node == null) return false;
-  if (Array.isArray(node)) return node.some((x) => looksLikePaymentTree(x, depth + 1));
-  if (typeof node !== 'object') return false;
-  const keys = Object.keys(node).map((k) => k.toLowerCase());
-  const hit =
-    keys.some((k) => /amount|payout|paid/.test(k)) &&
-    keys.some((k) => /payment|settlement|invoice|status|date|reference/.test(k));
-  if (hit) return true;
-  return Object.values(node).some((v) => v && typeof v === 'object' && looksLikePaymentTree(v, depth + 1));
-}
-
-function walkPayments(node, out, depth) {
-  if (depth > 8 || node == null || out.length > 200) return;
-  if (Array.isArray(node)) {
-    for (const item of node) walkPayments(item, out, depth + 1);
-    return;
-  }
-  if (typeof node !== 'object') return;
-  const entries = Object.entries(node);
-  const lower = Object.fromEntries(entries.map(([k, v]) => [k.toLowerCase(), v]));
-  const amountKey = Object.keys(lower).find((k) => /amount|payout|paid|gross/.test(k));
-  const refKey = Object.keys(lower).find((k) => /reference|invoice|settlement|paymentid|payment_id/.test(k));
-  const dateKey = Object.keys(lower).find((k) => /date|paidat|paid_at|settlement/.test(k));
-  if (amountKey && (refKey || dateKey)) {
-    const amount = Number(String(lower[amountKey]).replace(/[^0-9.-]/g, ''));
-    if (Number.isFinite(amount)) {
-      out.push({
-        reference_id: refKey ? String(lower[refKey]) : null,
-        amazon_ref_id: null,
-        load_id: null,
-        amount,
-        payment_date: dateKey ? String(lower[dateKey]).slice(0, 32) : null,
-        payment_status: lower.status || lower.paymentstatus || lower.payment_status || null,
-      });
-    }
-  }
-  for (const v of Object.values(node)) {
-    if (v && typeof v === 'object') walkPayments(v, out, depth + 1);
   }
 }
 
@@ -433,7 +404,6 @@ async function flushPendingTrips() {
     loads,
     detail_detected: loads.some((l) => l.trailer_id || l.tractor_id || l.arrival_address),
   });
-  // Track active ids for optional reconcile
   const activeIds = loads
     .filter((l) => l.trip_bucket === 'upcoming' || l.trip_bucket === 'in_transit')
     .map((l) => l.load_id)
@@ -444,68 +414,86 @@ async function flushPendingTrips() {
   void flushToEdge();
 }
 
-function enqueueDetailsFetch(tripId) {
-  if (!tripId) return;
-  if (detailsQueue.includes(tripId)) return;
-  detailsQueue.push(tripId);
-  void pumpDetailsQueue();
-}
-
-async function pumpDetailsQueue() {
-  if (detailsPumpRunning) return;
-  detailsPumpRunning = true;
+/**
+ * Optional (default OFF): replay last captured POST with tileCountTab=HISTORY,
+ * pagination.from += 100 until page returns < 100 entities. Max 1 req / 2s.
+ * Runs via chrome.tabs.sendMessage → MAIN page fetch (same cookies/headers).
+ */
+async function maybeSyncAllHistory() {
+  const state = await getState();
+  if (!state.live || !state.syncAllHistory || historySyncRunning) return;
+  historySyncRunning = true;
   try {
-    while (detailsQueue.length) {
-      const state = await getState();
-      if (!state.live) {
-        detailsQueue.length = 0;
+    const stored = await chrome.storage.local.get([LAST_ENTITIES_REQ_KEY]);
+    const last = stored[LAST_ENTITIES_REQ_KEY];
+    if (!last?.body) {
+      log('history sync: no captured request body yet — browse Trips first');
+      return;
+    }
+
+    const tabs = await chrome.tabs.query({});
+    const relayTab = tabs.find((t) => t.url && RELAY_HOST_RE.test(t.url) && t.id != null);
+    if (!relayTab) {
+      log('history sync: no Relay tab for credentials');
+      return;
+    }
+
+    let from = 0;
+    let page = 0;
+    for (;;) {
+      const wait = Math.max(0, HISTORY_MIN_INTERVAL_MS - (Date.now() - lastHistoryPageAt));
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+      if (!(await getState()).live || !(await getState()).syncAllHistory) break;
+
+      const body = {
+        ...last.body,
+        tileCountTab: 'HISTORY',
+        pagination: {
+          ...(last.body.pagination || {}),
+          size: HISTORY_PAGE_SIZE,
+          from,
+        },
+      };
+
+      lastHistoryPageAt = Date.now();
+      page += 1;
+      log(`history sync page ${page} from=${from}`);
+
+      let result;
+      try {
+        result = await chrome.tabs.sendMessage(relayTab.id, {
+          type: 'RELAY_FETCH_ENTITIES_V2',
+          url: ENTITIES_V2_URL,
+          body,
+        });
+      } catch (err) {
+        log('history sync tab message failed', err?.message || err);
         break;
       }
-      const wait = Math.max(0, 1000 / DETAILS_MAX_PER_SECOND - (Date.now() - lastDetailsFetchAt));
-      if (wait) await new Promise((r) => setTimeout(r, wait));
-      const tripId = detailsQueue.shift();
-      lastDetailsFetchAt = Date.now();
-      await fetchDetailsForTrip(tripId);
+
+      if (!result?.ok || !result.data) {
+        log('history sync failed', result?.error || 'no data');
+        break;
+      }
+
+      await handleCapture({
+        url: ENTITIES_V2_URL,
+        requestBody: body,
+        data: result.data,
+        capturedAt: new Date().toISOString(),
+        pageUrl: relayTab.url,
+      });
+
+      const n = Array.isArray(result.data.entities) ? result.data.entities.length : 0;
+      if (n < HISTORY_PAGE_SIZE) break;
+      from += HISTORY_PAGE_SIZE;
+      if (page > 50) {
+        log('history sync safety stop at 50 pages');
+        break;
+      }
     }
   } finally {
-    detailsPumpRunning = false;
-  }
-}
-
-async function fetchDetailsForTrip(tripId) {
-  try {
-    const stored = await chrome.storage.local.get([DETAILS_PATTERN_KEY]);
-    const patterns = Array.isArray(stored[DETAILS_PATTERN_KEY]) ? stored[DETAILS_PATTERN_KEY] : [];
-    if (!patterns.length) {
-      log('no details pattern yet for', tripId);
-      return;
-    }
-    const pattern = patterns[patterns.length - 1];
-    const url = pattern.templateUrl.replace('{ID}', encodeURIComponent(tripId));
-    log('background details fetch', url.slice(0, 180));
-    const res = await fetch(url, {
-      method: 'GET',
-      credentials: 'include',
-      headers: { Accept: 'application/json' },
-    });
-    if (!res.ok) {
-      log('details fetch HTTP', res.status, tripId);
-      return;
-    }
-    const ct = res.headers.get('content-type') || '';
-    if (!/json/i.test(ct)) {
-      log('details fetch non-json', ct);
-      return;
-    }
-    const data = await res.json();
-    await handleCapture({
-      url,
-      data,
-      capturedAt: new Date().toISOString(),
-      pageUrl: null,
-    });
-  } catch (err) {
-    log('details fetch failed', tripId, err?.message || err);
+    historySyncRunning = false;
   }
 }
 
@@ -526,22 +514,11 @@ async function ingestCollection(data) {
         observed_at: new Date().toISOString(),
       };
       collected += 1;
-      if (payment.load_id || payment.amazon_ref_id) {
-        const loadKey = payment.load_id || payment.amazon_ref_id;
-        if (loadKey && isValidRelayLoadId(loadKey)) {
-          pendingLoads[loadKey] = {
-            ...(pendingLoads[loadKey] || { load_id: loadKey }),
-            payment_status: payment.payment_status || pendingLoads[loadKey]?.payment_status,
-            payment_date: payment.payment_date || pendingLoads[loadKey]?.payment_date,
-            observed_at: new Date().toISOString(),
-          };
-        }
-      }
     }
-    const hasAny = Object.keys(pendingPayments).length > 0 || (data.payments || []).length > 0;
+    const hasAny = Object.keys(pendingPayments).length > 0;
     await updateSection('payments', {
       state: hasAny ? 'Collecting' : 'Waiting for page',
-      lastError: hasAny ? null : 'No payment JSON captured yet — open Payments',
+      lastError: hasAny ? null : 'No payment data yet',
       lastCollectedAt: hasAny ? new Date().toISOString() : null,
     });
   } else {
@@ -574,7 +551,7 @@ async function ingestCollection(data) {
     const hasRows = sectionLoads.length > 0;
     await updateSection(data.section || 'tours', {
       state: hasRows ? 'Collecting' : 'Waiting for page',
-      lastError: hasRows ? null : 'No trips extracted from captured JSON yet',
+      lastError: hasRows ? null : 'No trips from entitiesV2 yet — open Trips tabs',
       lastCollectedAt: hasRows ? new Date().toISOString() : null,
     });
     if (data.detail_detected) {
@@ -618,7 +595,6 @@ async function flushToEdge() {
     const state = await getState();
     if (!state.live || !state.extensionApiKey) return;
 
-    // Drain any pending trip batch first
     if (pendingTripBatch.size) await flushPendingTrips();
 
     const cache = { ...(state.syncedLoadCache || {}) };
@@ -756,7 +732,7 @@ async function flushToEdge() {
         lastErr = err;
         const msg = String(err?.message || err);
         const friendly = /timed out/i.test(msg)
-          ? `CRM flush timed out after ${Math.round(FLUSH_TIMEOUT_MS / 1000)}s on batch ${i + 1}/${loadChunks.length}. Retry with backoff.`
+          ? `CRM flush timed out on batch ${i + 1}/${loadChunks.length}. Retry with backoff.`
           : `CRM flush failed on batch ${i + 1}/${loadChunks.length}: ${msg}`;
         syncErrors = [...syncErrors.slice(-19), { at: new Date().toISOString(), error: friendly }];
         await setState({
@@ -772,7 +748,6 @@ async function flushToEdge() {
           dedupe_key: `sync_error:${friendly}`.slice(0, 180),
           message: `Relay sync error: ${friendly}`,
         });
-        // Backoff retry
         const delay = flushBackoffMs;
         flushBackoffMs = Math.min(FLUSH_BACKOFF_MAX_MS, flushBackoffMs * 2);
         setTimeout(() => void flushToEdge(), delay);
@@ -801,13 +776,9 @@ async function flushToEdge() {
       const syncedSections = new Set();
       if (loads.length) {
         syncedSections.add('tours');
-        if (loads.some((l) => l.section === 'load_detail' || l.trailer_id || l.additional_charges != null)) {
-          syncedSections.add('load_detail');
-        }
+        if (loads.some((l) => l.trailer_id || l.tractor_id)) syncedSections.add('load_detail');
       }
-      if (payments.length || latest.sections.payments?.state === 'Collecting') {
-        syncedSections.add('payments');
-      }
+      if (payments.length) syncedSections.add('payments');
       for (const id of syncedSections) {
         await updateSection(id, {
           state: 'Synced',
@@ -819,7 +790,7 @@ async function flushToEdge() {
         syncProgress: {
           ...(await getState()).syncProgress,
           phase: 'listening',
-          detail: `Synced ${loads.length} load(s). Still capturing Relay JSON…`,
+          detail: `Synced ${loads.length} load(s). Listening for entitiesV2…`,
           percent: 100,
         },
       });
@@ -856,9 +827,8 @@ async function maybeNotifyTelegram(event) {
       body: JSON.stringify(event),
     });
   } catch {
-    // Non-fatal
+    /* non-fatal */
   }
 }
 
-// Keep SECTIONS referenced for popup parity
 void SECTIONS;

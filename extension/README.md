@@ -1,53 +1,39 @@
 # Amazon Relay → Internal Sys Chrome Extension (MV3)
 
-Syncs **CRM-required** Amazon Relay fields into the Internal Sys fleet schema (`internal_sys` on Supabase) via Edge Functions.
+Syncs CRM-required Amazon Relay fields into Internal Sys via Edge `relay-sync`.
 
-## Method (v1.4.0)
+## Method (v1.4.1)
 
-**Passive JSON API capture** — no DOM scraping, no row expand clicks, no MutationObserver on the Trips table.
+**Passive capture of one confirmed API:**
 
-1. **MAIN world** `content/injected.js` wraps `fetch` + `XMLHttpRequest` and `postMessage`s JSON bodies.
-2. **Isolated** `content/content.js` bridges to the service worker.
-3. **Background** stores the last 200 raw captures, recursively extracts trips/legs/stops, dedupes by hash, and flushes to `relay-sync` (same CRM payload shape as before).
+`POST https://relay.amazon.com/api/tours/entitiesV2`
 
-## Supabase target
+- Request body includes `tileCountTab` (`IN_TRANSIT` / `UPCOMING` / `HISTORY`) and `pagination`
+- Response `{ entities: [...], totalRecords, nextToken, ... }` has all trip/leg/stop data — **no row expansion**
 
-`https://iiyqkdjwxlnfqvlidbqr.supabase.co` (Internal system). Not the CDL Score project.
+Pipeline: MAIN `injected.js` (fetch + XHR) → isolated `content.js` → service worker exact field map → CRM flush.
 
-Set `SUPABASE_ANON_KEY` in `shared/config.js` from that project's Settings → API (anon/publishable key only).
+Optional (default **off**): Options → **Sync all History** paginates `tileCountTab=HISTORY` with `from += 100`, ≤1 req / 2s.
 
 ## Load in Chrome
 
-1. Open `chrome://extensions`
-2. Enable **Developer mode**
-3. **Load unpacked** → select this `extension/` folder
-4. Pin **Internal Sys — Amazon Relay Sync**
-5. After updates: **Reload** the extension → refresh open Relay tabs
-
-## Use
-
-1. Sign in to Amazon Relay in Chrome (carrier session stays in the browser)
-2. Open the extension popup → login `admin` / `qwerty`
-3. Paste `RELAY_EXTENSION_API_KEY` → **GO LIVE**
-4. Open Relay **Trips** (Upcoming / In Transit / History) and use the site normally — the extension captures JSON as Relay loads it
-5. Optional: extension **Options** → **Download raw captures** (last 200 JSON responses)
-6. **Flush now** forces a CRM flush of pending extracted trips
+1. `chrome://extensions` → Developer mode → **Load unpacked** → `extension/`
+2. Reload extension after updates → **refresh every open Relay tab**
+3. Popup: `admin` / `qwerty` → paste `RELAY_EXTENSION_API_KEY` → **GO LIVE**
+4. Browse Trips Upcoming / In Transit / History normally
 
 ## Verify (DevTools)
 
-On a Relay Trips tab:
+| Context | Expected |
+|---------|----------|
+| **MAIN** (page console) | `[RelayCapture MAIN] entitiesV2 hooks installed` then `entitiesV2 captured IN_TRANSIT` (or UPCOMING / HISTORY) |
+| **Bridge** (content) | `[RelayCapture bridge] listening for entitiesV2 captures` / `forwarded entitiesV2 <tab>` |
+| **Service worker** Inspect | `[RelayCapture] tab=IN_TRANSIT trips=N legs=N stops=N` |
 
-| Context | Expected console line |
-|---------|------------------------|
-| Page (MAIN) | `[RelayCapture MAIN] fetch/XHR hooks installed` then `[RelayCapture MAIN] captured JSON …` |
-| Content script (isolated) | `[RelayCapture bridge] listening…` / `forwarded …` |
-| Service worker | `[RelayCapture SW] captured URL …` / `extractTrips → N trip(s)…` |
-
-Open `chrome://extensions` → service worker **Inspect** for SW logs.
+Options → **Download raw captures** (last 20; phone/email stripped).
 
 ## Security
 
-- No Supabase service-role key in the extension
-- No Telegram bot token in the extension
-- Extension authenticates to Edge Functions with `X-Relay-Extension-Key`
-- Capture is limited to JSON responses on Relay tabs you open; hooks never alter page behavior
+- No service-role key / Telegram token in the extension
+- Edge auth via `X-Relay-Extension-Key`
+- Driver **firstName/lastName only** — never phone/email in storage or CRM payload

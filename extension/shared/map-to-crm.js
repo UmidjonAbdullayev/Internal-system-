@@ -1,5 +1,5 @@
 /**
- * Map normalized API-capture trips → existing relay-sync load rows.
+ * Map entitiesV2-normalized trips → existing relay-sync load rows.
  */
 
 import { mapLoadStatus, parseDate, isValidRelayLoadId, sanitizeDriverName } from './normalize.js';
@@ -26,11 +26,17 @@ function addressFromStop(stop) {
   return parts.length ? parts.join(', ') : stop.facilityCode || null;
 }
 
-function sectionToBucket(section, status) {
+function sectionToBucket(section, status, tab) {
   const s = String(section || '').toLowerCase();
-  if (s === 'history') return 'history';
-  if (s === 'upcoming') return 'upcoming';
-  if (s === 'in_transit' || s === 'in-transit') return 'in_transit';
+  if (s === 'history' || String(tab || '').toUpperCase() === 'HISTORY') return 'history';
+  if (s === 'upcoming' || String(tab || '').toUpperCase() === 'UPCOMING') return 'upcoming';
+  if (
+    s === 'in_transit' ||
+    s === 'in-transit' ||
+    String(tab || '').toUpperCase() === 'IN_TRANSIT'
+  ) {
+    return 'in_transit';
+  }
   const mapped = mapLoadStatus(status);
   if (mapped && /^(Completed|Delivered|Cancelled|Rejected)$/i.test(mapped)) return 'history';
   if (mapped === 'Booked' || mapped === 'Available') return 'upcoming';
@@ -49,52 +55,62 @@ function statusForBucket(bucket, status) {
 
 /**
  * Expand one normalized trip into one or more CRM load objects.
- * Never drops for missing fields — leave nulls; finalizeLoadForSync fills gaps at flush.
+ * Prefer legs (versionedLoadId); if no legs, emit tripId as load when valid.
  */
 export function tripsToCrmLoads(trips) {
   const loads = [];
   for (const trip of trips || []) {
     if (!trip?.tripId) continue;
-    const bucket = sectionToBucket(trip.section, trip.status);
-    const loadStatus = statusForBucket(bucket, trip.status);
-    const legs = Array.isArray(trip.legs) && trip.legs.length ? trip.legs : [{}];
+    const bucket = sectionToBucket(trip.section, trip.status || trip.executionStatus, trip.tab);
+    const loadStatus = statusForBucket(
+      bucket,
+      trip.executionStatus || trip.tourState || trip.status,
+    );
+    const legs = Array.isArray(trip.legs) && trip.legs.length ? trip.legs : [null];
 
     for (const leg of legs) {
-      const stops = Array.isArray(leg.stops) ? [...leg.stops] : [];
+      const stops = leg && Array.isArray(leg.stops) ? [...leg.stops] : [];
       stops.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
       const first = stops[0] || null;
       const last = stops.length > 1 ? stops[stops.length - 1] : stops[0] || null;
 
-      let loadId = leg.loadId || trip.tripId;
+      let loadId = (leg && leg.loadId) || trip.tripId;
       if (loadId) loadId = String(loadId).trim().toUpperCase();
       if (!isValidRelayLoadId(loadId)) {
-        // Still emit if tripId is valid; otherwise skip invalid ids
         if (isValidRelayLoadId(trip.tripId)) loadId = String(trip.tripId).trim().toUpperCase();
         else continue;
       }
 
       const parentTripId =
-        trip.tripId &&
-        String(trip.tripId).toUpperCase() !== loadId &&
-        isValidRelayLoadId(trip.tripId)
+        trip.tripId && String(trip.tripId).toUpperCase() !== loadId
           ? String(trip.tripId).toUpperCase()
-          : /^T-/i.test(trip.tripId)
-            ? String(trip.tripId).toUpperCase()
-            : null;
+          : null;
 
       const pickupDate =
-        ymdFromIso(first?.scheduledArrival || first?.actualArrival || first?.cpt) || null;
+        ymdFromIso(first?.scheduledArrival || first?.actualArrival || first?.eta) || null;
       const deliveryDate =
-        ymdFromIso(last?.scheduledArrival || last?.actualArrival || last?.cpt || last?.scheduledDeparture) ||
+        ymdFromIso(
+          last?.scheduledArrival || last?.actualArrival || last?.eta || last?.scheduledDeparture,
+        ) || null;
+
+      const driverRaw =
+        sanitizeDriverName(leg?.driver) ||
+        sanitizeDriverName(trip.driver) ||
+        leg?.driver ||
+        trip.driver ||
         null;
+
+      const notesParts = [];
+      if (first?.scheduledArrivalLocal) notesParts.push(`PU ${first.scheduledArrivalLocal}`);
+      if (last?.scheduledArrivalLocal || last?.cptLocal) {
+        notesParts.push(`DEL ${last.scheduledArrivalLocal || last?.etaLocal || ''}`.trim());
+      }
+      if (leg?.cptLocal) notesParts.push(`CPT ${leg.cptLocal}`);
 
       loads.push({
         load_id: loadId,
-        amazon_ref_id:
-          leg.loadId && String(leg.loadId).toUpperCase() !== loadId
-            ? String(leg.loadId).toUpperCase()
-            : null,
-        parent_trip_id: parentTripId && parentTripId !== loadId ? parentTripId : /^T-/i.test(trip.tripId) ? String(trip.tripId).toUpperCase() : null,
+        amazon_ref_id: null,
+        parent_trip_id: parentTripId && isValidRelayLoadId(parentTripId) ? parentTripId : null,
         load_status: loadStatus,
         trip_bucket: bucket === 'unknown' ? null : bucket,
         pickup_location: placeFromStop(first),
@@ -103,18 +119,20 @@ export function tripsToCrmLoads(trips) {
         delivery_address: addressFromStop(last),
         pickup_date: pickupDate,
         delivery_date: deliveryDate,
-        trailer_id: leg.trailerId || null,
-        tractor_id: leg.tractorId || null,
-        trailer_type: trip.equipment || null,
-        driver_name_raw: sanitizeDriverName(trip.driver) || trip.driver || null,
-        distance_miles: leg.miles ?? trip.totalMiles ?? null,
-        rate_gross: leg.payout ?? trip.payout ?? null,
+        trailer_id: leg?.trailerId || null,
+        tractor_id: leg?.tractorId || null,
+        trailer_type: leg?.equipmentType || trip.equipment || null,
+        driver_name_raw: driverRaw,
+        distance_miles: leg?.miles ?? trip.totalMiles ?? null,
+        rate_gross: leg?.payout ?? trip.payout ?? null,
         arrival_actual: first?.actualArrival || last?.actualArrival || null,
         arrival_scheduled: first?.scheduledArrival || last?.scheduledArrival || null,
         arrival_address: addressFromStop(last) || addressFromStop(first),
-        notes: null,
+        notes: notesParts.filter(Boolean).join(' · ') || null,
         section: 'tours',
-        source: 'relay_api_capture',
+        source: 'relay_entitiesV2',
+        entity_version: trip.version ?? null,
+        tile_count_tab: trip.tab || null,
       });
     }
   }
