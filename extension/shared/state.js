@@ -209,59 +209,64 @@ export async function getState() {
 }
 
 export async function setState(patch) {
-  const current = await getState();
+  const current = await getState().catch(() => ({}));
   const next = { ...current, ...patch };
   if (patch.sections) {
-    next.sections = { ...current.sections, ...patch.sections };
+    next.sections = { ...(current.sections || {}), ...patch.sections };
   }
   if (patch.syncProgress) {
-    next.syncProgress = { ...current.syncProgress, ...patch.syncProgress };
+    next.syncProgress = { ...(current.syncProgress || {}), ...patch.syncProgress };
   }
   if (patch.health) {
-    next.health = { ...current.health, ...patch.health };
+    next.health = { ...(current.health || {}), ...patch.health };
   }
   if (patch.scheduleMs) {
-    next.scheduleMs = { ...current.scheduleMs, ...patch.scheduleMs };
+    next.scheduleMs = { ...(current.scheduleMs || {}), ...patch.scheduleMs };
   }
   if (patch.nextDueAt) {
-    next.nextDueAt = { ...current.nextDueAt, ...patch.nextDueAt };
+    next.nextDueAt = { ...(current.nextDueAt || {}), ...patch.nextDueAt };
   }
   if (patch.sectionSync) {
     next.sectionSync = {
-      IN_TRANSIT: { ...current.sectionSync.IN_TRANSIT, ...(patch.sectionSync.IN_TRANSIT || {}) },
-      UPCOMING: { ...current.sectionSync.UPCOMING, ...(patch.sectionSync.UPCOMING || {}) },
-      HISTORY: { ...current.sectionSync.HISTORY, ...(patch.sectionSync.HISTORY || {}) },
+      IN_TRANSIT: { ...(current.sectionSync?.IN_TRANSIT || {}), ...(patch.sectionSync.IN_TRANSIT || {}) },
+      UPCOMING: { ...(current.sectionSync?.UPCOMING || {}), ...(patch.sectionSync.UPCOMING || {}) },
+      HISTORY: { ...(current.sectionSync?.HISTORY || {}), ...(patch.sectionSync.HISTORY || {}) },
     };
   }
   if (patch.catchUp) {
-    next.catchUp = { ...current.catchUp, ...patch.catchUp };
+    next.catchUp = { ...(current.catchUp || {}), ...patch.catchUp };
   }
   if (patch.sectionCounts) {
     next.sectionCounts = {
-      IN_TRANSIT: { ...current.sectionCounts.IN_TRANSIT, ...(patch.sectionCounts.IN_TRANSIT || {}) },
-      UPCOMING: { ...current.sectionCounts.UPCOMING, ...(patch.sectionCounts.UPCOMING || {}) },
-      HISTORY: { ...current.sectionCounts.HISTORY, ...(patch.sectionCounts.HISTORY || {}) },
+      IN_TRANSIT: { ...(current.sectionCounts?.IN_TRANSIT || {}), ...(patch.sectionCounts.IN_TRANSIT || {}) },
+      UPCOMING: { ...(current.sectionCounts?.UPCOMING || {}), ...(patch.sectionCounts.UPCOMING || {}) },
+      HISTORY: { ...(current.sectionCounts?.HISTORY || {}), ...(patch.sectionCounts.HISTORY || {}) },
     };
   }
   if (patch.templateMeta) {
     next.templateMeta = {
-      IN_TRANSIT: { ...current.templateMeta.IN_TRANSIT, ...(patch.templateMeta.IN_TRANSIT || {}) },
-      UPCOMING: { ...current.templateMeta.UPCOMING, ...(patch.templateMeta.UPCOMING || {}) },
-      HISTORY: { ...current.templateMeta.HISTORY, ...(patch.templateMeta.HISTORY || {}) },
+      IN_TRANSIT: { ...(current.templateMeta?.IN_TRANSIT || {}), ...(patch.templateMeta.IN_TRANSIT || {}) },
+      UPCOMING: { ...(current.templateMeta?.UPCOMING || {}), ...(patch.templateMeta.UPCOMING || {}) },
+      HISTORY: { ...(current.templateMeta?.HISTORY || {}), ...(patch.templateMeta.HISTORY || {}) },
     };
   }
   if (patch.templateWrong) {
-    next.templateWrong = { ...current.templateWrong, ...patch.templateWrong };
+    next.templateWrong = { ...(current.templateWrong || {}), ...patch.templateWrong };
   }
   if (patch.historyBackfillProgress) {
     next.historyBackfillProgress = {
-      ...current.historyBackfillProgress,
+      ...(current.historyBackfillProgress || {}),
       ...patch.historyBackfillProgress,
     };
   }
-  await chrome.storage.local.set({ relayState: next });
+  try {
+    await chrome.storage.local.set({ relayState: next });
+  } catch (err) {
+    console.warn('[setState] storage error (sync continues)', err);
+  }
   return next;
 }
+
 
 export async function updateSection(sectionId, patch) {
   const current = await getState();
