@@ -15,6 +15,8 @@ export const BOT_COMMANDS_PRIVATE = [
   { command: "driver", description: "Select driver: /driver DRV-xxxx" },
   { command: "logout", description: "Clear admin session" },
   { command: "help", description: "List commands" },
+  { command: "late", description: "/late <tripId> <reason>" },
+  { command: "mute", description: "/mute <tripId> [hours]" },
 ];
 export const ACTIVE_LOAD_EXCLUDE = '("Completed","Cancelled","Rejected","Delivered")';
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -38,6 +40,7 @@ export async function reply(
   chatId: number | string,
   text: string,
   replyMarkup?: Record<string, unknown>,
+  parseMode?: string,
 ) {
   const payload: Record<string, unknown> = {
     chat_id: chatId,
@@ -45,7 +48,152 @@ export async function reply(
     disable_web_page_preview: true,
   };
   if (replyMarkup) payload.reply_markup = replyMarkup;
+  if (parseMode) payload.parse_mode = parseMode;
   await tg(botToken, "sendMessage", payload);
+}
+
+export async function crmBaseUrl(sb: SupabaseClient): Promise<string> {
+  const { data } = await sb
+    .from("telegram_alert_config")
+    .select("crm_base_url")
+    .eq("id", 1)
+    .maybeSingle();
+  return String(data?.crm_base_url || "https://internal-system-lac.vercel.app").replace(/\/$/, "");
+}
+
+export function openCrmMarkup(base: string, tripId: string) {
+  return {
+    inline_keyboard: [[{ text: "Open in CRM", url: `${base}/loads?q=${encodeURIComponent(tripId)}` }]],
+  };
+}
+
+export async function buildTripStatusById(sb: SupabaseClient, tripIdRaw: string): Promise<string> {
+  const tripId = tripIdRaw.trim().toUpperCase();
+  const { data: trip } = await sb
+    .from("relay_trips")
+    .select("trip_id, section, status, driver_name_raw, start_time, execution_status")
+    .eq("trip_id", tripId)
+    .maybeSingle();
+  if (trip) {
+    const { data: stops } = await sb
+      .from("relay_stops")
+      .select("seq, facility_code, stop_type, scheduled_arrival, actual_arrival, eta")
+      .eq("trip_id", tripId)
+      .eq("archived", false)
+      .order("seq", { ascending: true })
+      .limit(6);
+    const lines = [
+      `Trip ${trip.trip_id}`,
+      `Section: ${trip.section || "—"} · ${trip.status || trip.execution_status || "—"}`,
+      `Driver: ${trip.driver_name_raw || "—"}`,
+      `Start: ${trip.start_time || "—"}`,
+      `Stops: ${(stops || []).length}`,
+    ];
+    for (const s of stops || []) {
+      lines.push(
+        `• ${s.seq ?? "?"} ${s.facility_code || s.stop_type || "Stop"} sch=${s.scheduled_arrival || "—"} act=${s.actual_arrival || "—"}`,
+      );
+    }
+    return lines.join("\n");
+  }
+  const { data: load } = await sb
+    .from("loads")
+    .select(
+      "load_id, parent_trip_id, load_status, trip_bucket, driver_name_raw, pickup_location, delivery_location, arrival_actual, arrival_scheduled, late_reason",
+    )
+    .or(`load_id.eq.${tripId},parent_trip_id.eq.${tripId}`)
+    .limit(5);
+  if (!load?.length) return `No trip/load found for ${tripId}`;
+  const lines = [`Trip/load ${tripId}`, `Matches: ${load.length}`];
+  for (const l of load) {
+    lines.push(
+      `• ${l.load_id} [${l.load_status}/${l.trip_bucket}] ${l.driver_name_raw || "—"}`,
+      `  ${l.pickup_location || "—"} → ${l.delivery_location || "—"}`,
+      `  Arr ${l.arrival_actual || "—"} Sch ${l.arrival_scheduled || "—"} Late: ${l.late_reason || "—"}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+export async function setLateReason(
+  sb: SupabaseClient,
+  tripIdRaw: string,
+  reason: string,
+): Promise<{ ok: boolean; tripId: string; error?: string }> {
+  const tripId = tripIdRaw.trim().toUpperCase();
+  const reasonTrim = reason.trim().slice(0, 500);
+  if (!reasonTrim) return { ok: false, tripId, error: "reason required" };
+  const now = new Date().toISOString();
+  const { data: loads } = await sb
+    .from("loads")
+    .select("id, load_id, parent_trip_id")
+    .or(`load_id.eq.${tripId},parent_trip_id.eq.${tripId}`);
+  if (loads?.length) {
+    await sb
+      .from("loads")
+      .update({ late_reason: reasonTrim, late_reason_at: now, updated_at: now })
+      .or(`load_id.eq.${tripId},parent_trip_id.eq.${tripId}`);
+  }
+  await sb
+    .from("relay_stops")
+    .update({ late_reason: reasonTrim, late_reason_at: now, updated_at: now })
+    .eq("trip_id", tripId)
+    .is("late_reason", null);
+  // Fire late_reason alert via trip-alerts
+  const base = Deno.env.get("SUPABASE_URL");
+  const service = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (base && service) {
+    try {
+      await fetch(`${base}/functions/v1/trip-alerts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${service}`,
+        },
+        body: JSON.stringify({
+          action: "status",
+          events: [{
+            kind: "late_reason",
+            tripId,
+            section: "IN_TRANSIT",
+            lateReason: reasonTrim,
+          }],
+        }),
+      });
+    } catch {
+      /* non-fatal */
+    }
+  }
+  return { ok: true, tripId };
+}
+
+export async function muteTrip(
+  sb: SupabaseClient,
+  tripIdRaw: string,
+  chatId: string,
+  hours: number,
+  mutedBy: string | null,
+): Promise<string> {
+  const tripId = tripIdRaw.trim().toUpperCase();
+  const hrs = Number.isFinite(hours) && hours > 0 ? hours : 24;
+  const until = new Date(Date.now() + hrs * 3600_000).toISOString();
+  await sb.from("telegram_trip_mutes").upsert(
+    {
+      trip_id: tripId,
+      chat_id: chatId,
+      muted_until: until,
+      muted_by: mutedBy,
+    },
+    { onConflict: "trip_id,chat_id" },
+  );
+  return `Muted ${tripId} for ${hrs}h (until ${until})`;
+}
+
+export async function setDispatchChat(sb: SupabaseClient, chatId: string): Promise<void> {
+  await sb
+    .from("telegram_alert_config")
+    .update({ default_chat_id: chatId, updated_at: new Date().toISOString() })
+    .eq("id", 1);
 }
 export async function answerCallback(botToken: string, callbackQueryId: string, text?: string) {
   await tg(botToken, "answerCallbackQuery", {

@@ -19,6 +19,12 @@ import {
   buildUpdatesText,
   buildTourText,
   handleCallback,
+  buildTripStatusById,
+  setLateReason,
+  muteTrip,
+  setDispatchChat,
+  crmBaseUrl,
+  openCrmMarkup,
 } from "./helpers.ts";
 
 Deno.serve(async (req: Request) => {
@@ -106,11 +112,73 @@ Deno.serve(async (req: Request) => {
         await reply(botToken, chatId, "Group unlinked (set inactive). Type /link DRV-xxxx to re-link.");
         return json({ success: true, unlinked: true });
       }
-      if (["/menu", "/start", "/status", "/updates", "/tour", "/loads", "/help"].includes(cmdBase)) {
+      // Dispatch trip alert commands (typed; no group slash menu)
+      if (cmdBase === "/setdispatch") {
+        await setDispatchChat(sb, chatId);
         await reply(
           botToken,
           chatId,
-          "Menus are disabled in groups. Open a private chat with @inter_sysbot, unlock with the admin password, then send DRV-xxxx.",
+          "This group is now the default dispatch alert chat (telegram_alert_config.default_chat_id).",
+        );
+        return json({ success: true, setdispatch: true, chat_id: chatId });
+      }
+      if (cmdBase === "/late") {
+        const m = text.match(/^\/late(?:@\w+)?\s+(\S+)\s+(.+)$/i);
+        if (!m) {
+          await reply(botToken, chatId, "Usage: /late <tripId> <reason>");
+          return json({ success: true, late: false });
+        }
+        const result = await setLateReason(sb, m[1], m[2]);
+        if (!result.ok) {
+          await reply(botToken, chatId, result.error || "Failed");
+          return json({ success: false, late: false });
+        }
+        const base = await crmBaseUrl(sb);
+        await reply(
+          botToken,
+          chatId,
+          `Late reason saved for ${result.tripId}.`,
+          openCrmMarkup(base, result.tripId),
+        );
+        return json({ success: true, late: true, trip_id: result.tripId });
+      }
+      if (cmdBase === "/status") {
+        const m = text.match(/^\/status(?:@\w+)?\s+(\S+)/i);
+        if (!m) {
+          await reply(
+            botToken,
+            chatId,
+            "In groups use /status <tripId>. Full driver menus are DM-only with @inter_sysbot.",
+          );
+          return json({ success: true, redirected: "need_trip" });
+        }
+        const body = await buildTripStatusById(sb, m[1]);
+        const base = await crmBaseUrl(sb);
+        await reply(botToken, chatId, body, openCrmMarkup(base, m[1].trim().toUpperCase()));
+        return json({ success: true, status: true, trip: true });
+      }
+      if (cmdBase === "/mute") {
+        const m = text.match(/^\/mute(?:@\w+)?\s+(\S+)(?:\s+(\d+))?/i);
+        if (!m) {
+          await reply(botToken, chatId, "Usage: /mute <tripId> [hours]");
+          return json({ success: true, mute: false });
+        }
+        const hours = m[2] ? Number(m[2]) : 24;
+        const msg = await muteTrip(
+          sb,
+          m[1],
+          chatId,
+          hours,
+          userId != null ? String(userId) : null,
+        );
+        await reply(botToken, chatId, msg);
+        return json({ success: true, mute: true });
+      }
+      if (["/menu", "/start", "/updates", "/tour", "/loads", "/help"].includes(cmdBase)) {
+        await reply(
+          botToken,
+          chatId,
+          "Menus are disabled in groups. Open a private chat with @inter_sysbot, unlock with the admin password, then send DRV-xxxx.\nGroup alert cmds: /late /status <tripId> /mute <tripId> /setdispatch",
         );
         return json({ success: true, redirected: "dm_only" });
       }

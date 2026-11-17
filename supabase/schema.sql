@@ -386,6 +386,54 @@ create table if not exists public.cleanup_runs (
   meta jsonb not null default '{}'::jsonb
 );
 
+-- Dispatch trip alerts
+create table if not exists public.telegram_alert_config (
+  id int primary key default 1 check (id = 1),
+  default_chat_id text,
+  bootstrapped boolean not null default false,
+  bootstrapped_at timestamptz,
+  sync_stale_notified boolean not null default false,
+  cron_secret text not null default encode(gen_random_bytes(24), 'hex'),
+  crm_base_url text not null default 'https://internal-system-lac.vercel.app',
+  timezone text not null default 'America/Chicago',
+  quiet_hours_start time,
+  quiet_hours_end time,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.telegram_alert_settings (
+  alert_type text primary key,
+  chat_id text,
+  enabled boolean not null default true,
+  quiet_hours_start time,
+  quiet_hours_end time,
+  timezone text,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.alerts_sent (
+  id uuid primary key default gen_random_uuid(),
+  trip_id text not null,
+  stop_id text not null default '',
+  alert_type text not null,
+  level text not null default '0',
+  sent_at timestamptz not null default now(),
+  telegram_message_id bigint,
+  chat_id text,
+  meta jsonb not null default '{}'::jsonb,
+  unique (trip_id, stop_id, alert_type, level)
+);
+
+create table if not exists public.telegram_trip_mutes (
+  id uuid primary key default gen_random_uuid(),
+  trip_id text not null,
+  chat_id text not null,
+  muted_until timestamptz not null,
+  muted_by text,
+  created_at timestamptz not null default now(),
+  unique (trip_id, chat_id)
+);
+
 -- RLS: extension writes via Edge Functions (service role); authenticated CRM can read
 alter table public.users enable row level security;
 alter table public.drivers enable row level security;
@@ -403,6 +451,10 @@ alter table public.relay_notification_dedupe enable row level security;
 alter table public.driver_telegram_groups enable row level security;
 alter table public.telegram_notification_history enable row level security;
 alter table public.telegram_admin_sessions enable row level security;
+alter table public.telegram_alert_config enable row level security;
+alter table public.telegram_alert_settings enable row level security;
+alter table public.alerts_sent enable row level security;
+alter table public.telegram_trip_mutes enable row level security;
 
 do $$
 begin
