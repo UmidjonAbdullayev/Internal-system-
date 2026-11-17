@@ -1,8 +1,72 @@
 /**
- * Map entitiesV2-normalized trips → existing relay-sync load rows.
+ * Map entitiesV2-normalized trips → CRM loads (compat) + trips payload (new model).
  */
 
 import { mapLoadStatus, parseDate, isValidRelayLoadId, sanitizeDriverName } from './normalize.js';
+import { tripContentHashPayload, hashString } from './extract.js';
+
+/**
+ * Edge `trips[]` shape: trip UPSERT + nested legs/stops (never save legs as trips).
+ */
+export async function tripsToEdgePayload(trips) {
+  const out = [];
+  for (const trip of trips || []) {
+    if (!trip?.tripId) continue;
+    const contentHash = await hashString(tripContentHashPayload(trip));
+    const tab = String(trip.tab || '').toUpperCase();
+    out.push({
+      tripId: String(trip.tripId).toUpperCase(),
+      version: trip.version ?? null,
+      tab: tab || null,
+      section: trip.section || null,
+      tourState: trip.tourState || null,
+      executionStatus: trip.executionStatus || null,
+      workType: trip.workType || null,
+      businessType: trip.businessType || null,
+      startTime: trip.startTime || null,
+      endTime: trip.endTime || null,
+      totalMiles: trip.totalMiles ?? null,
+      payout: trip.payout ?? null,
+      currency: trip.currency || null,
+      ratePerMile: trip.ratePerMile ?? null,
+      driver: trip.driver || null,
+      equipment: trip.equipment || null,
+      status: trip.status || trip.executionStatus || trip.tourState || null,
+      contentHash,
+      legs: (trip.legs || []).map((leg) => ({
+        loadId: leg.loadId || null,
+        facilitySequence: leg.facilitySequence || null,
+        executionStatus: leg.executionStatus || null,
+        equipmentType: leg.equipmentType || null,
+        miles: leg.miles ?? null,
+        payout: leg.payout ?? null,
+        tractorId: leg.tractorId || null,
+        trailerId: leg.trailerId || null,
+        driver: leg.driver || null,
+        cpt: leg.cpt || null,
+        stops: (leg.stops || []).map((s) => ({
+          seq: s.seq ?? null,
+          stopType: s.stopType || null,
+          facilityCode: s.facilityCode || null,
+          address: s.address || null,
+          city: s.city || null,
+          state: s.state || null,
+          zip: s.zip || null,
+          timeZone: s.timeZone || null,
+          scheduledArrival: s.scheduledArrival || null,
+          actualArrival: s.actualArrival || null,
+          scheduledDeparture: s.scheduledDeparture || null,
+          actualDeparture: s.actualDeparture || null,
+          eta: s.eta || null,
+          scheduledArrivalLocal: s.scheduledArrivalLocal || null,
+          actualArrivalLocal: s.actualArrivalLocal || null,
+        })),
+      })),
+      raw: trip.raw || null,
+    });
+  }
+  return out;
+}
 
 function ymdFromIso(iso) {
   if (!iso) return null;

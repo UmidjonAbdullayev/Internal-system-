@@ -1,5 +1,6 @@
 import {
   RELAY_SYNC_FN,
+  RELAY_SNAPSHOT_FN,
   RELAY_TELEGRAM_FN,
   SUPABASE_ANON_KEY,
   SUPABASE_URL,
@@ -34,7 +35,7 @@ import {
   mapLoadStatus,
 } from '../shared/normalize.js';
 import { extractTrips, countTripStats, tripContentHashPayload, hashString } from '../shared/extract.js';
-import { tripsToCrmLoads } from '../shared/map-to-crm.js';
+import { tripsToCrmLoads, tripsToEdgePayload } from '../shared/map-to-crm.js';
 import {
   configureAlwaysOn,
   saveRequestTemplate,
@@ -451,10 +452,13 @@ async function handleCapture(msg) {
 }
 
 async function handleTripsDiff(diff) {
-  const { tileCountTab, newTrips, changedTrips, removedTripIds } = diff;
+  const { tileCountTab, newTrips, changedTrips, removedTripIds, trips, snapshot } = diff;
   const toPush = [...newTrips, ...changedTrips];
 
-  if (toPush.length) {
+  // Always send full section trip payloads + optional snapshot to new CRM model
+  if ((trips && trips.length) || snapshot) {
+    await pushTripsModelImmediate(trips || toPush, snapshot, tileCountTab);
+  } else if (toPush.length) {
     await pushTripsImmediate(toPush, {
       reason: 'always-on',
       tileCountTab,
@@ -470,6 +474,68 @@ async function handleTripsDiff(diff) {
   }
 
   await updateBadge();
+}
+
+/** UPSERT relay_trips/legs/stops (+ snapshot) via relay-snapshot; loads via relay-sync. */
+async function pushTripsModelImmediate(trips, snapshot, tileCountTab) {
+  const state = await getState();
+  if (!state.live || !state.extensionApiKey) return;
+
+  const edgeTrips = await tripsToEdgePayload(trips);
+  const loads = tripsToCrmLoads(trips);
+  const clientId = await ensureClientId();
+
+  try {
+    const res = await withTimeout(
+      fetch(RELAY_SNAPSHOT_FN, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          apikey: SUPABASE_ANON_KEY,
+          'X-Relay-Extension-Key': state.extensionApiKey,
+        },
+        body: JSON.stringify({
+          client_id: clientId,
+          trips: edgeTrips,
+          ...(snapshot ? { snapshot } : {}),
+        }),
+      }),
+      FLUSH_TIMEOUT_MS,
+      `relay-snapshot ${tileCountTab || ''}`,
+    );
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      throw new Error(json.error || `HTTP ${res.status}`);
+    }
+    if (json.section_counts) {
+      await setState({
+        sectionCounts: {
+          ...(state.sectionCounts || {}),
+          ...json.section_counts,
+        },
+        lastSyncAt: new Date().toISOString(),
+      });
+    }
+    // Legacy loads path for existing CRM UI (legs as loads with parent_trip_id)
+    if (loads.length) {
+      await ingestCollection({ section: 'tours', loads, detail_detected: true });
+      void flushToEdge();
+    }
+    await updateSection('tours', {
+      state: 'Synced',
+      lastError: null,
+      lastCollectedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    log('pushTripsModelImmediate failed', err?.message || err);
+    if (loads.length) {
+      await ingestCollection({ section: 'tours', loads, detail_detected: true });
+    }
+    const delay = flushBackoffMs;
+    flushBackoffMs = Math.min(FLUSH_BACKOFF_MAX_MS, flushBackoffMs * 2);
+    setTimeout(() => void flushToEdge(), delay);
+  }
 }
 
 async function handleRemovedTrips(tileCountTab, removedTripIds) {

@@ -423,6 +423,29 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
     });
   }
 
+  const uniqueIds = [
+    ...new Set(allTrips.map((t) => String(t.tripId || '').toUpperCase()).filter(Boolean)),
+  ];
+  const reportedTotal =
+    Number.isFinite(totalRecords) && totalRecords !== Infinity ? Number(totalRecords) : uniqueIds.length;
+
+  // Snapshot only after full pagination (all pages), error-free, counts match
+  let snapshot = null;
+  if (!page1Only) {
+    if (uniqueIds.length !== reportedTotal) {
+      log(
+        `snapshot SKIP ${tileCountTab}: unique tripIds=${uniqueIds.length} != totalRecords=${reportedTotal}`,
+      );
+    } else {
+      snapshot = {
+        section: tileCountTab,
+        tripIds: uniqueIds,
+        totalRecords: reportedTotal,
+        syncedAt: new Date().toISOString(),
+      };
+    }
+  }
+
   await hooks.onTripsDiff({
     tileCountTab,
     trips: allTrips,
@@ -430,9 +453,14 @@ export async function syncSection(tabId, tileCountTab, { page1Only = false } = {
     changedTrips: diff.changedTrips,
     removedTripIds: diff.removedTripIds,
     changedFieldsMap: diff.changedFieldsMap,
+    pages,
+    page1Only: Boolean(page1Only),
+    totalRecords: reportedTotal,
+    snapshot,
+    fetchHadError: false,
   });
 
-  return { ok: true, pages, ...diff.stats };
+  return { ok: true, pages, totalRecords: reportedTotal, snapshot, ...diff.stats };
 }
 
 export async function ensureAlarmsAlwaysOn() {

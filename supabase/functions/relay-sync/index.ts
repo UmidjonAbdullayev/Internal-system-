@@ -49,6 +49,78 @@ type PaymentIn = {
   notes?: string | null;
 };
 
+type StopIn = {
+  seq?: number | null;
+  stopType?: string | null;
+  facilityCode?: string | null;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  zip?: string | null;
+  timeZone?: string | null;
+  scheduledArrival?: string | null;
+  actualArrival?: string | null;
+  scheduledDeparture?: string | null;
+  actualDeparture?: string | null;
+  eta?: string | null;
+  scheduledArrivalLocal?: string | null;
+  actualArrivalLocal?: string | null;
+};
+
+type LegIn = {
+  loadId?: string | null;
+  facilitySequence?: string | null;
+  executionStatus?: string | null;
+  equipmentType?: string | null;
+  miles?: number | null;
+  payout?: number | null;
+  tractorId?: string | null;
+  trailerId?: string | null;
+  driver?: string | null;
+  cpt?: string | null;
+  stops?: StopIn[];
+};
+
+type TripIn = {
+  tripId: string;
+  version?: string | number | null;
+  tab?: string | null;
+  section?: string | null;
+  tourState?: string | null;
+  executionStatus?: string | null;
+  workType?: string | null;
+  businessType?: string | null;
+  startTime?: string | null;
+  endTime?: string | null;
+  totalMiles?: number | null;
+  payout?: number | null;
+  currency?: string | null;
+  ratePerMile?: number | null;
+  driver?: string | null;
+  equipment?: string | null;
+  status?: string | null;
+  contentHash?: string | null;
+  legs?: LegIn[];
+  raw?: unknown;
+};
+
+type SnapshotIn = {
+  section: string;
+  tripIds: string[];
+  totalRecords: number;
+  syncedAt?: string;
+};
+
+const SECTION_OK = new Set(["IN_TRANSIT", "UPCOMING", "HISTORY"]);
+const REMOVED_AFTER_MS = 10 * 60 * 1000;
+
+function normalizeSection(raw: unknown): string | null {
+  const s = String(raw || "").toUpperCase().replace(/-/g, "_");
+  if (s === "INTRANSIT") return "IN_TRANSIT";
+  if (SECTION_OK.has(s)) return s;
+  return null;
+}
+
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -307,6 +379,9 @@ Deno.serve(async (req: Request) => {
     const body = await req.json();
     const loads: LoadIn[] = Array.isArray(body.loads) ? body.loads : [];
     const payments: PaymentIn[] = Array.isArray(body.payments) ? body.payments : [];
+    const tripsIn: TripIn[] = Array.isArray(body.trips) ? body.trips : [];
+    const snapshot: SnapshotIn | null =
+      body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null;
     const clientId = typeof body.client_id === "string" ? body.client_id : null;
     /**
      * When set (full Upcoming+In Transit pass), demote other active amazon_relay rows to History.
@@ -336,9 +411,17 @@ Deno.serve(async (req: Request) => {
     let loadsUpdated = 0;
     let loadsPaymentUpdated = 0;
     let paymentsUpserted = 0;
+    let tripsUpserted = 0;
+    let legsUpserted = 0;
+    let stopsUpserted = 0;
+    let snapshotMoved = 0;
+    let snapshotRemoved = 0;
+    let loadsReconciled = 0;
     const errors: string[] = [];
     const syncedLoadIds: string[] = [];
     const syncedPaymentRefs: string[] = [];
+    const syncedTripIds: string[] = [];
+    const sectionCounts: Record<string, { relay: number; crm: number; mismatch: boolean }> = {};
     const notifications: Array<{
       event_type: string;
       dedupe_key: string;
@@ -353,6 +436,198 @@ Deno.serve(async (req: Request) => {
       .from("drivers")
       .select("id, first_name, last_name, notes, driver_id");
     const driversCache: DriverRow[] = (driverRows || []) as DriverRow[];
+
+    // ---- New model: UPSERT relay_trips / relay_legs / relay_stops by tripId ----
+    for (const trip of tripsIn) {
+      const tripId = String(trip?.tripId || "").trim().toUpperCase();
+      if (!tripId || !isValidRelayLoadId(tripId)) {
+        errors.push(`Invalid tripId skipped: ${trip?.tripId || "(missing)"}`);
+        continue;
+      }
+      const section = normalizeSection(trip.tab || trip.section);
+      const tripRow = {
+        trip_id: tripId,
+        section,
+        relay_version: trip.version != null ? String(trip.version) : null,
+        last_seen_at: now,
+        tour_state: trip.tourState ?? null,
+        execution_status: trip.executionStatus ?? null,
+        work_type: trip.workType ?? null,
+        business_type: trip.businessType ?? null,
+        start_time: trip.startTime ?? null,
+        end_time: trip.endTime ?? null,
+        total_miles: trip.totalMiles ?? null,
+        payout: trip.payout ?? null,
+        currency: trip.currency ?? null,
+        rate_per_mile: trip.ratePerMile ?? null,
+        driver_name_raw: sanitizeDriverName(trip.driver),
+        equipment: trip.equipment ?? null,
+        status: trip.status || trip.executionStatus || trip.tourState || null,
+        content_hash: trip.contentHash ?? null,
+        raw: trip.raw ?? {},
+        archived: false,
+        updated_at: now,
+      };
+      const { error: tripErr } = await sb.from("relay_trips").upsert(tripRow, {
+        onConflict: "trip_id",
+      });
+      if (tripErr) {
+        errors.push(`Trip upsert ${tripId}: ${tripErr.message}`);
+        continue;
+      }
+      tripsUpserted += 1;
+      syncedTripIds.push(tripId);
+
+      for (const leg of trip.legs || []) {
+        const loadId = String(leg?.loadId || "").trim().toUpperCase();
+        if (!loadId || !isValidRelayLoadId(loadId)) continue;
+        const legRow = {
+          load_id: loadId,
+          trip_id: tripId,
+          facility_sequence: leg.facilitySequence ?? null,
+          execution_status: leg.executionStatus ?? null,
+          equipment_type: leg.equipmentType ?? null,
+          miles: leg.miles ?? null,
+          payout: leg.payout ?? null,
+          tractor_id: leg.tractorId ?? null,
+          trailer_id: leg.trailerId ?? null,
+          driver_name_raw: sanitizeDriverName(leg.driver),
+          cpt: leg.cpt ?? null,
+          raw: {},
+          archived: false,
+          last_seen_at: now,
+          updated_at: now,
+        };
+        const { error: legErr } = await sb.from("relay_legs").upsert(legRow, {
+          onConflict: "load_id",
+        });
+        if (legErr) {
+          errors.push(`Leg upsert ${loadId}: ${legErr.message}`);
+          continue;
+        }
+        legsUpserted += 1;
+
+        for (const stop of leg.stops || []) {
+          const seq = stop.seq ?? 0;
+          const stopId = `${tripId}:${loadId}:${seq}`;
+          const stopRow = {
+            stop_id: stopId,
+            load_id: loadId,
+            trip_id: tripId,
+            seq,
+            stop_type: stop.stopType ?? null,
+            facility_code: stop.facilityCode ?? null,
+            address: stop.address ?? null,
+            city: stop.city ?? null,
+            state: stop.state ?? null,
+            zip: stop.zip ?? null,
+            time_zone: stop.timeZone ?? null,
+            scheduled_arrival: stop.scheduledArrival ?? null,
+            actual_arrival: stop.actualArrival ?? null,
+            scheduled_departure: stop.scheduledDeparture ?? null,
+            actual_departure: stop.actualDeparture ?? null,
+            eta: stop.eta ?? null,
+            scheduled_arrival_local: stop.scheduledArrivalLocal ?? null,
+            actual_arrival_local: stop.actualArrivalLocal ?? null,
+            raw: {},
+            archived: false,
+            updated_at: now,
+          };
+          const { error: stopErr } = await sb.from("relay_stops").upsert(stopRow, {
+            onConflict: "stop_id",
+          });
+          if (stopErr) errors.push(`Stop upsert ${stopId}: ${stopErr.message}`);
+          else stopsUpserted += 1;
+        }
+      }
+    }
+
+    // ---- Section snapshot reconcile ----
+    if (snapshot?.section && Array.isArray(snapshot.tripIds)) {
+      const section = normalizeSection(snapshot.section);
+      if (!section) {
+        errors.push(`Invalid snapshot section: ${snapshot.section}`);
+      } else {
+        const tripIds = [
+          ...new Set(
+            snapshot.tripIds
+              .map((id) => String(id || "").trim().toUpperCase())
+              .filter((id) => isValidRelayLoadId(id)),
+          ),
+        ];
+        const totalRecords = Number(snapshot.totalRecords) || 0;
+        const syncedAt = snapshot.syncedAt || now;
+
+        const { data: sectionRows } = await sb
+          .from("relay_trips")
+          .select("trip_id, last_seen_at, status")
+          .eq("section", section)
+          .eq("archived", false);
+
+        const inSnapshot = new Set(tripIds);
+        for (const row of sectionRows || []) {
+          if (inSnapshot.has(row.trip_id)) continue;
+          const { error } = await sb
+            .from("relay_trips")
+            .update({
+              status: "moved_awaiting_section",
+              updated_at: now,
+            })
+            .eq("trip_id", row.trip_id);
+          if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
+          else snapshotMoved += 1;
+        }
+
+        // Not seen in any section within 10 minutes → removed_from_relay
+        const cutoff = new Date(Date.now() - REMOVED_AFTER_MS).toISOString();
+        const { data: stale } = await sb
+          .from("relay_trips")
+          .select("trip_id, last_seen_at, status")
+          .eq("archived", false)
+          .in("status", ["moved_awaiting_section", "In Transit", "Booked", "IN_PROGRESS"])
+          .lt("last_seen_at", cutoff);
+        for (const row of stale || []) {
+          if (inSnapshot.has(row.trip_id)) continue;
+          const { error } = await sb
+            .from("relay_trips")
+            .update({
+              status: "removed_from_relay",
+              section: "HISTORY",
+              updated_at: now,
+            })
+            .eq("trip_id", row.trip_id);
+          if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
+          else snapshotRemoved += 1;
+        }
+
+        const { count: crmCount } = await sb
+          .from("relay_trips")
+          .select("trip_id", { count: "exact", head: true })
+          .eq("section", section)
+          .eq("archived", false)
+          .neq("status", "removed_from_relay");
+
+        const crm = crmCount ?? 0;
+        const mismatch = crm !== tripIds.length;
+        await sb.from("relay_section_snapshots").upsert(
+          {
+            section,
+            trip_ids: tripIds,
+            total_records: totalRecords,
+            crm_count: crm,
+            mismatch,
+            synced_at: syncedAt,
+            updated_at: now,
+          },
+          { onConflict: "section" },
+        );
+        sectionCounts[section] = {
+          relay: tripIds.length,
+          crm,
+          mismatch,
+        };
+      }
+    }
 
     for (const rawLoad of loads) {
       const load = normalizeLoadBucketStatus(rawLoad);
@@ -655,7 +930,6 @@ Deno.serve(async (req: Request) => {
       .eq("is_stale", false);
 
     // Full active pass: anything still upcoming/in_transit but not in Relay's active set → History
-    let loadsReconciled = 0;
     // Skip empty reconcile sets — they wipe the active fleet (see comment above).
     if (reconcileActiveIds && reconcileActiveIds.length > 0) {
       const activeSet = new Set([
@@ -739,8 +1013,15 @@ Deno.serve(async (req: Request) => {
       .update({
         finished_at: finishedAt,
         status: errors.length ? "completed_with_errors" : "completed",
-        records_collected: loads.length + payments.length,
-        records_updated: loadsUpdated + paymentsUpserted + loadsPaymentUpdated + loadsReconciled,
+        records_collected: loads.length + payments.length + tripsIn.length,
+        records_updated:
+          loadsUpdated +
+          paymentsUpserted +
+          loadsPaymentUpdated +
+          loadsReconciled +
+          tripsUpserted +
+          legsUpserted +
+          stopsUpserted,
         records_inserted: loadsInserted,
         error_count: errors.length,
         errors,
@@ -756,8 +1037,15 @@ Deno.serve(async (req: Request) => {
       loads_payment_updated: loadsPaymentUpdated,
       loads_reconciled: loadsReconciled,
       payments_upserted: paymentsUpserted,
+      trips_upserted: tripsUpserted,
+      legs_upserted: legsUpserted,
+      stops_upserted: stopsUpserted,
+      snapshot_moved: snapshotMoved,
+      snapshot_removed: snapshotRemoved,
       synced_load_ids: syncedLoadIds,
       synced_payment_refs: syncedPaymentRefs,
+      synced_trip_ids: syncedTripIds,
+      section_counts: sectionCounts,
       errors,
       notifications,
     });

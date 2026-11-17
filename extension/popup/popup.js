@@ -51,12 +51,18 @@ function render(state) {
     weeks;
 
   const tileSync = state.sectionSync || {};
+  const counts = state.sectionCounts || {};
   $('tile-sync').innerHTML = ['IN_TRANSIT', 'UPCOMING', 'HISTORY']
     .map((tab) => {
       const s = tileSync[tab] || {};
+      const c = counts[tab] || {};
       const when = s.lastSyncAt ? new Date(s.lastSyncAt).toLocaleTimeString() : '—';
       const err = s.lastError ? ` · ${s.lastError}` : '';
-      return `<li><span>${tab}</span><span class="badge ${s.lastError ? 'error' : 'collecting'}">${s.trips || 0} trips · ${when}${err}</span></li>`;
+      const relayN = c.relay ?? s.trips ?? 0;
+      const crmN = c.crm ?? '—';
+      const mismatch = Boolean(c.mismatch) || (crmN !== '—' && Number(crmN) !== Number(relayN));
+      const countCls = mismatch ? 'mismatch' : 'ok-count';
+      return `<li><span>${tab}</span><span class="badge ${s.lastError ? 'error' : 'collecting'}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when}${err}</span></li>`;
     })
     .join('');
 
