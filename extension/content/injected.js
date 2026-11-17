@@ -1,5 +1,6 @@
 /**
  * MAIN-world hooks — capture ONLY POST /api/tours/entitiesV2.
+ * Also serves scheduled fetches for always-on sync (same credentials).
  * Never touches the DOM. Never consumes/alters original responses.
  */
 (() => {
@@ -13,7 +14,6 @@
     const TARGET = '/api/tours/entitiesV2';
     const DEBUG = true;
 
-    /** Last successful entitiesV2 request headers (for optional History replay). */
     let lastHeaders = null;
 
     function isEntitiesV2(url) {
@@ -24,6 +24,16 @@
       }
     }
 
+    function stripCookieHeaders(headers) {
+      if (!headers || typeof headers !== 'object') return {};
+      const out = {};
+      for (const [k, v] of Object.entries(headers)) {
+        if (/^cookie$/i.test(k) || /^set-cookie$/i.test(k)) continue;
+        if (v != null) out[k] = String(v);
+      }
+      return out;
+    }
+
     function headersToObject(headers) {
       try {
         if (!headers) return null;
@@ -32,18 +42,13 @@
           headers.forEach((v, k) => {
             out[k] = v;
           });
-          return out;
+          return stripCookieHeaders(out);
         }
         if (Array.isArray(headers)) {
           for (const [k, v] of headers) out[k] = v;
-          return out;
+          return stripCookieHeaders(out);
         }
-        if (typeof headers === 'object') {
-          for (const [k, v] of Object.entries(headers)) {
-            if (v != null) out[k] = String(v);
-          }
-          return out;
-        }
+        if (typeof headers === 'object') return stripCookieHeaders(headers);
       } catch {
         /* ignore */
       }
@@ -94,7 +99,6 @@
       }
     }
 
-    // --- fetch ---
     const originalFetch = window.fetch;
     if (typeof originalFetch === 'function') {
       window.fetch = async function relayCaptureFetch(input, init) {
@@ -112,7 +116,7 @@
               init?.body != null ? init.body : input && input.body != null ? input.body : null;
             reqBody = parseRequestBody(rawBody);
             const hdrs = headersToObject(init?.headers) || headersToObject(input?.headers);
-            if (hdrs) lastHeaders = hdrs;
+            if (hdrs && Object.keys(hdrs).length) lastHeaders = hdrs;
           }
         } catch {
           /* ignore */
@@ -127,7 +131,7 @@
               .json()
               .then((data) => safePost(reqUrl, reqBody, data))
               .catch(() => {
-                /* ignore */
+                /* ignore non-json */
               });
           }
         } catch {
@@ -137,7 +141,6 @@
       };
     }
 
-    // --- XMLHttpRequest ---
     const XHR = window.XMLHttpRequest;
     if (typeof XHR === 'function') {
       const originalOpen = XHR.prototype.open;
@@ -156,9 +159,7 @@
 
       XHR.prototype.setRequestHeader = function relayCaptureSetHeader(name, value) {
         try {
-          if (this.__relayCaptureHeaders) {
-            this.__relayCaptureHeaders[name] = value;
-          }
+          if (this.__relayCaptureHeaders) this.__relayCaptureHeaders[name] = value;
         } catch {
           /* ignore */
         }
@@ -171,7 +172,7 @@
           if (isEntitiesV2(url)) {
             this.__relayCaptureRequestBody = parseRequestBody(body);
             if (this.__relayCaptureHeaders && Object.keys(this.__relayCaptureHeaders).length) {
-              lastHeaders = { ...this.__relayCaptureHeaders };
+              lastHeaders = stripCookieHeaders(this.__relayCaptureHeaders);
             }
             this.addEventListener(
               'load',
@@ -200,31 +201,81 @@
       };
     }
 
-    // Optional History pagination: isolated → MAIN fetch with same credentials/headers
+    // Always-on / scheduled fetch: isolated → MAIN with template headers
     window.addEventListener('message', (e) => {
       try {
         if (e.source !== window) return;
         const msg = e.data;
         if (!msg || msg.type !== FETCH_REQ) return;
-        const { requestId, url, body } = msg;
+        const { requestId, url, body, headers: tplHeaders } = msg;
         (async () => {
           try {
             const headers = {
               Accept: 'application/json',
               'Content-Type': 'application/json',
-              ...(lastHeaders || {}),
+              ...stripCookieHeaders(lastHeaders || {}),
+              ...stripCookieHeaders(tplHeaders || {}),
             };
-            // Ensure JSON body content-type
             headers['Content-Type'] = 'application/json';
+            delete headers.Cookie;
+            delete headers.cookie;
+
             const res = await originalFetch(url || `https://relay.amazon.com${TARGET}`, {
               method: 'POST',
               credentials: 'include',
               headers,
               body: JSON.stringify(body || {}),
+              redirect: 'follow',
             });
+
+            const ct = res.headers?.get?.('content-type') || '';
+            const finalUrl = res.url || '';
+            if (/signin|ap\/signin|login/i.test(finalUrl) || res.status === 401 || res.status === 403) {
+              window.postMessage(
+                {
+                  type: FETCH_RES,
+                  requestId,
+                  ok: false,
+                  status: res.status || 401,
+                  authRequired: true,
+                  error: 'Log in to Relay',
+                },
+                location.origin,
+              );
+              return;
+            }
+
+            if (!/json/i.test(ct)) {
+              const text = await res.text().catch(() => '');
+              const auth =
+                /signin|Sign in|amazon\.com\/ap\//i.test(text) ||
+                /signin|login/i.test(finalUrl);
+              window.postMessage(
+                {
+                  type: FETCH_RES,
+                  requestId,
+                  ok: false,
+                  status: res.status,
+                  authRequired: auth,
+                  error: auth ? 'Log in to Relay' : `Non-JSON response (${res.status})`,
+                },
+                location.origin,
+              );
+              return;
+            }
+
             const data = await res.json();
+            // Scheduled fetches also emit capture so template/passive path stays warm
+            if (res.ok) safePost(url || TARGET, body, data);
             window.postMessage(
-              { type: FETCH_RES, requestId, ok: res.ok, status: res.status, data },
+              {
+                type: FETCH_RES,
+                requestId,
+                ok: res.ok,
+                status: res.status,
+                data: res.ok ? data : null,
+                error: res.ok ? null : `HTTP ${res.status}`,
+              },
               location.origin,
             );
           } catch (err) {
