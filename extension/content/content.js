@@ -68,7 +68,7 @@
             const timer = setTimeout(() => {
               pendingFetches.delete(requestId);
               resolve({ ok: false, error: 'entitiesV2 fetch timed out' });
-            }, 30000);
+            }, 45000);
             pendingFetches.set(requestId, (res) => {
               clearTimeout(timer);
               resolve(res);
@@ -79,6 +79,7 @@
                 requestId,
                 url: msg.url,
                 body: msg.body,
+                headers: msg.headers || null,
               },
               location.origin,
             );

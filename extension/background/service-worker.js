@@ -5,11 +5,9 @@ import {
   SUPABASE_URL,
   SECTIONS,
   SYNC_ALARM,
-  CAPTURE_FLUSH_ALARM,
+  ALWAYS_ON_ALARM,
   DEBUG,
   MAX_RAW_CAPTURES,
-  CAPTURE_BATCH_MS,
-  CAPTURE_BATCH_SIZE,
   SYNC_FLUSH_MINUTES,
   FLUSH_TIMEOUT_MS,
   FLUSH_BATCH_SIZE,
@@ -18,10 +16,9 @@ import {
   TYPICAL_FULL_SYNC_SECONDS,
   RAW_CAPTURES_KEY,
   TRIP_HASH_KEY,
-  LAST_ENTITIES_REQ_KEY,
   ENTITIES_V2_URL,
-  HISTORY_PAGE_SIZE,
-  HISTORY_MIN_INTERVAL_MS,
+  HTTP_BACKOFF_MAX_MS,
+  SCHEDULE_MIN,
   isTripsBoardUrl,
   HISTORY_SKIP_TTL_MS,
 } from '../shared/config.js';
@@ -34,18 +31,25 @@ import {
   isValidRelayLoadId,
   sanitizeDriverName,
   isGoodLocation,
+  mapLoadStatus,
 } from '../shared/normalize.js';
 import { extractTrips, countTripStats, tripContentHashPayload, hashString } from '../shared/extract.js';
 import { tripsToCrmLoads } from '../shared/map-to-crm.js';
+import {
+  configureAlwaysOn,
+  saveRequestTemplate,
+  getRequestTemplate,
+  stripCookieHeaders,
+  enforceScheduleMs,
+  ensureAlarmsAlwaysOn,
+  alwaysOnTick,
+  stopHeartbeat,
+} from './always-on-sync.js';
 
 const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
 
 let flushRunning = false;
-let captureFlushTimer = null;
-let pendingTripBatch = new Map(); // dedupeKey → trip
 let flushBackoffMs = FLUSH_BACKOFF_BASE_MS;
-let historySyncRunning = false;
-let lastHistoryPageAt = 0;
 
 function log(...args) {
   if (DEBUG) console.log('[RelayCapture]', ...args);
@@ -62,18 +66,13 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-function tripDedupeKey(trip) {
-  return `${trip.tripId}::${trip.version ?? ''}`;
-}
-
-/** Strip phone/email from raw entity before storage (privacy). */
+/** Strip phone/email from raw entity before storage. */
 function sanitizeEntityForStorage(entity) {
   try {
     const clone = JSON.parse(JSON.stringify(entity));
     const scrubPerson = (p) => {
       if (!p || typeof p !== 'object') return p;
-      const out = { firstName: p.firstName ?? null, lastName: p.lastName ?? null };
-      return out;
+      return { firstName: p.firstName ?? null, lastName: p.lastName ?? null };
     };
     if (Array.isArray(clone.drivers)) clone.drivers = clone.drivers.map(scrubPerson);
     if (Array.isArray(clone.loads)) {
@@ -91,18 +90,86 @@ function sanitizeCaptureJson(data) {
   try {
     if (!data || typeof data !== 'object') return data;
     if (!Array.isArray(data.entities)) return data;
-    return {
-      ...data,
-      entities: data.entities.map(sanitizeEntityForStorage),
-    };
+    return { ...data, entities: data.entities.map(sanitizeEntityForStorage) };
   } catch {
     return data;
   }
 }
 
+async function updateBadge() {
+  try {
+    const state = await getState();
+    if (!state.live) {
+      await chrome.action.setBadgeText({ text: '' });
+      return;
+    }
+    if (state.health?.status === 'auth') {
+      await chrome.action.setBadgeBackgroundColor({ color: '#c62828' });
+      await chrome.action.setBadgeText({ text: '!' });
+      await chrome.action.setTitle({ title: 'Log in to Relay' });
+      return;
+    }
+    if (state.health?.status === 'backoff') {
+      await chrome.action.setBadgeBackgroundColor({ color: '#ef6c00' });
+      await chrome.action.setBadgeText({ text: '…' });
+      return;
+    }
+    const n = Number(state.health?.inTransitCount) || 0;
+    await chrome.action.setBadgeBackgroundColor({ color: '#2e7d32' });
+    await chrome.action.setBadgeText({ text: n > 0 ? String(Math.min(n, 999)) : '0' });
+    await chrome.action.setTitle({
+      title: `Relay Sync — ${n} in transit`,
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+configureAlwaysOn({
+  log,
+  onAuthRequired: async () => {
+    await setState({
+      health: {
+        status: 'auth',
+        message: 'Log in to Relay',
+        lastAuthErrorAt: new Date().toISOString(),
+      },
+      syncProgress: {
+        phase: 'auth',
+        detail: 'Paused — log in to Amazon Relay, then sync resumes automatically.',
+        percent: 0,
+      },
+    });
+    await updateBadge();
+  },
+  onHealthy: async () => {
+    const state = await getState();
+    if (state.health?.status !== 'healthy') {
+      await setState({
+        health: { status: 'healthy', message: '', pausedUntil: null },
+      });
+    }
+    await updateBadge();
+  },
+  onBackoff: async (status, delayMs) => {
+    const until = new Date(Date.now() + Math.min(HTTP_BACKOFF_MAX_MS, delayMs)).toISOString();
+    await setState({
+      health: {
+        status: 'backoff',
+        message: `HTTP ${status} — backing off`,
+        pausedUntil: until,
+      },
+    });
+    await updateBadge();
+  },
+  onTripsDiff: async (diff) => {
+    await handleTripsDiff(diff);
+  },
+});
+
 async function ensureAlarms() {
   await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_FLUSH_MINUTES });
-  await chrome.alarms.create(CAPTURE_FLUSH_ALARM, { periodInMinutes: 1 });
+  await ensureAlarmsAlwaysOn();
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -110,19 +177,27 @@ chrome.runtime.onInstalled.addListener(async () => {
   flushRunning = false;
   await setState({ scanInProgress: false });
   await ensureAlarms();
+  await updateBadge();
 });
 
 chrome.runtime.onStartup?.addListener?.(async () => {
   flushRunning = false;
   await ensureAlarms();
+  const state = await getState();
+  if (state.live && state.loggedIn) {
+    void alwaysOnTick({ force: true });
+  }
+  await updateBadge();
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   const state = await getState();
   if (!state.live || !state.loggedIn) return;
-  if (alarm.name === SYNC_ALARM || alarm.name === CAPTURE_FLUSH_ALARM) {
-    scheduleCaptureFlush(0);
+  if (alarm.name === SYNC_ALARM) {
     void flushToEdge();
+  }
+  if (alarm.name === ALWAYS_ON_ALARM || alarm.name === SYNC_ALARM) {
+    void alwaysOnTick({ force: false });
   }
 });
 
@@ -147,7 +222,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       if (msg?.type === 'LOGOUT') {
-        sendResponse({ ok: true, state: await setState({ loggedIn: false, live: false }) });
+        stopHeartbeat();
+        await setState({ loggedIn: false, live: false });
+        await updateBadge();
+        sendResponse({ ok: true, state: await getState() });
         return;
       }
       if (msg?.type === 'SET_API_KEY') {
@@ -157,10 +235,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         });
         return;
       }
-      if (msg?.type === 'SET_SYNC_ALL_HISTORY') {
-        const next = await setState({ syncAllHistory: Boolean(msg.syncAllHistory) });
-        sendResponse({ ok: true, state: next });
-        if (next.live && next.syncAllHistory) void maybeSyncAllHistory();
+      if (msg?.type === 'SET_SCHEDULE') {
+        const scheduleMs = enforceScheduleMs(msg.scheduleMs || {});
+        sendResponse({ ok: true, state: await setState({ scheduleMs }) });
         return;
       }
       if (msg?.type === 'GO_LIVE') {
@@ -184,14 +261,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return;
         }
         flushRunning = false;
+        const hasTpl = Boolean(await getRequestTemplate());
         await setState({
           live: true,
           syncErrors: [],
           prompts: [],
+          hasRequestTemplate: hasTpl,
+          health: { status: 'healthy', message: '', pausedUntil: null },
+          nextDueAt: { IN_TRANSIT: 0, UPCOMING: 0, HISTORY: 0 },
           syncProgress: {
-            phase: 'listening',
-            detail:
-              'Listening for POST /api/tours/entitiesV2. Browse Relay Trips tabs — no clicks needed.',
+            phase: 'always-on',
+            detail: hasTpl
+              ? 'Always-on sync starting — IN_TRANSIT / UPCOMING / HISTORY.'
+              : 'Opening Relay tab to seed entitiesV2 request template…',
             percent: 10,
             startedAt: new Date().toISOString(),
             typicalSeconds: TYPICAL_FULL_SYNC_SECONDS,
@@ -201,32 +283,32 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await ensureAlarms();
         await refreshOpenTabs();
         sendResponse({ ok: true, state: await getState() });
+        await updateBadge();
+        void alwaysOnTick({ force: true });
         void flushToEdge();
-        if ((await getState()).syncAllHistory) void maybeSyncAllHistory();
         return;
       }
       if (msg?.type === 'STOP') {
         flushRunning = false;
-        pendingTripBatch.clear();
-        sendResponse({
-          ok: true,
-          state: await setState({
-            live: false,
-            syncProgress: {
-              phase: 'idle',
-              detail: 'Stopped',
-              percent: 0,
-              typicalSeconds: TYPICAL_FULL_SYNC_SECONDS,
-            },
-          }),
+        stopHeartbeat();
+        await setState({
+          live: false,
+          health: { status: 'idle', message: '' },
+          syncProgress: {
+            phase: 'idle',
+            detail: 'Stopped',
+            percent: 0,
+            typicalSeconds: TYPICAL_FULL_SYNC_SECONDS,
+          },
         });
+        await updateBadge();
+        sendResponse({ ok: true, state: await getState() });
         return;
       }
       if (msg?.type === 'FORCE_SCAN') {
         await refreshOpenTabs();
-        scheduleCaptureFlush(0);
+        void alwaysOnTick({ force: true });
         void flushToEdge();
-        if ((await getState()).syncAllHistory) void maybeSyncAllHistory();
         sendResponse({ ok: true, state: await getState() });
         return;
       }
@@ -255,21 +337,13 @@ async function refreshOpenTabs() {
     await setState({
       openTabs: relayTabs.map((t) => ({ id: t.id, url: t.url, title: t.title })),
     });
-    const hasTrips = relayTabs.some((t) => isTripsBoardUrl(t.url));
-    const hasPay = relayTabs.some((t) => /payment|settlement|invoice/i.test(t.url || ''));
-    if (hasTrips) await updateSection('tours', { state: 'Collecting', lastError: null });
+    const hasTrips = relayTabs.some((t) => isTripsBoardUrl(t.url) || /relay\.amazon\.com/i.test(t.url));
     const prompts = [];
     if (!hasTrips) {
       prompts.push({
         sectionId: 'tours',
         message:
-          'Open Amazon Relay → Trips (Upcoming / In Transit / History). Extension captures entitiesV2 JSON only.',
-      });
-    }
-    if (!hasPay) {
-      prompts.push({
-        sectionId: 'payments',
-        message: 'Open Payments if you need settlement sync (separate from entitiesV2).',
+          'Always-on will open a pinned Relay tab automatically when LIVE. Stay logged into Relay.',
       });
     }
     await setState({ prompts });
@@ -286,18 +360,42 @@ async function storeRawCapture(entry) {
   await chrome.storage.local.set({ [RAW_CAPTURES_KEY]: list });
 }
 
+/**
+ * Passive capture path (user browsing) + template seed.
+ * Scheduled sync also posts captures via MAIN safePost.
+ */
 async function handleCapture(msg) {
   try {
     const state = await getState();
-    if (!state.live || !state.loggedIn) return;
-
+    // Seed template even before LIVE so GO LIVE can start immediately
     const url = String(msg.url || '');
     if (!url.includes('/api/tours/entitiesV2')) return;
 
     const requestBody = msg.requestBody || null;
+    const headers = stripCookieHeaders(msg.requestHeaders || {});
     const data = sanitizeCaptureJson(msg.data);
     const capturedAt = msg.capturedAt || new Date().toISOString();
     const tab = requestBody?.tileCountTab || '?';
+
+    if (requestBody && typeof requestBody === 'object') {
+      const existing = await getRequestTemplate();
+      if (!existing?.body) {
+        await saveRequestTemplate(requestBody, headers, {
+          at: capturedAt,
+          pageUrl: msg.pageUrl || null,
+        });
+        log('request template seeded from capture', tab);
+        if (state.live) void alwaysOnTick({ force: true });
+      } else {
+        // Refresh headers/body from latest successful capture
+        await saveRequestTemplate(requestBody, headers, {
+          at: capturedAt,
+          pageUrl: msg.pageUrl || null,
+        });
+      }
+    }
+
+    if (!state.live || !state.loggedIn) return;
 
     await storeRawCapture({
       url,
@@ -307,16 +405,12 @@ async function handleCapture(msg) {
       pageUrl: msg.pageUrl || null,
     });
 
-    // Remember last request for optional History pagination (headers left to page-context fetch)
-    if (requestBody && typeof requestBody === 'object') {
-      await chrome.storage.local.set({
-        [LAST_ENTITIES_REQ_KEY]: {
-          body: requestBody,
-          url: ENTITIES_V2_URL,
-          at: capturedAt,
-          pageUrl: msg.pageUrl || null,
-        },
+    // Clear auth pause on successful JSON capture
+    if (state.health?.status === 'auth') {
+      await setState({
+        health: { status: 'healthy', message: '', pausedUntil: null },
       });
+      await updateBadge();
     }
 
     const trips = extractTrips(url, data, requestBody);
@@ -328,173 +422,164 @@ async function handleCapture(msg) {
       lastCaptureUrl: url.slice(0, 300),
       lastCaptureTab: tab,
       capturesSeen: (state.capturesSeen || 0) + 1,
+      hasRequestTemplate: true,
     });
 
+    // Passive path: treat as soft ingest without removing snapshot logic
+    // (always-on tick owns NEW/CHANGED/REMOVED). Still upsert new/changed by hash.
     if (!trips.length) return;
 
     const hashStore = await chrome.storage.local.get([TRIP_HASH_KEY]);
     const hashes = { ...(hashStore[TRIP_HASH_KEY] || {}) };
-    let changed = 0;
-
+    const changedTrips = [];
     for (const trip of trips) {
-      const key = tripDedupeKey(trip);
       const payload = tripContentHashPayload(trip);
       const hash = await hashString(payload);
+      const key = `${trip.tripId}::${trip.version ?? ''}`;
       if (hashes[key] === hash) continue;
       hashes[key] = hash;
-      pendingTripBatch.set(key, trip);
-      changed += 1;
+      changedTrips.push(trip);
     }
-
     await chrome.storage.local.set({ [TRIP_HASH_KEY]: hashes });
 
-    if (changed) {
-      const st = await getState();
-      await setState({
-        tripsExtracted: (st.tripsExtracted || 0) + changed,
-        syncProgress: {
-          ...st.syncProgress,
-          phase: 'capturing',
-          detail: `entitiesV2 ${tab}: ${changed} new/changed trip(s); ${pendingTripBatch.size} pending.`,
-          percent: Math.min(90, 20 + pendingTripBatch.size),
-        },
-      });
-      await updateSection('tours', {
-        state: 'Collecting',
-        lastError: null,
-        lastCollectedAt: new Date().toISOString(),
-      });
-      if (trips.some((t) => (t.legs || []).some((l) => l.trailerId || (l.stops || []).length))) {
-        await updateSection('load_detail', {
-          state: 'Collecting',
-          lastError: null,
-          lastCollectedAt: new Date().toISOString(),
-        });
-      }
-      scheduleCaptureFlush(CAPTURE_BATCH_MS);
-      if (pendingTripBatch.size >= CAPTURE_BATCH_SIZE) scheduleCaptureFlush(0);
-    }
-
-    // Kick optional history sync when we see a HISTORY page or setting is on
-    if ((await getState()).syncAllHistory) {
-      void maybeSyncAllHistory();
+    if (changedTrips.length) {
+      await pushTripsImmediate(changedTrips, { reason: 'passive' });
     }
   } catch (err) {
     log('handleCapture error', err);
   }
 }
 
-function scheduleCaptureFlush(delayMs) {
-  if (captureFlushTimer) clearTimeout(captureFlushTimer);
-  captureFlushTimer = setTimeout(() => {
-    captureFlushTimer = null;
-    void flushPendingTrips();
-  }, Math.max(0, delayMs));
+async function handleTripsDiff(diff) {
+  const { tileCountTab, newTrips, changedTrips, removedTripIds } = diff;
+  const toPush = [...newTrips, ...changedTrips];
+
+  if (toPush.length) {
+    await pushTripsImmediate(toPush, {
+      reason: 'always-on',
+      tileCountTab,
+      changeKinds: {
+        newIds: new Set(newTrips.map((t) => t.tripId)),
+        changedIds: new Set(changedTrips.map((t) => t.tripId)),
+      },
+    });
+  }
+
+  if (removedTripIds?.length) {
+    await handleRemovedTrips(tileCountTab, removedTripIds);
+  }
+
+  await updateBadge();
 }
 
-async function flushPendingTrips() {
-  if (!pendingTripBatch.size) return;
-  const batch = [...pendingTripBatch.values()];
-  pendingTripBatch.clear();
-  const loads = tripsToCrmLoads(batch);
-  log(`flushing ${batch.length} trip(s) → ${loads.length} CRM load(s)`);
+async function handleRemovedTrips(tileCountTab, removedTripIds) {
+  // Only demote when removed from an active board
+  if (tileCountTab !== 'IN_TRANSIT' && tileCountTab !== 'UPCOMING') return;
+
+  const state = await getState();
+  const pendingLoads = { ...state.pendingLoads };
+  const loads = [];
+
+  for (const tripId of removedTripIds) {
+    // Find pending loads for this parent or id
+    for (const [loadId, row] of Object.entries(pendingLoads)) {
+      const match =
+        loadId === tripId ||
+        row.parent_trip_id === tripId ||
+        row.load_id === tripId;
+      if (!match) continue;
+      // If still present on the other active board, skip demotion
+      // (snapshot of other board is checked loosely via trip_bucket)
+      const updated = {
+        ...row,
+        load_status: 'Completed',
+        trip_bucket: 'history',
+        notes: [row.notes, `removed_from:${tileCountTab}`].filter(Boolean).join(' · '),
+        force_history_upsert: true,
+        observed_at: new Date().toISOString(),
+      };
+      pendingLoads[loadId] = updated;
+      loads.push(updated);
+    }
+
+    // Ensure at least a stub for the trip id itself
+    if (isValidRelayLoadId(tripId) && !pendingLoads[tripId]) {
+      const stub = {
+        load_id: tripId,
+        load_status: 'Completed',
+        trip_bucket: 'history',
+        pickup_location: null,
+        delivery_location: null,
+        notes: `removed_from:${tileCountTab}`,
+        force_history_upsert: true,
+        source: 'relay_entitiesV2_removed',
+        observed_at: new Date().toISOString(),
+      };
+      pendingLoads[tripId] = stub;
+      loads.push(stub);
+    }
+  }
+
   if (!loads.length) return;
+  await setState({ pendingLoads });
+  await ingestCollection({ section: 'tours', loads });
+  void flushToEdge();
+}
+
+async function pushTripsImmediate(trips, meta = {}) {
+  const loads = tripsToCrmLoads(trips).map((l) => {
+    if (meta.changeKinds?.newIds?.has(l.parent_trip_id) || meta.changeKinds?.newIds?.has(l.load_id)) {
+      return { ...l, change_kind: 'NEW' };
+    }
+    if (
+      meta.changeKinds?.changedIds?.has(l.parent_trip_id) ||
+      meta.changeKinds?.changedIds?.has(l.load_id)
+    ) {
+      return { ...l, change_kind: 'CHANGED' };
+    }
+    return l;
+  });
+  if (!loads.length) return;
+
+  const st = await getState();
+  await setState({
+    tripsExtracted: (st.tripsExtracted || 0) + trips.length,
+    syncProgress: {
+      ...st.syncProgress,
+      phase: 'flushing',
+      detail: `${meta.reason || 'sync'}: pushing ${loads.length} load(s) immediately.`,
+      percent: 70,
+    },
+  });
+  await updateSection('tours', {
+    state: 'Collecting',
+    lastError: null,
+    lastCollectedAt: new Date().toISOString(),
+  });
+  if (loads.some((l) => l.trailer_id || l.tractor_id)) {
+    await updateSection('load_detail', {
+      state: 'Collecting',
+      lastError: null,
+      lastCollectedAt: new Date().toISOString(),
+    });
+  }
+
   await ingestCollection({
     section: 'tours',
     loads,
     detail_detected: loads.some((l) => l.trailer_id || l.tractor_id || l.arrival_address),
   });
+
   const activeIds = loads
     .filter((l) => l.trip_bucket === 'upcoming' || l.trip_bucket === 'in_transit')
     .map((l) => l.load_id)
     .filter(Boolean);
   if (activeIds.length) {
-    await setState({ lastActiveLoadIds: [...new Set(activeIds)] });
+    const prev = (await getState()).lastActiveLoadIds || [];
+    await setState({ lastActiveLoadIds: [...new Set([...prev, ...activeIds])] });
   }
+
   void flushToEdge();
-}
-
-/**
- * Optional (default OFF): replay last captured POST with tileCountTab=HISTORY,
- * pagination.from += 100 until page returns < 100 entities. Max 1 req / 2s.
- * Runs via chrome.tabs.sendMessage → MAIN page fetch (same cookies/headers).
- */
-async function maybeSyncAllHistory() {
-  const state = await getState();
-  if (!state.live || !state.syncAllHistory || historySyncRunning) return;
-  historySyncRunning = true;
-  try {
-    const stored = await chrome.storage.local.get([LAST_ENTITIES_REQ_KEY]);
-    const last = stored[LAST_ENTITIES_REQ_KEY];
-    if (!last?.body) {
-      log('history sync: no captured request body yet — browse Trips first');
-      return;
-    }
-
-    const tabs = await chrome.tabs.query({});
-    const relayTab = tabs.find((t) => t.url && RELAY_HOST_RE.test(t.url) && t.id != null);
-    if (!relayTab) {
-      log('history sync: no Relay tab for credentials');
-      return;
-    }
-
-    let from = 0;
-    let page = 0;
-    for (;;) {
-      const wait = Math.max(0, HISTORY_MIN_INTERVAL_MS - (Date.now() - lastHistoryPageAt));
-      if (wait) await new Promise((r) => setTimeout(r, wait));
-      if (!(await getState()).live || !(await getState()).syncAllHistory) break;
-
-      const body = {
-        ...last.body,
-        tileCountTab: 'HISTORY',
-        pagination: {
-          ...(last.body.pagination || {}),
-          size: HISTORY_PAGE_SIZE,
-          from,
-        },
-      };
-
-      lastHistoryPageAt = Date.now();
-      page += 1;
-      log(`history sync page ${page} from=${from}`);
-
-      let result;
-      try {
-        result = await chrome.tabs.sendMessage(relayTab.id, {
-          type: 'RELAY_FETCH_ENTITIES_V2',
-          url: ENTITIES_V2_URL,
-          body,
-        });
-      } catch (err) {
-        log('history sync tab message failed', err?.message || err);
-        break;
-      }
-
-      if (!result?.ok || !result.data) {
-        log('history sync failed', result?.error || 'no data');
-        break;
-      }
-
-      await handleCapture({
-        url: ENTITIES_V2_URL,
-        requestBody: body,
-        data: result.data,
-        capturedAt: new Date().toISOString(),
-        pageUrl: relayTab.url,
-      });
-
-      const n = Array.isArray(result.data.entities) ? result.data.entities.length : 0;
-      if (n < HISTORY_PAGE_SIZE) break;
-      from += HISTORY_PAGE_SIZE;
-      if (page > 50) {
-        log('history sync safety stop at 50 pages');
-        break;
-      }
-    }
-  } finally {
-    historySyncRunning = false;
-  }
 }
 
 async function ingestCollection(data) {
@@ -544,6 +629,9 @@ async function ingestCollection(data) {
       const nextDriver = sanitizeDriverName(merged.driver_name_raw);
       const prevDriver = sanitizeDriverName(prev.driver_name_raw);
       merged.driver_name_raw = nextDriver || prevDriver || null;
+      if (merged.load_status && !mapLoadStatus(merged.load_status)) {
+        // keep raw; finalizeLoadForSync maps buckets
+      }
       pendingLoads[load.load_id] = merged;
       collected += 1;
     }
@@ -551,7 +639,7 @@ async function ingestCollection(data) {
     const hasRows = sectionLoads.length > 0;
     await updateSection(data.section || 'tours', {
       state: hasRows ? 'Collecting' : 'Waiting for page',
-      lastError: hasRows ? null : 'No trips from entitiesV2 yet — open Trips tabs',
+      lastError: hasRows ? null : 'No trips yet',
       lastCollectedAt: hasRows ? new Date().toISOString() : null,
     });
     if (data.detail_detected) {
@@ -595,19 +683,19 @@ async function flushToEdge() {
     const state = await getState();
     if (!state.live || !state.extensionApiKey) return;
 
-    if (pendingTripBatch.size) await flushPendingTrips();
-
     const cache = { ...(state.syncedLoadCache || {}) };
     const loads = [];
     for (const raw of Object.values((await getState()).pendingLoads)) {
-      if (!isCompleteLoad(raw)) continue;
+      if (!isCompleteLoad(raw) && !raw.force_history_upsert) continue;
       const load = finalizeLoadForSync(raw);
-      if (!load || !isCompleteLoad(load)) continue;
+      if (!load) continue;
+      if (!isCompleteLoad(load) && !raw.force_history_upsert) continue;
       const content_hash = await hashLoadPayload(load);
 
       if (
-        load.trip_bucket === 'history' ||
-        /^(Completed|Delivered|Cancelled|Rejected)$/i.test(load.load_status || '')
+        !raw.force_history_upsert &&
+        (load.trip_bucket === 'history' ||
+          /^(Completed|Delivered|Cancelled|Rejected)$/i.test(load.load_status || ''))
       ) {
         const prev = cache[load.load_id];
         if (
@@ -615,8 +703,7 @@ async function flushToEdge() {
           prev.trip_bucket === 'history' &&
           prev.load_status === load.load_status &&
           (prev.payment_status || 'Not Received') === (load.payment_status || 'Not Received') &&
-          prev.content_hash === content_hash &&
-          !raw.force_history_upsert
+          prev.content_hash === content_hash
         ) {
           continue;
         }
@@ -672,14 +759,6 @@ async function flushToEdge() {
       const chunk = loadChunks[i];
       const isLast = i === loadChunks.length - 1;
       const batchLabel = `CRM flush batch ${i + 1}/${loadChunks.length} (${chunk.length} loads)`;
-      await setState({
-        syncProgress: {
-          ...(await getState()).syncProgress,
-          phase: 'flushing',
-          detail: `${batchLabel}…`,
-          percent: Math.min(99, 90 + Math.round(((i + 1) / loadChunks.length) * 9)),
-        },
-      });
 
       const body = {
         client_id: clientId,
@@ -730,10 +809,7 @@ async function flushToEdge() {
         for (const n of json.notifications || []) allNotifications.push(n);
       } catch (err) {
         lastErr = err;
-        const msg = String(err?.message || err);
-        const friendly = /timed out/i.test(msg)
-          ? `CRM flush timed out on batch ${i + 1}/${loadChunks.length}. Retry with backoff.`
-          : `CRM flush failed on batch ${i + 1}/${loadChunks.length}: ${msg}`;
+        const friendly = `CRM flush failed on batch ${i + 1}/${loadChunks.length}: ${err?.message || err}`;
         syncErrors = [...syncErrors.slice(-19), { at: new Date().toISOString(), error: friendly }];
         await setState({
           pendingLoads: remainingLoads,
@@ -758,7 +834,7 @@ async function flushToEdge() {
     for (const [id, raw] of Object.entries(remainingLoads)) {
       if (raw?.trip_bucket === 'history' && nextCache[id]?.trip_bucket === 'history') {
         const age = Date.now() - (nextCache[id].at || 0);
-        if (age < HISTORY_SKIP_TTL_MS) delete remainingLoads[id];
+        if (age < HISTORY_SKIP_TTL_MS && !raw.force_history_upsert) delete remainingLoads[id];
       }
     }
 
@@ -789,8 +865,8 @@ async function flushToEdge() {
       await setState({
         syncProgress: {
           ...(await getState()).syncProgress,
-          phase: 'listening',
-          detail: `Synced ${loads.length} load(s). Listening for entitiesV2…`,
+          phase: 'always-on',
+          detail: `Synced ${loads.length} load(s). Always-on listening…`,
           percent: 100,
         },
       });
@@ -832,3 +908,5 @@ async function maybeNotifyTelegram(event) {
 }
 
 void SECTIONS;
+void SCHEDULE_MIN;
+void ENTITIES_V2_URL;

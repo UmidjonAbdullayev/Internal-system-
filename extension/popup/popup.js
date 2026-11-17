@@ -42,17 +42,29 @@ function render(state) {
   const weeks = (prog.historyWeeks || []).length
     ? ` History weeks: ${prog.historyWeeks.join(', ')}.`
     : '';
+  const health = state.health || {};
   $('sync-detail').textContent =
     (prog.detail ||
-      'Listening for entitiesV2. Options: download raw captures / optional History sync.') +
+      'Always-on entitiesV2. Badge = in-transit count (or ! if login needed).') +
+    (health.status === 'auth' ? ' Log in to Relay.' : '') +
     durationNote +
     weeks;
+
+  const tileSync = state.sectionSync || {};
+  $('tile-sync').innerHTML = ['IN_TRANSIT', 'UPCOMING', 'HISTORY']
+    .map((tab) => {
+      const s = tileSync[tab] || {};
+      const when = s.lastSyncAt ? new Date(s.lastSyncAt).toLocaleTimeString() : '—';
+      const err = s.lastError ? ` · ${s.lastError}` : '';
+      return `<li><span>${tab}</span><span class="badge ${s.lastError ? 'error' : 'collecting'}">${s.trips || 0} trips · ${when}${err}</span></li>`;
+    })
+    .join('');
 
   $('sections').innerHTML = SECTIONS.map((section) => {
     const st = state.sections?.[section.id]?.state || 'Not checked';
     const note =
       st === 'Synced'
-        ? ' <span class="hint-inline" title="API capture OK. CRM rows only change when Edge upserts succeed (see Inserted/Updated/Errors).">· capture OK</span>'
+        ? ' <span class="hint-inline" title="CRM upsert OK.">· OK</span>'
         : '';
     return `<li><span>${section.label}</span><span class="badge ${badgeClass(st)}">${st}</span>${note}</li>`;
   }).join('');

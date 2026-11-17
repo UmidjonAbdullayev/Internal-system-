@@ -1,3 +1,15 @@
+import { SCHEDULE_DEFAULTS } from './config.js';
+
+const DEFAULT_SECTION_SYNC = {
+  lastSyncAt: null,
+  lastError: null,
+  trips: 0,
+  pages: 0,
+  newCount: 0,
+  changedCount: 0,
+  removedCount: 0,
+};
+
 const DEFAULT_STATE = {
   loggedIn: false,
   live: false,
@@ -25,7 +37,7 @@ const DEFAULT_STATE = {
     percent: 0,
     startedAt: null,
     lastDurationMs: null,
-    typicalSeconds: 'passive',
+    typicalSeconds: 'always-on',
     historyWeeks: [],
   },
   lastPaymentsScanAt: null,
@@ -41,16 +53,48 @@ const DEFAULT_STATE = {
   lastCaptureTab: null,
   capturesSeen: 0,
   tripsExtracted: 0,
-  /** Optional: replay entitiesV2 with HISTORY pagination. Default OFF. */
-  syncAllHistory: false,
+  /** @deprecated — HISTORY backfill is built into always-on */
+  syncAllHistory: true,
+  historyBackfillDone: false,
   syncedLoadCache: {},
   lastActiveLoadIds: [],
+  /** Always-on health */
+  health: {
+    status: 'idle', // idle | healthy | auth | backoff
+    message: '',
+    inTransitCount: 0,
+    pausedUntil: null,
+    lastAuthErrorAt: null,
+  },
+  /** Per tileCountTab sync stats */
+  sectionSync: {
+    IN_TRANSIT: { ...DEFAULT_SECTION_SYNC },
+    UPCOMING: { ...DEFAULT_SECTION_SYNC },
+    HISTORY: { ...DEFAULT_SECTION_SYNC },
+  },
+  /** Schedule overrides (ms); enforced against SCHEDULE_MIN in options/SW */
+  scheduleMs: { ...SCHEDULE_DEFAULTS },
+  nextDueAt: {
+    IN_TRANSIT: 0,
+    UPCOMING: 0,
+    HISTORY: 0,
+  },
+  hasRequestTemplate: false,
+  alwaysOnTabId: null,
 };
 
 export async function getState() {
   const stored = await chrome.storage.local.get(['relayState']);
   const merged = { ...DEFAULT_STATE, ...(stored.relayState || {}) };
   merged.syncProgress = { ...DEFAULT_STATE.syncProgress, ...(merged.syncProgress || {}) };
+  merged.health = { ...DEFAULT_STATE.health, ...(merged.health || {}) };
+  merged.scheduleMs = { ...SCHEDULE_DEFAULTS, ...(merged.scheduleMs || {}) };
+  merged.nextDueAt = { ...DEFAULT_STATE.nextDueAt, ...(merged.nextDueAt || {}) };
+  merged.sectionSync = {
+    IN_TRANSIT: { ...DEFAULT_SECTION_SYNC, ...(merged.sectionSync?.IN_TRANSIT || {}) },
+    UPCOMING: { ...DEFAULT_SECTION_SYNC, ...(merged.sectionSync?.UPCOMING || {}) },
+    HISTORY: { ...DEFAULT_SECTION_SYNC, ...(merged.sectionSync?.HISTORY || {}) },
+  };
   return merged;
 }
 
@@ -62,6 +106,22 @@ export async function setState(patch) {
   }
   if (patch.syncProgress) {
     next.syncProgress = { ...current.syncProgress, ...patch.syncProgress };
+  }
+  if (patch.health) {
+    next.health = { ...current.health, ...patch.health };
+  }
+  if (patch.scheduleMs) {
+    next.scheduleMs = { ...current.scheduleMs, ...patch.scheduleMs };
+  }
+  if (patch.nextDueAt) {
+    next.nextDueAt = { ...current.nextDueAt, ...patch.nextDueAt };
+  }
+  if (patch.sectionSync) {
+    next.sectionSync = {
+      IN_TRANSIT: { ...current.sectionSync.IN_TRANSIT, ...(patch.sectionSync.IN_TRANSIT || {}) },
+      UPCOMING: { ...current.sectionSync.UPCOMING, ...(patch.sectionSync.UPCOMING || {}) },
+      HISTORY: { ...current.sectionSync.HISTORY, ...(patch.sectionSync.HISTORY || {}) },
+    };
   }
   await chrome.storage.local.set({ relayState: next });
   return next;
