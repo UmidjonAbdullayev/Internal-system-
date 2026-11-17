@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys — Amazon Relay Sync",
-  "version": "1.8.0",
-  "description": "Per-tab entitiesV2 filter bodies (no tileCountTab-only swap); HISTORY 7-day windows; section safety.",
+  "version": "1.8.1",
+  "description": "Per-tab entitiesV2 sync; alarm-backed extension_alive heartbeat; HISTORY 7-day windows.",
   "permissions": ["storage", "tabs", "alarms"],
   "host_permissions": [
     "https://relay.amazon.com/*",

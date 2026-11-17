@@ -496,7 +496,9 @@ export function LoadsPage() {
           relayCount={sectionSnap?.totalRecords}
           sectionLabel={liveSection || 'IN_TRANSIT'}
           lastSuccessfulSyncAt={sectionSync?.lastSuccessfulSyncAt}
-          extensionAliveAt={extensionHeartbeat?.aliveAt}
+          extensionAliveAt={
+            extensionHeartbeat?.aliveAt || sectionSync?.lastSuccessfulSyncAt || null
+          }
           onShowLastKnown={() => setShowLastKnown(true)}
         />
       )}

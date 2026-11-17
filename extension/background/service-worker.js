@@ -7,6 +7,7 @@ import {
   SECTIONS,
   SYNC_ALARM,
   ALWAYS_ON_ALARM,
+  EXTENSION_ALIVE_ALARM,
   QUEUE_TICK_MS,
   EXTENSION_ALIVE_INTERVAL_MS,
   DEBUG,
@@ -209,6 +210,7 @@ function stopQueueTimers() {
     clearInterval(extensionAliveTimer);
     extensionAliveTimer = null;
   }
+  void chrome.alarms.clear(EXTENSION_ALIVE_ALARM);
 }
 
 function startQueueTimers() {
@@ -216,6 +218,7 @@ function startQueueTimers() {
   queueTickTimer = setInterval(() => {
     void alwaysOnTick({ force: false });
   }, QUEUE_TICK_MS);
+  // Best-effort while SW is awake; chrome.alarms covers sleeps (MV3 kills setInterval).
   extensionAliveTimer = setInterval(() => {
     void (async () => {
       const st = await getState();
@@ -224,11 +227,13 @@ function startQueueTimers() {
       await pushExtensionAlive(auth);
     })();
   }, EXTENSION_ALIVE_INTERVAL_MS);
+  void chrome.alarms.create(EXTENSION_ALIVE_ALARM, { periodInMinutes: 1 });
   void pushExtensionAlive('ok');
 }
 
 async function ensureAlarms() {
   await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_FLUSH_MINUTES });
+  await chrome.alarms.create(EXTENSION_ALIVE_ALARM, { periodInMinutes: 1 });
   await ensureAlarmsAlwaysOn();
 }
 
@@ -259,6 +264,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
   if (alarm.name === ALWAYS_ON_ALARM || alarm.name === SYNC_ALARM) {
     void alwaysOnTick({ force: false });
+  }
+  if (alarm.name === EXTENSION_ALIVE_ALARM) {
+    const auth = state.health?.status === 'auth' ? 'auth_required' : 'ok';
+    void pushExtensionAlive(auth);
   }
 });
 
@@ -657,6 +666,8 @@ async function pushTripsModelImmediate(trips, snapshot, tileCountTab, opts = {})
       lastError: null,
       lastCollectedAt: new Date().toISOString(),
     });
+    // Dedicated heartbeat may be asleep with the SW; sync success also implies alive.
+    void pushExtensionAlive('ok', snapshot?.section ? `sync:${snapshot.section}` : 'sync');
     return json;
   } catch (err) {
     const friendly = `CRM push failed: ${err?.message || err}`;

@@ -32,14 +32,25 @@ export function isSectionPaused(row: SyncStateRow | undefined, nowMs = Date.now(
   return nowMs - Date.parse(row.lastSuccessfulSyncAt) > LIVE_PAUSE_MS;
 }
 
+/**
+ * Offline when neither heartbeat.alive_at nor a recent successful sync
+ * is within EXTENSION_OFFLINE_MS. Sync fallback avoids false "offline"
+ * when the dedicated heartbeat path never wrote (null alive_at) but
+ * relay-snapshot upserts were still succeeding.
+ */
 export function isExtensionOffline(
   heartbeat: ExtensionHeartbeat | null | undefined,
   nowMs = Date.now(),
+  recentSyncAt?: string | null,
 ): boolean {
-  if (!heartbeat?.aliveAt) return true;
-  const at = Date.parse(heartbeat.aliveAt);
-  if (!Number.isFinite(at)) return true;
-  return nowMs - at > EXTENSION_OFFLINE_MS;
+  let newest = -Infinity;
+  for (const iso of [heartbeat?.aliveAt, recentSyncAt]) {
+    if (!iso) continue;
+    const at = Date.parse(iso);
+    if (Number.isFinite(at) && at > newest) newest = at;
+  }
+  if (!Number.isFinite(newest) || newest === -Infinity) return true;
+  return nowMs - newest > EXTENSION_OFFLINE_MS;
 }
 
 export function liveMirrorMode(
@@ -52,7 +63,15 @@ export function liveMirrorMode(
 ): LiveMirrorMode {
   if (opts.heartbeat?.authStatus === 'auth_required') return 'auth';
   if (opts.reconnectSyncing || row?.syncing) return 'syncing';
-  if (isExtensionOffline(opts.heartbeat)) return opts.showLastKnown ? 'last_known' : 'offline';
+  if (
+    isExtensionOffline(
+      opts.heartbeat,
+      Date.now(),
+      row?.lastSuccessfulSyncAt ?? null,
+    )
+  ) {
+    return opts.showLastKnown ? 'last_known' : 'offline';
+  }
   if (isSectionPaused(row)) return opts.showLastKnown ? 'last_known' : 'delayed';
   return 'live';
 }

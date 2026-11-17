@@ -105,6 +105,32 @@ export async function markSyncAttempt(
   );
 }
 
+/** Mark extension alive — used by dedicated heartbeat and successful sync pushes. */
+export async function touchExtensionAlive(
+  sb: SupabaseClient,
+  opts: {
+    now: string;
+    authStatus?: string;
+    clientId?: string | null;
+    detail?: string | null;
+  },
+) {
+  const authStatus = ["ok", "auth_required", "unknown"].includes(String(opts.authStatus || ""))
+    ? String(opts.authStatus)
+    : "ok";
+  await sb.from("extension_heartbeat").upsert(
+    {
+      id: 1,
+      alive_at: opts.now,
+      auth_status: authStatus,
+      client_id: opts.clientId != null ? String(opts.clientId) : null,
+      detail: opts.detail != null ? String(opts.detail).slice(0, 500) : null,
+      updated_at: opts.now,
+    },
+    { onConflict: "id" },
+  );
+}
+
 export async function resolveDispatchChatId(sb: SupabaseClient): Promise<string | null> {
   const { data: settings } = await sb
     .from("telegram_alert_settings")

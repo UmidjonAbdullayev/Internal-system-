@@ -52,6 +52,8 @@ export function isTripsBoardUrl(url) {
 
 export const SYNC_ALARM = 'relay-sync-flush';
 export const ALWAYS_ON_ALARM = 'relay-always-on-tick';
+/** Chrome alarms min period is 1m — keeps extension_heartbeat fresh across MV3 SW sleeps. */
+export const EXTENSION_ALIVE_ALARM = 'relay-extension-alive';
 export const SECTION_ALARM_PREFIX = 'relay-section-';
 
 /** Raw entitiesV2 ring buffer. */
