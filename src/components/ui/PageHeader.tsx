@@ -7,7 +7,7 @@ export function PageHeader({
   badge,
 }: {
   title: string;
-  subtitle?: string;
+  subtitle?: ReactNode;
   actions?: ReactNode;
   badge?: ReactNode;
 }) {
@@ -20,8 +20,8 @@ export function PageHeader({
           </h1>
           {badge}
         </div>
-        {subtitle && (
-          <p className="mt-1 text-sm text-text-secondary">{subtitle}</p>
+        {subtitle != null && subtitle !== false && (
+          <div className="mt-1 text-sm text-text-secondary">{subtitle}</div>
         )}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}

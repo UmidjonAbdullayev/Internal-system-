@@ -1,78 +1,53 @@
-import { useMemo, useState, useEffect } from 'react';
-import { useSearchParams, Link } from 'react-router-dom';
-import { Plus, Download, Pencil, Trash2, Eye } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { CircleHelp, Download, Plus } from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { Button } from '@/components/ui/Button';
-import { Badge } from '@/components/ui/Badge';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { Select, Input, Field, Textarea } from '@/components/ui/Input';
 import { Card } from '@/components/ui/Card';
-import { Modal, ConfirmDialog } from '@/components/ui/Modal';
-import { Drawer } from '@/components/ui/Drawer';
+import { Modal } from '@/components/ui/Modal';
 import { EmptyState } from '@/components/ui/EmptyState';
-import { SortHeader, useSort, type SortDir } from '@/components/shared/SortHeader';
-import { TripStatusIcon } from '@/components/shared/TripStatusIcon';
-import { getLoadFinalGross } from '@/lib/calculations';
-import { resolveTripStatus, tripStatusTooltip } from '@/lib/loadStatusDisplay';
+import { SyncStatusLine } from '@/components/trips/SyncStatusLine';
+import { TripLegend } from '@/components/trips/TripLegend';
+import { TripRow } from '@/components/trips/TripRow';
 import {
-  formatCurrency,
-  formatDate,
-  downloadCSV,
-  getDriverFullName,
-  getWeekRange,
-  todayISO,
-} from '@/lib/utils';
-import type { Load, LoadStatus, PaymentStatus, TrailerType, TripBucket } from '@/types';
+  displayStatusLabel,
+  filterTrips,
+  tabCountsFromSnapshots,
+  tripDriverName,
+  type TripTab,
+} from '@/lib/relayTrips';
+import { downloadCSV, formatCurrency, getDriverFullName } from '@/lib/utils';
+import type { LoadStatus, PaymentStatus, TrailerType } from '@/types';
 
 const LOAD_STATUSES: LoadStatus[] = [
-  'Available', 'Booked', 'Dispatched', 'In Transit', 'Delivered', 'Completed', 'Cancelled', 'Rejected',
+  'Available',
+  'Booked',
+  'Dispatched',
+  'In Transit',
+  'Delivered',
+  'Completed',
+  'Cancelled',
+  'Rejected',
 ];
 const PAYMENT_STATUSES: PaymentStatus[] = [
-  'Not Received', 'Pending', 'Processing', 'Paid', 'On Hold', 'Disputed',
+  'Not Received',
+  'Pending',
+  'Processing',
+  'Paid',
+  'On Hold',
+  'Disputed',
 ];
 const TRAILER_TYPES: TrailerType[] = ['Dry Van', 'Reefer', 'Flatbed', 'Step Deck', 'Box Truck'];
 
-type LoadsTab = TripBucket | 'all';
-
-const TRIP_TABS: { id: LoadsTab; label: string }[] = [
+const TRIP_TABS: { id: TripTab; label: string }[] = [
   { id: 'upcoming', label: 'Upcoming' },
   { id: 'in_transit', label: 'In Transit' },
   { id: 'history', label: 'History' },
   { id: 'all', label: 'All' },
 ];
-
-function inferTripBucket(load: Load): TripBucket | null {
-  // Terminal statuses always History — even if trip_bucket was left stale as active.
-  if (
-    load.loadStatus === 'Completed' ||
-    load.loadStatus === 'Delivered' ||
-    load.loadStatus === 'Cancelled' ||
-    load.loadStatus === 'Rejected'
-  ) {
-    return 'history';
-  }
-  if (load.tripBucket === 'history') return 'history';
-  if (load.tripBucket === 'in_transit' || load.tripBucket === 'upcoming') return load.tripBucket;
-  if (load.loadStatus === 'In Transit' || load.loadStatus === 'Dispatched') return 'in_transit';
-  if (load.loadStatus === 'Booked' || load.loadStatus === 'Available') return 'upcoming';
-  return null;
-}
-
-function driverDisplayName(
-  load: Load,
-  driverMap: Record<string, { firstName: string; lastName: string }>,
-): string {
-  if (load.driverId && driverMap[load.driverId]) {
-    return getDriverFullName(driverMap[load.driverId].firstName, driverMap[load.driverId].lastName);
-  }
-  return load.driverNameRaw || 'Unassigned';
-}
-
-/** Date range only applies on History — live boards show all matching rows. */
-function tabUsesDateFilter(tab: LoadsTab): boolean {
-  return tab === 'history';
-}
 
 const emptyForm = {
   loadId: '',
@@ -95,31 +70,35 @@ const emptyForm = {
 };
 
 export function LoadsPage() {
-  const { loads, drivers, addLoad, updateLoad, deleteLoad, dataSource, refreshData, companySettings } =
-    useData();
+  const {
+    loads,
+    drivers,
+    relayTrips,
+    relaySnapshots,
+    relaySyncHealth,
+    activityLogs,
+    addLoad,
+    dataSource,
+    refreshData,
+    dataReady,
+  } = useData();
   const [params, setParams] = useSearchParams();
-  const today = todayISO(companySettings.timezone || 'America/Chicago');
-  const week = getWeekRange(today);
-  const urlTab = params.get('tab') as LoadsTab | null;
-  const [tab, setTab] = useState<LoadsTab>(
+  const urlTab = params.get('tab') as TripTab | null;
+  const [tab, setTab] = useState<TripTab>(
     urlTab && TRIP_TABS.some((x) => x.id === urlTab) ? urlTab : 'in_transit',
   );
   const [tabAutoPicked, setTabAutoPicked] = useState(Boolean(urlTab));
   const [search, setSearch] = useState(params.get('q') ?? '');
   const [statusFilter, setStatusFilter] = useState(params.get('status') ?? '');
-  const [paymentFilter, setPaymentFilter] = useState(params.get('paymentStatus') ?? '');
-  const [driverFilter, setDriverFilter] = useState('');
-  /** History-only date range (day / week / custom). Live tabs ignore these. */
-  const [dateFrom, setDateFrom] = useState(params.get('from') || today);
-  const [dateTo, setDateTo] = useState(params.get('to') || today);
-  const datesActive = tabUsesDateFilter(tab);
-  const [sortKey, setSortKey] = useState('deliveryDate');
-  const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [driverFilter, setDriverFilter] = useState(params.get('driver') ?? '');
+  const [lateOnly, setLateOnly] = useState(params.get('late') === '1');
+  const [needsAttentionOnly, setNeedsAttentionOnly] = useState(params.get('attention') === '1');
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [focusedIndex, setFocusedIndex] = useState(0);
+  const [legendOpen, setLegendOpen] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
-  const [editing, setEditing] = useState<Load | null>(null);
   const [form, setForm] = useState(emptyForm);
-  const [detail, setDetail] = useState<Load | null>(null);
-  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (params.get('action') === 'new') {
@@ -127,38 +106,23 @@ export function LoadsPage() {
       params.delete('action');
       setParams(params, { replace: true });
     }
-    const t = params.get('tab') as LoadsTab | null;
+    const t = params.get('tab') as TripTab | null;
     if (t && TRIP_TABS.some((x) => x.id === t)) {
       setTab(t);
       setTabAutoPicked(true);
     }
   }, [params, setParams]);
 
-  const driverMap = useMemo(
-    () => Object.fromEntries(drivers.map((d) => [d.id, d])),
-    [drivers]
+  const tabCounts = useMemo(
+    () => tabCountsFromSnapshots(relaySnapshots, relayTrips),
+    [relaySnapshots, relayTrips],
   );
 
-  const tabCounts = useMemo(() => {
-    const counts: Record<LoadsTab, number> = {
-      upcoming: 0,
-      in_transit: 0,
-      history: 0,
-      all: loads.length,
-    };
-    for (const l of loads) {
-      const b = inferTripBucket(l);
-      if (b) counts[b] += 1;
-    }
-    return counts;
-  }, [loads]);
-
-  // When synced data exists but default In Transit is empty, land on a tab that has rows.
   useEffect(() => {
-    if (tabAutoPicked || !loads.length) return;
-    const preferred: LoadsTab[] = ['in_transit', 'upcoming', 'history', 'all'];
+    if (tabAutoPicked || !relayTrips.length) return;
+    const preferred: TripTab[] = ['in_transit', 'upcoming', 'history', 'all'];
     const next =
-      preferred.find((t) => (t === 'all' ? loads.length > 0 : tabCounts[t] > 0)) || 'all';
+      preferred.find((t) => (t === 'all' ? relayTrips.length > 0 : tabCounts[t] > 0)) || 'all';
     if (next !== tab) {
       setTab(next);
       const nextParams = new URLSearchParams(params);
@@ -166,75 +130,60 @@ export function LoadsPage() {
       setParams(nextParams, { replace: true });
     }
     setTabAutoPicked(true);
-  }, [loads.length, tabCounts, tabAutoPicked, tab, params, setParams]);
+  }, [relayTrips.length, tabCounts, tabAutoPicked, tab, params, setParams]);
 
-  const filtered = useMemo(() => {
-    const q = search.toLowerCase();
-    return loads.filter((l) => {
-      const bucket = inferTripBucket(l);
-      if (tab !== 'all' && bucket !== tab) return false;
-      if (statusFilter && l.loadStatus !== statusFilter) return false;
-      if (paymentFilter && l.paymentStatus !== paymentFilter) return false;
-      if (driverFilter && l.driverId !== driverFilter) return false;
-      // Upcoming / In Transit / All: no date filter — live boards show every matching row.
-      if (datesActive && (dateFrom || dateTo)) {
-        const inRange = (d: string) => {
-          if (!d) return false;
-          if (dateFrom && d < dateFrom) return false;
-          if (dateTo && d > dateTo) return false;
-          return true;
-        };
-        // Match ops day on pickup or delivery (Relay dates).
-        if (!inRange(l.deliveryDate) && !inRange(l.pickupDate)) return false;
-      }
-      if (q) {
-        const hay = [
-          l.loadId,
-          l.amazonRefId,
-          l.parentTripId,
-          l.trailerId,
-          l.tractorId,
-          l.pickupLocation,
-          l.deliveryLocation,
-          driverDisplayName(l, driverMap),
-        ]
-          .join(' ')
-          .toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
-  }, [loads, tab, search, statusFilter, paymentFilter, driverFilter, dateFrom, dateTo, datesActive, driverMap]);
+  const statusOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of relayTrips) set.add(displayStatusLabel(t));
+    return [...set].sort();
+  }, [relayTrips]);
 
-  /** Rows in the current tab before date/search filters — used for “hidden by filter” UX. */
-  const inTabCount = useMemo(() => {
-    if (tab === 'all') return loads.length;
-    return loads.filter((l) => inferTripBucket(l) === tab).length;
-  }, [loads, tab]);
-
-  const sorted = useSort(filtered, sortKey, sortDir, {
-    loadId: (l) => l.loadId,
-    deliveryDate: (l) => l.deliveryDate,
-    pickupDate: (l) => l.pickupDate,
-    rateGross: (l) => getLoadFinalGross(l),
-    distanceMiles: (l) => l.distanceMiles,
-    loadStatus: (l) => l.loadStatus,
-    paymentStatus: (l) => l.paymentStatus,
-    driver: (l) => driverDisplayName(l, driverMap),
-    tractor: (l) => l.tractorId || '',
-    trailer: (l) => l.trailerId || '',
-  });
-
-  const handleSort = (key: string) => {
-    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-    else {
-      setSortKey(key);
-      setSortDir('desc');
+  const driverOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of relayTrips) {
+      const n = tripDriverName(t);
+      if (n) set.add(n);
     }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [relayTrips]);
+
+  const filtered = useMemo(
+    () =>
+      filterTrips(relayTrips, {
+        tab,
+        search,
+        status: statusFilter,
+        driver: driverFilter,
+        lateOnly,
+        needsAttentionOnly,
+      }),
+    [relayTrips, tab, search, statusFilter, driverFilter, lateOnly, needsAttentionOnly],
+  );
+
+  const inTabCount = useMemo(() => {
+    if (tab === 'all') return relayTrips.length;
+    return filterTrips(relayTrips, {
+      tab,
+      search: '',
+      status: '',
+      driver: '',
+      lateOnly: false,
+      needsAttentionOnly: false,
+    }).length;
+  }, [relayTrips, tab]);
+
+  useEffect(() => {
+    setFocusedIndex((i) => (filtered.length ? Math.min(i, filtered.length - 1) : 0));
+  }, [filtered.length]);
+
+  const selectTab = (id: TripTab) => {
+    setTab(id);
+    const next = new URLSearchParams(params);
+    next.set('tab', id);
+    setParams(next, { replace: true });
   };
 
   const openCreate = () => {
-    setEditing(null);
     setForm({
       ...emptyForm,
       loadId: `LD-${8500 + loads.length}`,
@@ -243,83 +192,96 @@ export function LoadsPage() {
     setFormOpen(true);
   };
 
-  const openEdit = (load: Load) => {
-    setEditing(load);
-    setForm({
-      loadId: load.loadId,
-      amazonRefId: load.amazonRefId,
-      driverId: load.driverId,
-      loadStatus: load.loadStatus,
-      paymentStatus: load.paymentStatus,
-      pickupLocation: load.pickupLocation,
-      deliveryLocation: load.deliveryLocation,
-      pickupDate: load.pickupDate,
-      deliveryDate: load.deliveryDate,
-      trailerId: load.trailerId,
-      trailerType: load.trailerType,
-      tractorId: load.tractorId || '',
-      distanceMiles: load.distanceMiles,
-      rateGross: load.rateGross,
-      additionalCharges: load.additionalCharges,
-      paymentDate: load.paymentDate,
-      notes: load.notes,
-    });
-    setFormOpen(true);
-  };
-
   const saveForm = () => {
     if (!form.loadId || !form.pickupLocation || !form.deliveryLocation) return;
-    const payload = {
+    addLoad({
       ...form,
       driverId: form.driverId || null,
       paymentDate: form.paymentDate || null,
       tractorId: form.tractorId || '',
-    };
-    if (editing) updateLoad(editing.id, payload);
-    else addLoad(payload);
+    });
     setFormOpen(false);
   };
 
   const exportCSV = () => {
     downloadCSV(
-      'loads-export.csv',
+      'trips-export.csv',
       [
-        'Trip/Load ID', 'Parent Trip', 'Driver', 'Status', 'Status Bar', 'Tractor', 'Trailer',
-        'Pickup', 'Delivery', 'Pickup Date', 'Delivery Date', 'Miles', 'Pay', 'Bucket',
+        'Trip ID',
+        'Section',
+        'Driver',
+        'Status',
+        'Tractor',
+        'Trailer',
+        'Miles',
+        'Pay',
+        'Rate/mi',
+        'Legs',
+        'Stops',
       ],
-      sorted.map((l) => [
-        l.loadId,
-        l.parentTripId || '',
-        driverDisplayName(l, driverMap),
-        resolveTripStatus(l).name,
-        tripStatusTooltip(resolveTripStatus(l)),
-        l.tractorId || '',
-        l.trailerId || '',
-        l.pickupLocation,
-        l.deliveryLocation,
-        l.pickupDate,
-        l.deliveryDate,
-        l.distanceMiles,
-        getLoadFinalGross(l),
-        inferTripBucket(l) || '',
-      ])
+      filtered.map((t) => [
+        t.tripId,
+        t.section || '',
+        tripDriverName(t),
+        displayStatusLabel(t),
+        t.legs.map((l) => l.tractorId).filter(Boolean).join('|'),
+        t.legs.map((l) => l.trailerId).filter(Boolean).join('|'),
+        t.totalMiles ?? '',
+        t.payout ?? '',
+        t.ratePerMile ?? '',
+        t.legs.length,
+        t.legs.reduce((n, l) => n + l.stops.length, 0),
+      ]),
     );
   };
 
-  const selectTab = (id: LoadsTab) => {
-    setTab(id);
-    const next = new URLSearchParams(params);
-    next.set('tab', id);
-    setParams(next, { replace: true });
-  };
+  const onListKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (!filtered.length) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setFocusedIndex((i) => Math.min(filtered.length - 1, i + 1));
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setFocusedIndex((i) => Math.max(0, i - 1));
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const trip = filtered[focusedIndex];
+        if (trip) {
+          setExpandedId((id) => (id === trip.tripId ? null : trip.tripId));
+        }
+      }
+    },
+    [filtered, focusedIndex],
+  );
+
+  useEffect(() => {
+    const el = listRef.current?.querySelector(`[data-trip-id="${filtered[focusedIndex]?.tripId}"]`);
+    if (el && 'scrollIntoView' in el) {
+      (el as HTMLElement).scrollIntoView({ block: 'nearest' });
+    }
+  }, [focusedIndex, filtered]);
+
+  const filtersActive = Boolean(search || statusFilter || driverFilter || lateOnly || needsAttentionOnly);
 
   return (
     <div>
       <PageHeader
         title="Loads / Trips"
-        subtitle={`${sorted.length} shown · live ${dataSource} · mirrors Relay Upcoming / In Transit / History`}
+        subtitle={
+          <span className="block">
+            <SyncStatusLine health={relaySyncHealth} />
+            <span className="mt-0.5 block text-xs text-text-secondary">
+              {filtered.length} shown · {dataSource}
+              {relaySnapshots.some((s) => s.mismatch) ? ' · snapshot mismatch — check extension popup' : ''}
+            </span>
+          </span>
+        }
         actions={
           <>
+            <Button variant="outline" size="sm" onClick={() => setLegendOpen(true)}>
+              <CircleHelp className="h-4 w-4" /> Legend
+            </Button>
             <Button variant="outline" size="sm" onClick={() => void refreshData()}>
               Refresh
             </Button>
@@ -356,305 +318,171 @@ export function LoadsPage() {
           <SearchInput
             value={search}
             onChange={setSearch}
-            placeholder="Search trip, load, driver, tractor, trailer..."
-            className="w-full sm:w-72"
+            placeholder="Search trip, load, driver, tractor, trailer, city, facility…"
+            className="w-full sm:w-80"
           />
-          <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="w-36">
+          <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="w-40">
             <option value="">All Statuses</option>
-            {LOAD_STATUSES.map((s) => (
-              <option key={s} value={s}>{s}</option>
-            ))}
-          </Select>
-          <Select value={paymentFilter} onChange={(e) => setPaymentFilter(e.target.value)} className="w-40">
-            <option value="">All Payments</option>
-            {PAYMENT_STATUSES.map((s) => (
-              <option key={s} value={s}>{s}</option>
+            {statusOptions.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
             ))}
           </Select>
           <Select value={driverFilter} onChange={(e) => setDriverFilter(e.target.value)} className="w-44">
             <option value="">All Drivers</option>
-            {drivers.map((d) => (
-              <option key={d.id} value={d.id}>
-                {getDriverFullName(d.firstName, d.lastName)}
+            {driverOptions.map((d) => (
+              <option key={d} value={d}>
+                {d}
               </option>
             ))}
           </Select>
-          {datesActive ? (
-            <>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
-                  From
-                </label>
-                <Input
-                  type="date"
-                  value={dateFrom}
-                  onChange={(e) => setDateFrom(e.target.value)}
-                  className="w-36"
-                />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[10px] font-medium uppercase tracking-wide text-text-secondary">
-                  To
-                </label>
-                <Input
-                  type="date"
-                  value={dateTo}
-                  onChange={(e) => setDateTo(e.target.value)}
-                  className="w-36"
-                />
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                type="button"
-                onClick={() => {
-                  setDateFrom(today);
-                  setDateTo(today);
-                }}
-              >
-                Today
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                type="button"
-                onClick={() => {
-                  setDateFrom(week.start);
-                  setDateTo(week.end);
-                }}
-              >
-                This week
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                type="button"
-                onClick={() => {
-                  setDateFrom('');
-                  setDateTo('');
-                }}
-              >
-                All dates
-              </Button>
-            </>
-          ) : (
-            <p className="pb-1 text-xs text-text-secondary">
-              {tab === 'upcoming'
-                ? 'Upcoming board — all booked trips, no date filter.'
-                : tab === 'in_transit'
-                  ? 'In Transit board — all live trips, no date filter.'
-                  : 'All trips — date range is on History only.'}
-            </p>
-          )}
+          <label className="inline-flex items-center gap-2 rounded-lg border border-border bg-white px-3 h-9 text-xs font-medium text-text cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={lateOnly}
+              onChange={(e) => setLateOnly(e.target.checked)}
+              className="rounded border-border"
+            />
+            Late only
+          </label>
+          <label className="inline-flex items-center gap-2 rounded-lg border border-border bg-white px-3 h-9 text-xs font-medium text-text cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={needsAttentionOnly}
+              onChange={(e) => setNeedsAttentionOnly(e.target.checked)}
+              className="rounded border-border"
+            />
+            Needs attention
+          </label>
         </div>
-        {inTabCount > 0 &&
-          filtered.length === 0 &&
-          ((datesActive && (dateFrom || dateTo)) ||
-            search ||
-            statusFilter ||
-            paymentFilter ||
-            driverFilter) && (
+        {inTabCount > 0 && filtered.length === 0 && filtersActive && (
           <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
             <span>
-              {inTabCount} trip{inTabCount === 1 ? '' : 's'} in this tab, but filters hide them
-              {datesActive && (dateFrom || dateTo)
-                ? ` (dates ${dateFrom || '…'} → ${dateTo || '…'})`
-                : ''}
-              .
+              {inTabCount} trip{inTabCount === 1 ? '' : 's'} in this tab, but filters hide them.
             </span>
             <Button
               variant="outline"
               size="sm"
               type="button"
               onClick={() => {
-                if (datesActive) {
-                  setDateFrom('');
-                  setDateTo('');
-                }
                 setSearch('');
                 setStatusFilter('');
-                setPaymentFilter('');
                 setDriverFilter('');
+                setLateOnly(false);
+                setNeedsAttentionOnly(false);
               }}
             >
               Clear filters
             </Button>
-            {datesActive && (
-              <Button
-                variant="ghost"
-                size="sm"
-                type="button"
-                onClick={() => {
-                  setDateFrom(week.start);
-                  setDateTo(week.end);
-                }}
-              >
-                Use this week
-              </Button>
-            )}
           </div>
         )}
       </Card>
 
       <Card className="overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm min-w-[1400px]">
-            <thead>
-              <tr className="border-b border-border bg-bg/80">
-                <SortHeader label="Trip / Load" sortKey="loadId" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <SortHeader label="Driver" sortKey="driver" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <SortHeader label="Tractor" sortKey="tractor" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <SortHeader label="Trailer" sortKey="trailer" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Route</th>
-                <SortHeader label="Status" sortKey="loadStatus" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <SortHeader label="Pay" sortKey="rateGross" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                <SortHeader label="Delivery" sortKey="deliveryDate" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sorted.map((l) => {
-                const d = l.driverId ? driverMap[l.driverId] : null;
-                return (
-                  <tr
-                    key={l.id}
-                    className="border-b border-border/60 table-row-hover cursor-pointer"
-                    onClick={() => setDetail(l)}
-                  >
-                    <td className="px-3 py-2.5">
-                      <div className="font-medium text-primary">{l.loadId}</div>
-                      {l.parentTripId && l.parentTripId !== l.loadId && (
-                        <div className="text-[11px] text-text-secondary">Trip {l.parentTripId}</div>
-                      )}
-                      {l.jobType && (
-                        <div className="text-[10px] text-text-secondary">{l.jobType}</div>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      {d ? (
-                        <Link
-                          to={`/drivers/${d.id}`}
-                          className="font-medium hover:underline"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          {getDriverFullName(d.firstName, d.lastName)}
-                        </Link>
-                      ) : (
-                        <span className={l.driverNameRaw ? '' : 'text-text-secondary italic'}>
-                          {l.driverNameRaw || 'Unassigned'}
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5 text-xs tabular-nums">{l.tractorId || '—'}</td>
-                    <td className="px-3 py-2.5 text-xs">
-                      <div>{l.trailerId || '—'}</div>
-                      <div className="text-text-secondary">{l.trailerType}</div>
-                    </td>
-                    <td className="px-3 py-2.5 text-xs">
-                      <div>{l.pickupLocation}</div>
-                      <div className="text-text-secondary">→ {l.deliveryLocation}</div>
-                      {(l.arrivalActual || l.arrivalScheduled) && (
-                        <div className="mt-0.5 text-[11px] text-text-secondary">
-                          {l.arrivalActual ? `Arrived ${l.arrivalActual}` : null}
-                          {l.arrivalActual && l.arrivalScheduled ? ' · ' : null}
-                          {l.arrivalScheduled ? `Sch. ${l.arrivalScheduled}` : null}
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <TripStatusIcon load={l} />
-                    </td>
-                    <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
-                      {formatCurrency(getLoadFinalGross(l))}
-                    </td>
-                    <td className="px-3 py-2.5 text-xs whitespace-nowrap">{formatDate(l.deliveryDate, 'MMM d')}</td>
-                    <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
-                      <div className="flex items-center justify-end gap-1">
-                        <Button variant="ghost" size="sm" onClick={() => setDetail(l)}>
-                          <Eye className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button variant="ghost" size="sm" onClick={() => openEdit(l)}>
-                          <Pencil className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button variant="ghost" size="sm" onClick={() => setDeleteId(l.id)}>
-                          <Trash2 className="h-3.5 w-3.5 text-danger" />
-                        </Button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-          {sorted.length === 0 && (
-            <EmptyState
-              title={
-                loads.length === 0
-                  ? 'No trips synced yet'
-                  : inTabCount > 0
-                    ? 'Filters hide synced trips'
-                    : tab === 'in_transit'
-                      ? 'No In Transit trips'
-                      : tab === 'upcoming'
-                        ? 'No Upcoming trips'
-                        : tab === 'history'
-                          ? 'No History trips in this date range'
-                          : 'No trips in this tab'
-              }
-              description={
-                loads.length === 0
-                  ? 'Open Amazon Relay Trips with the extension live (GO LIVE), then refresh. Extension “Synced” can mean the page was scraped with nothing new to upsert — check CRM Errors and Supabase loads.'
-                  : inTabCount > 0 && datesActive && (dateFrom || dateTo)
-                    ? `This History tab has ${inTabCount} synced trip(s). Widen the date range (This week / All dates).`
-                    : inTabCount > 0
-                      ? `This tab has ${inTabCount} synced trip(s). Clear search/status/payment/driver filters.`
-                      : tab === 'in_transit' && tabCounts.history > 0
-                        ? `${tabCounts.history} trip(s) are under History. Switch tabs, or Force scan with Upcoming/In Transit open so active trips stay active.`
-                        : 'Open Amazon Relay Trips with the extension live, or add a load manually.'
-              }
-              actionLabel={
-                inTabCount > 0 && datesActive && (dateFrom || dateTo)
-                  ? 'All dates'
-                  : inTabCount > 0
-                    ? 'Clear filters'
-                    : 'Add Load'
-              }
-              onAction={
-                inTabCount > 0 && datesActive && (dateFrom || dateTo)
-                  ? () => {
-                      setDateFrom('');
-                      setDateTo('');
-                    }
-                  : inTabCount > 0
-                    ? () => {
-                        setSearch('');
-                        setStatusFilter('');
-                        setPaymentFilter('');
-                        setDriverFilter('');
-                      }
-                    : openCreate
-              }
-            />
-          )}
+        {/* Sticky header — desktop */}
+        <div className="sticky top-0 z-10 hidden md:grid grid-cols-[minmax(9rem,1.1fr)_minmax(8rem,1fr)_minmax(12rem,1.4fr)_minmax(11rem,1.3fr)_minmax(7rem,0.9fr)_minmax(6.5rem,0.85fr)_2rem] gap-3 border-b border-border bg-bg/95 px-3 py-2.5 text-[10px] font-semibold uppercase tracking-wide text-text-secondary backdrop-blur">
+          <div>Trip</div>
+          <div>Driver</div>
+          <div>Route</div>
+          <div>Progress</div>
+          <div>Status</div>
+          <div className="text-right">Pay</div>
+          <div />
         </div>
+
+        <div
+          ref={listRef}
+          tabIndex={0}
+          onKeyDown={onListKeyDown}
+          className="outline-none focus-visible:ring-2 focus-visible:ring-secondary/30 focus-visible:ring-inset"
+          aria-label="Trips list"
+        >
+          {filtered.map((trip, index) => (
+            <TripRow
+              key={trip.id || trip.tripId}
+              trip={trip}
+              expanded={expandedId === trip.tripId}
+              selected={focusedIndex === index}
+              onToggle={() => {
+                setFocusedIndex(index);
+                setExpandedId((id) => (id === trip.tripId ? null : trip.tripId));
+              }}
+              drivers={drivers}
+              activityLogs={activityLogs}
+            />
+          ))}
+        </div>
+
+        {filtered.length === 0 && dataReady && (
+          <EmptyState
+            title={
+              relayTrips.length === 0
+                ? 'No Relay trips synced yet'
+                : inTabCount > 0
+                  ? 'Filters hide synced trips'
+                  : tab === 'in_transit'
+                    ? 'No In Transit trips'
+                    : tab === 'upcoming'
+                      ? 'No Upcoming trips'
+                      : tab === 'history'
+                        ? 'No History trips'
+                        : 'No trips in this tab'
+            }
+            description={
+              relayTrips.length === 0
+                ? 'Extension 1.6.0+ writes relay_trips / legs / stops. Open Amazon Relay Trips, GO LIVE, then Refresh. Tab counts will match Relay section snapshots.'
+                : inTabCount > 0
+                  ? `This tab has ${inTabCount} trip(s). Clear search/status/driver/toggles.`
+                  : 'Switch tabs or wait for the next Relay snapshot.'
+            }
+            actionLabel={inTabCount > 0 ? 'Clear filters' : 'Refresh'}
+            onAction={
+              inTabCount > 0
+                ? () => {
+                    setSearch('');
+                    setStatusFilter('');
+                    setDriverFilter('');
+                    setLateOnly(false);
+                    setNeedsAttentionOnly(false);
+                  }
+                : () => void refreshData()
+            }
+          />
+        )}
       </Card>
 
-      {/* Create / Edit Modal */}
+      <TripLegend open={legendOpen} onClose={() => setLegendOpen(false)} />
+
+      {/* Manual CRM load (settlements / reports path) — does not invent relay_trips rows */}
       <Modal
         open={formOpen}
         onClose={() => setFormOpen(false)}
-        title={editing ? `Edit Load ${editing.loadId}` : 'Add New Load'}
+        title="Add New Load"
         size="xl"
         footer={
           <>
-            <Button variant="outline" onClick={() => setFormOpen(false)}>Cancel</Button>
-            <Button onClick={saveForm}>{editing ? 'Save Changes' : 'Create Load'}</Button>
+            <Button variant="outline" onClick={() => setFormOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={saveForm}>Create Load</Button>
           </>
         }
       >
+        <p className="mb-3 text-xs text-text-secondary">
+          Manual loads still save to the CRM <span className="font-mono">loads</span> table for
+          settlements/reports. Live Trips list above reads <span className="font-mono">relay_trips</span>.
+        </p>
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <Field label="Load ID"><Input value={form.loadId} onChange={(e) => setForm({ ...form, loadId: e.target.value })} /></Field>
-          <Field label="Amazon Reference ID"><Input value={form.amazonRefId} onChange={(e) => setForm({ ...form, amazonRefId: e.target.value })} /></Field>
+          <Field label="Load ID">
+            <Input value={form.loadId} onChange={(e) => setForm({ ...form, loadId: e.target.value })} />
+          </Field>
+          <Field label="Amazon Reference ID">
+            <Input
+              value={form.amazonRefId}
+              onChange={(e) => setForm({ ...form, amazonRefId: e.target.value })}
+            />
+          </Field>
           <Field label="Driver">
             <Select
               value={form.driverId ?? ''}
@@ -662,145 +490,122 @@ export function LoadsPage() {
             >
               <option value="">Unassigned</option>
               {drivers.map((d) => (
-                <option key={d.id} value={d.id}>{getDriverFullName(d.firstName, d.lastName)}</option>
+                <option key={d.id} value={d.id}>
+                  {getDriverFullName(d.firstName, d.lastName)}
+                </option>
               ))}
             </Select>
           </Field>
           <Field label="Load Status">
-            <Select value={form.loadStatus} onChange={(e) => setForm({ ...form, loadStatus: e.target.value as LoadStatus })}>
-              {LOAD_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+            <Select
+              value={form.loadStatus}
+              onChange={(e) => setForm({ ...form, loadStatus: e.target.value as LoadStatus })}
+            >
+              {LOAD_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
             </Select>
           </Field>
           <Field label="Payment Status">
-            <Select value={form.paymentStatus} onChange={(e) => setForm({ ...form, paymentStatus: e.target.value as PaymentStatus })}>
-              {PAYMENT_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+            <Select
+              value={form.paymentStatus}
+              onChange={(e) => setForm({ ...form, paymentStatus: e.target.value as PaymentStatus })}
+            >
+              {PAYMENT_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
             </Select>
           </Field>
           <Field label="Payment Date">
-            <Input type="date" value={form.paymentDate ?? ''} onChange={(e) => setForm({ ...form, paymentDate: e.target.value || null })} />
+            <Input
+              type="date"
+              value={form.paymentDate ?? ''}
+              onChange={(e) => setForm({ ...form, paymentDate: e.target.value || null })}
+            />
           </Field>
-          <Field label="Pickup Location"><Input value={form.pickupLocation} onChange={(e) => setForm({ ...form, pickupLocation: e.target.value })} /></Field>
-          <Field label="Delivery Location"><Input value={form.deliveryLocation} onChange={(e) => setForm({ ...form, deliveryLocation: e.target.value })} /></Field>
-          <Field label="Trailer ID"><Input value={form.trailerId} onChange={(e) => setForm({ ...form, trailerId: e.target.value })} /></Field>
-          <Field label="Tractor ID"><Input value={form.tractorId} onChange={(e) => setForm({ ...form, tractorId: e.target.value })} /></Field>
-          <Field label="Pickup Date"><Input type="date" value={form.pickupDate} onChange={(e) => setForm({ ...form, pickupDate: e.target.value })} /></Field>
-          <Field label="Delivery Date"><Input type="date" value={form.deliveryDate} onChange={(e) => setForm({ ...form, deliveryDate: e.target.value })} /></Field>
+          <Field label="Pickup Location">
+            <Input
+              value={form.pickupLocation}
+              onChange={(e) => setForm({ ...form, pickupLocation: e.target.value })}
+            />
+          </Field>
+          <Field label="Delivery Location">
+            <Input
+              value={form.deliveryLocation}
+              onChange={(e) => setForm({ ...form, deliveryLocation: e.target.value })}
+            />
+          </Field>
+          <Field label="Trailer ID">
+            <Input value={form.trailerId} onChange={(e) => setForm({ ...form, trailerId: e.target.value })} />
+          </Field>
+          <Field label="Tractor ID">
+            <Input value={form.tractorId} onChange={(e) => setForm({ ...form, tractorId: e.target.value })} />
+          </Field>
+          <Field label="Pickup Date">
+            <Input
+              type="date"
+              value={form.pickupDate}
+              onChange={(e) => setForm({ ...form, pickupDate: e.target.value })}
+            />
+          </Field>
+          <Field label="Delivery Date">
+            <Input
+              type="date"
+              value={form.deliveryDate}
+              onChange={(e) => setForm({ ...form, deliveryDate: e.target.value })}
+            />
+          </Field>
           <Field label="Trailer Type">
-            <Select value={form.trailerType} onChange={(e) => setForm({ ...form, trailerType: e.target.value as TrailerType })}>
-              {TRAILER_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            <Select
+              value={form.trailerType}
+              onChange={(e) => setForm({ ...form, trailerType: e.target.value as TrailerType })}
+            >
+              {TRAILER_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
             </Select>
           </Field>
-          <Field label="Distance (Miles)"><Input type="number" value={form.distanceMiles} onChange={(e) => setForm({ ...form, distanceMiles: Number(e.target.value) })} /></Field>
-          <Field label="Rate / Gross ($)"><Input type="number" step="0.01" value={form.rateGross} onChange={(e) => setForm({ ...form, rateGross: Number(e.target.value) })} /></Field>
-          <Field label="Additional Charges ($)"><Input type="number" step="0.01" value={form.additionalCharges} onChange={(e) => setForm({ ...form, additionalCharges: Number(e.target.value) })} /></Field>
+          <Field label="Distance (Miles)">
+            <Input
+              type="number"
+              value={form.distanceMiles}
+              onChange={(e) => setForm({ ...form, distanceMiles: Number(e.target.value) })}
+            />
+          </Field>
+          <Field label="Rate / Gross ($)">
+            <Input
+              type="number"
+              step="0.01"
+              value={form.rateGross}
+              onChange={(e) => setForm({ ...form, rateGross: Number(e.target.value) })}
+            />
+          </Field>
+          <Field label="Additional Charges ($)">
+            <Input
+              type="number"
+              step="0.01"
+              value={form.additionalCharges}
+              onChange={(e) => setForm({ ...form, additionalCharges: Number(e.target.value) })}
+            />
+          </Field>
           <Field label="Notes" className="sm:col-span-2 lg:col-span-3">
             <Textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
           </Field>
         </div>
         <p className="mt-3 text-sm text-text-secondary">
-          Final Gross: <span className="font-semibold text-text">{formatCurrency(form.rateGross + form.additionalCharges)}</span>
+          Final Gross:{' '}
+          <span className="font-semibold text-text">
+            {formatCurrency(form.rateGross + form.additionalCharges)}
+          </span>
         </p>
       </Modal>
 
-      {/* Detail Drawer */}
-      <Drawer
-        open={!!detail}
-        onClose={() => setDetail(null)}
-        title={detail ? `Load ${detail.loadId}` : ''}
-        width="max-w-2xl"
-        footer={
-          detail && (
-            <>
-              <Button variant="outline" onClick={() => { openEdit(detail); setDetail(null); }}>
-                <Pencil className="h-4 w-4" /> Edit
-              </Button>
-              <Button variant="danger" onClick={() => { setDeleteId(detail.id); setDetail(null); }}>
-                <Trash2 className="h-4 w-4" /> Delete
-              </Button>
-            </>
-          )
-        }
-      >
-        {detail && (
-          <div className="space-y-5 animate-fade-in">
-            <div className="flex flex-wrap gap-2">
-              <TripStatusIcon load={detail} />
-              <Badge status={detail.paymentStatus} />
-            </div>
-            <div className="grid grid-cols-2 gap-4 text-sm">
-              <Info label="Amazon Ref" value={detail.amazonRefId} />
-              <Info
-                label="Driver"
-                value={
-                  detail.driverId && driverMap[detail.driverId]
-                    ? getDriverFullName(driverMap[detail.driverId].firstName, driverMap[detail.driverId].lastName)
-                    : 'Unassigned'
-                }
-              />
-              <Info label="Pickup" value={detail.pickupLocation} />
-              <Info label="Delivery" value={detail.deliveryLocation} />
-              <Info label="Pickup Date" value={formatDate(detail.pickupDate)} />
-              <Info label="Delivery Date" value={formatDate(detail.deliveryDate)} />
-              <Info label="Trailer" value={`${detail.trailerId || '—'} (${detail.trailerType})`} />
-              <Info label="Tractor" value={detail.tractorId || '—'} />
-              <Info label="Arrived" value={detail.arrivalActual || '—'} />
-              <Info label="Sch. arrival" value={detail.arrivalScheduled || '—'} />
-              <Info
-                label="Arrival address"
-                value={detail.arrivalAddress || '—'}
-              />
-              <Info label="Parent Trip" value={detail.parentTripId || '—'} />
-              <Info label="Trip tab" value={inferTripBucket(detail) || '—'} />
-              <Info label="Status" value={tripStatusTooltip(resolveTripStatus(detail))} />
-              <Info label="Distance" value={`${detail.distanceMiles} mi`} />
-              <Info label="Rate Gross" value={formatCurrency(detail.rateGross)} />
-              <Info label="Additional Charges" value={formatCurrency(detail.additionalCharges)} />
-              <Info label="Final Gross" value={formatCurrency(getLoadFinalGross(detail))} />
-              <Info label="Payment Date" value={detail.paymentDate ? formatDate(detail.paymentDate) : '—'} />
-            </div>
-            {detail.notes && (
-              <div>
-                <p className="text-xs font-medium text-text-secondary mb-1">Notes</p>
-                <p className="text-sm rounded-lg bg-bg p-3">{detail.notes}</p>
-              </div>
-            )}
-            <div>
-              <p className="text-xs font-medium text-text-secondary mb-2">Status History</p>
-              <div className="space-y-2">
-                {detail.statusHistory.map((h, i) => (
-                  <div key={i} className="flex items-center gap-3 text-sm">
-                    <div className="h-2 w-2 rounded-full bg-primary" />
-                    <Badge status={h.status} />
-                    <span className="text-xs text-text-secondary">
-                      {formatDate(h.timestamp, 'MMM d, yyyy h:mm a')}
-                    </span>
-                    {h.note && <span className="text-xs text-text-secondary">— {h.note}</span>}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-      </Drawer>
-
-      <ConfirmDialog
-        open={!!deleteId}
-        onClose={() => setDeleteId(null)}
-        onConfirm={() => deleteId && deleteLoad(deleteId)}
-        title="Delete Load"
-        message="Are you sure you want to delete this load? This action cannot be undone."
-        confirmLabel="Delete"
-        danger
-      />
-    </div>
-  );
-}
-
-function Info({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <p className="text-xs text-text-secondary">{label}</p>
-      <p className="font-medium text-text">{value}</p>
     </div>
   );
 }

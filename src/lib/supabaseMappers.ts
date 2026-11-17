@@ -8,7 +8,13 @@ import type {
   LoadStatus,
   OneTimeCharge,
   PaymentStatus,
+  RelayCostItem,
+  RelayLeg,
   RelayPayment,
+  RelaySection,
+  RelaySectionSnapshot,
+  RelayStop,
+  RelayTrip,
   Settlement,
   SettlementStatus,
   TrailerType,
@@ -199,6 +205,176 @@ export function mapLoadReport(row: Record<string, unknown>): LoadReport {
     createdAt: str(row.created_at),
     updatedAt: str(row.updated_at),
   };
+}
+
+function asRecord(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+}
+
+function normalizeRelaySection(raw: unknown): RelaySection | null {
+  const s = String(raw || '')
+    .toUpperCase()
+    .replace(/-/g, '_');
+  if (s === 'INTRANSIT') return 'IN_TRANSIT';
+  if (s === 'IN_TRANSIT' || s === 'UPCOMING' || s === 'HISTORY') return s;
+  return null;
+}
+
+function extractCostItems(raw: Record<string, unknown>): RelayCostItem[] {
+  const fromTop = Array.isArray(raw.costItems) ? raw.costItems : null;
+  const fromAgg = Array.isArray(raw.aggregatedCostItems) ? raw.aggregatedCostItems : null;
+  const list = fromTop || fromAgg || [];
+  return list
+    .map((item) => {
+      const r = asRecord(item);
+      const money = asRecord(r.monetaryAmount);
+      const amount =
+        r.amount != null
+          ? num(r.amount, NaN)
+          : money.value != null
+            ? num(money.value, NaN)
+            : NaN;
+      return {
+        name: str(r.name, 'Cost'),
+        amount: Number.isFinite(amount) ? amount : null,
+      };
+    })
+    .filter((c) => c.name);
+}
+
+export function mapRelayStop(row: Record<string, unknown>): RelayStop {
+  return {
+    id: str(row.id),
+    stopId: str(row.stop_id),
+    loadId: str(row.load_id),
+    tripId: str(row.trip_id),
+    seq: row.seq == null ? null : num(row.seq),
+    stopType: row.stop_type ? str(row.stop_type) : null,
+    facilityCode: row.facility_code ? str(row.facility_code) : null,
+    address: row.address ? str(row.address) : null,
+    city: row.city ? str(row.city) : null,
+    state: row.state ? str(row.state) : null,
+    zip: row.zip ? str(row.zip) : null,
+    timeZone: row.time_zone ? str(row.time_zone) : null,
+    scheduledArrival: row.scheduled_arrival ? str(row.scheduled_arrival) : null,
+    actualArrival: row.actual_arrival ? str(row.actual_arrival) : null,
+    scheduledDeparture: row.scheduled_departure ? str(row.scheduled_departure) : null,
+    actualDeparture: row.actual_departure ? str(row.actual_departure) : null,
+    eta: row.eta ? str(row.eta) : null,
+    scheduledArrivalLocal: row.scheduled_arrival_local ? str(row.scheduled_arrival_local) : null,
+    actualArrivalLocal: row.actual_arrival_local ? str(row.actual_arrival_local) : null,
+    raw: asRecord(row.raw),
+    archived: Boolean(row.archived),
+    createdAt: str(row.created_at),
+    updatedAt: str(row.updated_at),
+  };
+}
+
+export function mapRelayLeg(row: Record<string, unknown>, stops: RelayStop[] = []): RelayLeg {
+  return {
+    id: str(row.id),
+    loadId: str(row.load_id),
+    tripId: str(row.trip_id),
+    facilitySequence: row.facility_sequence ? str(row.facility_sequence) : null,
+    executionStatus: row.execution_status ? str(row.execution_status) : null,
+    equipmentType: row.equipment_type ? str(row.equipment_type) : null,
+    miles: row.miles == null ? null : num(row.miles),
+    payout: row.payout == null ? null : num(row.payout),
+    tractorId: row.tractor_id ? str(row.tractor_id) : null,
+    trailerId: row.trailer_id ? str(row.trailer_id) : null,
+    driverNameRaw: row.driver_name_raw ? str(row.driver_name_raw) : null,
+    cpt: row.cpt ? str(row.cpt) : null,
+    contentHash: row.content_hash ? str(row.content_hash) : null,
+    raw: asRecord(row.raw),
+    archived: Boolean(row.archived),
+    lastSeenAt: row.last_seen_at ? str(row.last_seen_at) : null,
+    createdAt: str(row.created_at),
+    updatedAt: str(row.updated_at),
+    stops: [...stops].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0)),
+  };
+}
+
+export function mapRelayTrip(row: Record<string, unknown>, legs: RelayLeg[] = []): RelayTrip {
+  const raw = asRecord(row.raw);
+  return {
+    id: str(row.id),
+    tripId: str(row.trip_id),
+    section: normalizeRelaySection(row.section),
+    relayVersion: row.relay_version ? str(row.relay_version) : null,
+    lastSeenAt: row.last_seen_at ? str(row.last_seen_at) : null,
+    tourState: row.tour_state ? str(row.tour_state) : null,
+    executionStatus: row.execution_status ? str(row.execution_status) : null,
+    workType: row.work_type ? str(row.work_type) : null,
+    businessType: row.business_type ? str(row.business_type) : null,
+    startTime: row.start_time ? str(row.start_time) : null,
+    endTime: row.end_time ? str(row.end_time) : null,
+    totalMiles: row.total_miles == null ? null : num(row.total_miles),
+    payout: row.payout == null ? null : num(row.payout),
+    currency: row.currency ? str(row.currency) : null,
+    ratePerMile: row.rate_per_mile == null ? null : num(row.rate_per_mile),
+    driverNameRaw: row.driver_name_raw ? str(row.driver_name_raw) : null,
+    equipment: row.equipment ? str(row.equipment) : null,
+    status: row.status ? str(row.status) : null,
+    contentHash: row.content_hash ? str(row.content_hash) : null,
+    raw,
+    archived: Boolean(row.archived),
+    createdAt: str(row.created_at),
+    updatedAt: str(row.updated_at),
+    legs: [...legs].sort((a, b) => a.loadId.localeCompare(b.loadId)),
+    costItems: extractCostItems(raw),
+  };
+}
+
+export function mapRelaySectionSnapshot(row: Record<string, unknown>): RelaySectionSnapshot | null {
+  const section = normalizeRelaySection(row.section);
+  if (!section) return null;
+  const tripIds = Array.isArray(row.trip_ids)
+    ? row.trip_ids.map((id) => str(id)).filter(Boolean)
+    : [];
+  return {
+    section,
+    tripIds,
+    totalRecords: num(row.total_records),
+    crmCount: num(row.crm_count),
+    mismatch: Boolean(row.mismatch),
+    syncedAt: str(row.synced_at),
+    updatedAt: str(row.updated_at),
+  };
+}
+
+/** Join trip / leg / stop rows into nested RelayTrip[]. */
+export function assembleRelayTrips(
+  tripRows: Record<string, unknown>[],
+  legRows: Record<string, unknown>[],
+  stopRows: Record<string, unknown>[],
+): RelayTrip[] {
+  const stopsByLoad = new Map<string, RelayStop[]>();
+  for (const row of stopRows) {
+    const stop = mapRelayStop(row);
+    if (stop.archived) continue;
+    const list = stopsByLoad.get(stop.loadId) || [];
+    list.push(stop);
+    stopsByLoad.set(stop.loadId, list);
+  }
+
+  const legsByTrip = new Map<string, RelayLeg[]>();
+  for (const row of legRows) {
+    const loadId = str(row.load_id);
+    const leg = mapRelayLeg(row, stopsByLoad.get(loadId) || []);
+    if (leg.archived) continue;
+    const list = legsByTrip.get(leg.tripId) || [];
+    list.push(leg);
+    legsByTrip.set(leg.tripId, list);
+  }
+
+  return tripRows
+    .filter((row) => !row.archived)
+    .map((row) => mapRelayTrip(row, legsByTrip.get(str(row.trip_id)) || []))
+    .sort((a, b) => {
+      const at = a.startTime || a.lastSeenAt || a.updatedAt;
+      const bt = b.startTime || b.lastSeenAt || b.updatedAt;
+      return bt.localeCompare(at);
+    });
 }
 
 export function loadReportToRow(report: Partial<LoadReport> & { id?: string }): Record<string, unknown> {

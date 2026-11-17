@@ -71,6 +71,8 @@ export interface Driver {
 
 export type TripBucket = 'upcoming' | 'in_transit' | 'history';
 
+export type RelaySection = 'IN_TRANSIT' | 'UPCOMING' | 'HISTORY';
+
 export type StatusBarState =
   | 'pending'
   | 'arrived'
@@ -78,6 +80,106 @@ export type StatusBarState =
   | 'completed'
   | 'cancelled'
   | string;
+
+/** Cost / toll line from Relay tour aggregatedCostItems (stored on trip.raw). */
+export interface RelayCostItem {
+  name: string;
+  amount: number | null;
+}
+
+export interface RelayStop {
+  id: string;
+  stopId: string;
+  loadId: string;
+  tripId: string;
+  seq: number | null;
+  stopType: string | null;
+  facilityCode: string | null;
+  address: string | null;
+  city: string | null;
+  state: string | null;
+  zip: string | null;
+  timeZone: string | null;
+  scheduledArrival: string | null;
+  actualArrival: string | null;
+  scheduledDeparture: string | null;
+  actualDeparture: string | null;
+  eta: string | null;
+  scheduledArrivalLocal: string | null;
+  actualArrivalLocal: string | null;
+  raw: Record<string, unknown>;
+  archived: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RelayLeg {
+  id: string;
+  loadId: string;
+  tripId: string;
+  facilitySequence: string | null;
+  executionStatus: string | null;
+  equipmentType: string | null;
+  miles: number | null;
+  payout: number | null;
+  tractorId: string | null;
+  trailerId: string | null;
+  driverNameRaw: string | null;
+  cpt: string | null;
+  contentHash: string | null;
+  raw: Record<string, unknown>;
+  archived: boolean;
+  lastSeenAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  stops: RelayStop[];
+}
+
+export interface RelayTrip {
+  id: string;
+  tripId: string;
+  section: RelaySection | null;
+  relayVersion: string | null;
+  lastSeenAt: string | null;
+  tourState: string | null;
+  executionStatus: string | null;
+  workType: string | null;
+  businessType: string | null;
+  startTime: string | null;
+  endTime: string | null;
+  totalMiles: number | null;
+  payout: number | null;
+  currency: string | null;
+  ratePerMile: number | null;
+  driverNameRaw: string | null;
+  equipment: string | null;
+  status: string | null;
+  contentHash: string | null;
+  raw: Record<string, unknown>;
+  archived: boolean;
+  createdAt: string;
+  updatedAt: string;
+  legs: RelayLeg[];
+  costItems: RelayCostItem[];
+}
+
+export interface RelaySectionSnapshot {
+  section: RelaySection;
+  tripIds: string[];
+  totalRecords: number;
+  crmCount: number;
+  mismatch: boolean;
+  syncedAt: string;
+  updatedAt: string;
+}
+
+export type RelaySyncHealthStatus = 'healthy' | 'paused' | 'unknown';
+
+export interface RelaySyncHealth {
+  status: RelaySyncHealthStatus;
+  lastSyncedAt: string | null;
+  detail: string | null;
+}
 
 export interface Load {
   id: string;
