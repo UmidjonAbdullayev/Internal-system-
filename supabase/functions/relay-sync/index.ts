@@ -128,6 +128,56 @@ function json(data: unknown, status = 200) {
   });
 }
 
+type TripAlertEvent = {
+  kind: string;
+  tripId: string;
+  stopId?: string;
+  section?: string | null;
+  driver?: string | null;
+  prevDriver?: string | null;
+  scheduledAt?: string | null;
+  actualAt?: string | null;
+  nextStopLabel?: string | null;
+  nextStopDue?: string | null;
+  lateReason?: string | null;
+  facility?: string | null;
+  startTime?: string | null;
+  timing?: "late" | "early" | "on_time" | null;
+};
+
+function arrivalTiming(
+  actualIso?: string | null,
+  scheduledIso?: string | null,
+): "late" | "early" | "on_time" | null {
+  if (!actualIso || !scheduledIso) return null;
+  const a = new Date(actualIso).getTime();
+  const s = new Date(scheduledIso).getTime();
+  if (Number.isNaN(a) || Number.isNaN(s)) return null;
+  const mins = Math.round((a - s) / 60000);
+  if (mins > 15) return "late";
+  if (mins < -15) return "early";
+  return "on_time";
+}
+
+async function emitTripAlerts(events: TripAlertEvent[]) {
+  if (!events.length) return;
+  const base = Deno.env.get("SUPABASE_URL");
+  const service = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!base || !service) return;
+  try {
+    await fetch(`${base}/functions/v1/trip-alerts`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${service}`,
+      },
+      body: JSON.stringify({ action: "status", events }),
+    });
+  } catch {
+    /* non-fatal */
+  }
+}
+
 function requireExtensionKey(req: Request): string | Response {
   const expected = Deno.env.get("RELAY_EXTENSION_API_KEY");
   if (!expected) {
@@ -431,6 +481,7 @@ Deno.serve(async (req: Request) => {
       tractor_id?: string | null;
       load_id?: string | null;
     }> = [];
+    const tripAlertEvents: TripAlertEvent[] = [];
 
     const { data: driverRows } = await sb
       .from("drivers")
@@ -445,6 +496,14 @@ Deno.serve(async (req: Request) => {
         continue;
       }
       const section = normalizeSection(trip.tab || trip.section);
+      const { data: prevTrip } = await sb
+        .from("relay_trips")
+        .select("trip_id, section, status, driver_name_raw, start_time, execution_status")
+        .eq("trip_id", tripId)
+        .maybeSingle();
+
+      const nextDriver = sanitizeDriverName(trip.driver);
+      const nextStatus = trip.status || trip.executionStatus || trip.tourState || null;
       const tripRow = {
         trip_id: tripId,
         section,
@@ -460,9 +519,9 @@ Deno.serve(async (req: Request) => {
         payout: trip.payout ?? null,
         currency: trip.currency ?? null,
         rate_per_mile: trip.ratePerMile ?? null,
-        driver_name_raw: sanitizeDriverName(trip.driver),
+        driver_name_raw: nextDriver,
         equipment: trip.equipment ?? null,
-        status: trip.status || trip.executionStatus || trip.tourState || null,
+        status: nextStatus,
         content_hash: trip.contentHash ?? null,
         raw: trip.raw ?? {},
         archived: false,
@@ -477,6 +536,64 @@ Deno.serve(async (req: Request) => {
       }
       tripsUpserted += 1;
       syncedTripIds.push(tripId);
+
+      const liveSection = section === "UPCOMING" || section === "IN_TRANSIT";
+      if (liveSection) {
+        if (!prevTrip && section === "UPCOMING") {
+          tripAlertEvents.push({
+            kind: "trip_booked",
+            tripId,
+            section,
+            driver: nextDriver,
+          });
+        }
+        if (
+          prevTrip &&
+          String(prevTrip.driver_name_raw || "") !== String(nextDriver || "") &&
+          (prevTrip.driver_name_raw || nextDriver)
+        ) {
+          tripAlertEvents.push({
+            kind: "driver_changed",
+            tripId,
+            section,
+            prevDriver: prevTrip.driver_name_raw,
+            driver: nextDriver,
+          });
+        }
+        const prevSt = String(prevTrip?.status || prevTrip?.execution_status || "").toLowerCase();
+        const nextSt = String(nextStatus || "").toLowerCase();
+        if (
+          /cancel/.test(nextSt) &&
+          !/cancel/.test(prevSt)
+        ) {
+          tripAlertEvents.push({
+            kind: "cancelled",
+            tripId,
+            section,
+            driver: nextDriver,
+          });
+        }
+        if (
+          (/deliver|complete/.test(nextSt) && !/deliver|complete/.test(prevSt)) ||
+          (String(section) === "IN_TRANSIT" && /deliver|complete/.test(nextSt) && !prevTrip)
+        ) {
+          // delivered handled below with stronger signals too
+        }
+        if (/deliver|complete/.test(nextSt) && !/deliver|complete/.test(prevSt)) {
+          tripAlertEvents.push({
+            kind: "delivered",
+            tripId,
+            section,
+            driver: nextDriver,
+          });
+        }
+      }
+
+      const orderedStops: Array<{
+        stopId: string;
+        stop: StopIn;
+        loadId: string;
+      }> = [];
 
       for (const leg of trip.legs || []) {
         const loadId = String(leg?.loadId || "").trim().toUpperCase();
@@ -510,6 +627,15 @@ Deno.serve(async (req: Request) => {
         for (const stop of leg.stops || []) {
           const seq = stop.seq ?? 0;
           const stopId = `${tripId}:${loadId}:${seq}`;
+          orderedStops.push({ stopId, stop, loadId });
+          const { data: prevStop } = await sb
+            .from("relay_stops")
+            .select(
+              "stop_id, actual_arrival, actual_departure, scheduled_arrival, facility_code, stop_type, late_reason",
+            )
+            .eq("stop_id", stopId)
+            .maybeSingle();
+
           const stopRow = {
             stop_id: stopId,
             load_id: loadId,
@@ -538,6 +664,51 @@ Deno.serve(async (req: Request) => {
           });
           if (stopErr) errors.push(`Stop upsert ${stopId}: ${stopErr.message}`);
           else stopsUpserted += 1;
+
+          if (!liveSection) continue;
+          if (stop.actualArrival && !prevStop?.actual_arrival) {
+            tripAlertEvents.push({
+              kind: "arrived",
+              tripId,
+              stopId,
+              section,
+              facility: stop.facilityCode || stop.stopType || "Stop",
+              actualAt: stop.actualArrival,
+              scheduledAt: stop.scheduledArrival || prevStop?.scheduled_arrival,
+              timing: arrivalTiming(
+                stop.actualArrival,
+                stop.scheduledArrival || prevStop?.scheduled_arrival,
+              ),
+            });
+          }
+          if (stop.actualDeparture && !prevStop?.actual_departure) {
+            // next stop due = next in ordered list (filled after loop) — placeholder, refined below
+            tripAlertEvents.push({
+              kind: "departed",
+              tripId,
+              stopId,
+              section,
+              facility: stop.facilityCode || stop.stopType || "Stop",
+              nextStopLabel: null,
+              nextStopDue: null,
+            });
+          }
+        }
+      }
+
+      // Fill next-stop info on departed events for this trip
+      if (liveSection && orderedStops.length) {
+        for (let i = 0; i < orderedStops.length; i += 1) {
+          const cur = orderedStops[i];
+          const next = orderedStops[i + 1];
+          for (const ev of tripAlertEvents) {
+            if (ev.kind === "departed" && ev.stopId === cur.stopId && ev.tripId === tripId) {
+              ev.nextStopLabel = next
+                ? String(next.stop.facilityCode || next.stop.stopType || `Stop ${next.stop.seq}`)
+                : "—";
+              ev.nextStopDue = next?.stop.scheduledArrival || null;
+            }
+          }
         }
       }
     }
@@ -645,7 +816,7 @@ Deno.serve(async (req: Request) => {
       const { data: existing, error: findErr } = await sb
         .from("loads")
         .select(
-          "id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, tractor_id, driver_id, status_bar_state, status_stop_index, arrival_actual, arrival_scheduled, arrival_address, trip_bucket, parent_trip_id, driver_name_raw, pickup_location, delivery_location, rate_gross",
+          "id, load_id, load_status, payment_status, content_hash, status_history, trailer_id, tractor_id, driver_id, status_bar_state, status_stop_index, arrival_actual, arrival_scheduled, arrival_address, trip_bucket, parent_trip_id, driver_name_raw, pickup_location, delivery_location, rate_gross, late_reason, late_reason_at, notes",
         )
         .eq("load_id", load.load_id)
         .maybeSingle();
@@ -717,6 +888,69 @@ Deno.serve(async (req: Request) => {
         });
       }
 
+      // Dispatch trip alerts from load-level live changes (Upcoming / In Transit only)
+      const bucket = String(load.trip_bucket || existing?.trip_bucket || "").toLowerCase();
+      const liveBucket = bucket === "upcoming" || bucket === "in_transit";
+      const tripKey = String(load.parent_trip_id || existing?.parent_trip_id || load.load_id);
+      if (liveBucket) {
+        if (!existing && bucket === "upcoming") {
+          tripAlertEvents.push({
+            kind: "trip_booked",
+            tripId: tripKey,
+            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
+            driver: driverName,
+          });
+        }
+        if (
+          existing &&
+          existing.load_status !== load.load_status &&
+          /cancel/i.test(String(load.load_status))
+        ) {
+          tripAlertEvents.push({
+            kind: "cancelled",
+            tripId: tripKey,
+            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
+            driver: driverName,
+          });
+        }
+        if (
+          existing &&
+          existing.load_status !== load.load_status &&
+          /deliver|complete/i.test(String(load.load_status))
+        ) {
+          tripAlertEvents.push({
+            kind: "delivered",
+            tripId: tripKey,
+            section: "IN_TRANSIT",
+            driver: driverName,
+          });
+        }
+        if (
+          existing &&
+          String(existing.driver_name_raw || "") !== String(driverName || "") &&
+          (existing.driver_name_raw || driverName)
+        ) {
+          tripAlertEvents.push({
+            kind: "driver_changed",
+            tripId: tripKey,
+            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
+            prevDriver: existing.driver_name_raw,
+            driver: driverName,
+          });
+        }
+        // Late reason from notes pattern "Late: …" when newly appearing
+        const notesText = String(load.notes || "");
+        const lateMatch = notesText.match(/late\s*:\s*(.+)$/i);
+        if (lateMatch && !existing?.late_reason) {
+          tripAlertEvents.push({
+            kind: "late_reason",
+            tripId: tripKey,
+            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
+            lateReason: lateMatch[1].trim().slice(0, 200),
+          });
+        }
+      }
+
       const row = {
         load_id: load.load_id,
         amazon_ref_id: load.amazon_ref_id ?? null,
@@ -761,6 +995,16 @@ Deno.serve(async (req: Request) => {
         source: "amazon_relay",
         is_stale: false,
         updated_at: now,
+        late_reason: (() => {
+          const m = String(load.notes || "").match(/late\s*:\s*(.+)$/i);
+          if (m) return m[1].trim().slice(0, 500);
+          return existing?.late_reason ?? null;
+        })(),
+        late_reason_at: (() => {
+          const m = String(load.notes || "").match(/late\s*:\s*(.+)$/i);
+          if (m && !existing?.late_reason) return now;
+          return existing?.late_reason_at ?? null;
+        })(),
       };
 
       if (!existing) {
@@ -1029,6 +1273,17 @@ Deno.serve(async (req: Request) => {
       })
       .eq("id", run.id);
 
+    // Deduplicate trip alert events by kind+trip+stop
+    const seenAlert = new Set<string>();
+    const uniqueAlerts: TripAlertEvent[] = [];
+    for (const ev of tripAlertEvents) {
+      const key = `${ev.kind}:${ev.tripId}:${ev.stopId || ""}`;
+      if (seenAlert.has(key)) continue;
+      seenAlert.add(key);
+      uniqueAlerts.push(ev);
+    }
+    await emitTripAlerts(uniqueAlerts);
+
     return json({
       success: true,
       run_id: run.id,
@@ -1048,6 +1303,7 @@ Deno.serve(async (req: Request) => {
       section_counts: sectionCounts,
       errors,
       notifications,
+      trip_alerts_queued: uniqueAlerts.length,
     });
   } catch (err) {
     return json({ success: false, error: String(err) }, 500);
