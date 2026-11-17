@@ -27,6 +27,10 @@ Set `SUPABASE_ANON_KEY` in `shared/config.js` from that project's Settings → A
 6. Open Relay **Trips** (Upcoming / In Transit / History) plus **Payments**. Checklist updates as pages are detected. **v1.3.0** soft sync: keep using Relay while sync runs (popup progress; typical full pass **45–90s**). History walks **This week / Last week** (or Last 14 days) filters. Trips scan ~every 4–6 min with jitter; Payments on a longer cadence (~20–30 min). Delivery dates no longer invent Dec 31 / year-2044 junk. **v1.2.x** auto-expand + `T-…` upserts still apply.
 7. After updating this folder: `chrome://extensions` → **Reload** on Internal Sys — Amazon Relay Sync → refresh any open Relay tabs → **GO LIVE** (or Force scan).
 
+## v1.3.7 notes
+
+- **Expand no-op fix**: 1.3.6’s chevron matcher required `button` + detected blue/`aria-expanded` and often matched nothing; list-parent DOM scopes also invented “already open” internals. 1.3.7 finds the blue `>` / SVG left of the shipment id, falls back to the trip-id chip for parent accordion, and scopes internals to the card only. Still never clicks Assign Driver / driver links.
+
 ## v1.3.6 notes
 
 - **Safe two-level expand**: parent `T-…` rows open via a dedicated toggle only; internal legs open via the **blue chevron** beside the shipment id. Whole-row clicks are gone (they opened **Available drivers** / Assign Driver in 1.3.5). Skip when the control is unclear; never click driver links or Assign Driver dropdowns.
