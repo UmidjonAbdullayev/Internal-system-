@@ -121,6 +121,8 @@ const DEFAULT_STATE = {
   /** After pause: Syncing… until first complete live snapshots + HISTORY catch-up */
   reconnectSyncing: false,
   pendingCatchUpMissing: [],
+  /** When true, push all trips (ignore version/hash) until backfill completes. */
+  forceResync: false,
   catchUp: {
     active: false,
     missingTripIds: [],

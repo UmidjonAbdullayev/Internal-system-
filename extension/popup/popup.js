@@ -44,16 +44,24 @@ function render(state) {
     state.paymentsScanInProgress ||
     state.reconnectSyncing ||
     state.catchUp?.active ||
+    state.forceResync ||
     phase === 'syncing' ||
-    phase === 'catch-up';
+    phase === 'catch-up' ||
+    phase === 'history-push' ||
+    phase === 'force-resync' ||
+    phase === 'history-backfill';
   const phaseLabel =
-    state.reconnectSyncing || phase === 'syncing'
-      ? 'Syncing with Relay…'
-      : state.catchUp?.active || phase === 'catch-up'
-        ? 'Catch-up…'
-        : busy && phase !== 'near-live'
-          ? `${phase}…`
-          : phase;
+    phase === 'history-push'
+      ? prog.detail || 'History push…'
+      : state.forceResync || phase === 'force-resync'
+        ? 'Force re-sync…'
+        : state.reconnectSyncing || phase === 'syncing'
+          ? 'Syncing with Relay…'
+          : state.catchUp?.active || phase === 'catch-up'
+            ? 'Catch-up…'
+            : busy && phase !== 'near-live'
+              ? `${phase}…`
+              : phase;
   $('sync-phase').textContent = phaseLabel;
   $('sync-bar-fill').style.width = `${busy || pct ? pct : 0}%`;
   const durationNote =

@@ -17,6 +17,8 @@ import {
   FLUSH_BATCH_SIZE,
   FLUSH_BACKOFF_BASE_MS,
   FLUSH_BACKOFF_MAX_MS,
+  HISTORY_PUSH_BATCH_SIZE,
+  HISTORY_PUSH_RETRIES,
   TYPICAL_FULL_SYNC_SECONDS,
   RAW_CAPTURES_KEY,
   TRIP_HASH_KEY,
@@ -25,6 +27,8 @@ import {
   SCHEDULE_MIN,
   isTripsBoardUrl,
   HISTORY_SKIP_TTL_MS,
+  SECTION_SNAPSHOT_KEY,
+  HISTORY_BACKFILL_KEY,
 } from '../shared/config.js';
 import { getState, setState, updateSection, ensureClientId } from '../shared/state.js';
 import {
@@ -393,6 +397,44 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: true, state: await getState() });
         return;
       }
+      if (msg?.type === 'FORCE_RESYNC') {
+        // Ignore version/hash — re-push all Upcoming + In Transit + History backfill.
+        // Does not enable Telegram (TELEGRAM_ALERTS_ENABLED stays OFF).
+        await chrome.storage.local.set({
+          [SECTION_SNAPSHOT_KEY]: { IN_TRANSIT: {}, UPCOMING: {}, HISTORY: {} },
+          [HISTORY_BACKFILL_KEY]: {
+            done: false,
+            windowIndex: 0,
+            from: 0,
+            tripsAccum: 0,
+            crmAccum: 0,
+            totalWindows: 0,
+          },
+        });
+        await setState({
+          forceResync: true,
+          historyBackfillDone: false,
+          historyBackfillProgress: {
+            week: 1,
+            totalWeeks: 0,
+            trips: 0,
+            crmTrips: 0,
+            label: 'force re-sync',
+          },
+          syncProgress: {
+            phase: 'force-resync',
+            detail: 'Force re-sync — ignoring version/hash; History backfill restarting…',
+            percent: 5,
+            startedAt: new Date().toISOString(),
+          },
+          nextDueAt: { IN_TRANSIT: 0, UPCOMING: 0, HISTORY: 0 },
+        });
+        await refreshOpenTabs();
+        void alwaysOnTick({ force: true, forceResync: true });
+        void flushToEdge();
+        sendResponse({ ok: true, state: await getState() });
+        return;
+      }
       if (msg?.type === 'RELAY_CAPTURE') {
         sendResponse({ ok: true });
         void handleCapture(msg);
@@ -531,12 +573,19 @@ async function handleTripsDiff(diff) {
     log(`skip CRM push for ${tileCountTab}: template wrong / overlap`);
     return;
   }
-  const toPush = [...newTrips, ...changedTrips];
+  const st = await getState();
+  const forceResync = Boolean(diff.forceResync || st.forceResync);
+  // Change-only (version/hash) unless force re-sync or catch-up found set.
+  const toPush = forceResync
+    ? [...(trips || [])]
+    : catchUp
+      ? [...(trips || [])]
+      : [...newTrips, ...changedTrips];
 
-  // Always send full section trip payloads + optional snapshot to new CRM model
-  if ((trips && trips.length) || snapshot) {
-    const json = await pushTripsModelImmediate(trips || toPush, snapshot, tileCountTab, {
+  if (toPush.length || snapshot) {
+    const json = await pushTripsModelImmediate(toPush, snapshot, tileCountTab, {
       catchUp: Boolean(catchUp),
+      forceResync,
     });
     if (json?.live_missing?.length) {
       const prev = (await getState()).pendingCatchUpMissing || [];
@@ -546,8 +595,8 @@ async function handleTripsDiff(diff) {
         ],
       });
     }
-  } else if (toPush.length) {
-    await pushTripsImmediate(toPush, {
+  } else if (newTrips.length || changedTrips.length) {
+    await pushTripsImmediate([...newTrips, ...changedTrips], {
       reason: 'always-on',
       tileCountTab,
       changeKinds: {
@@ -584,6 +633,26 @@ async function postRelaySnapshot(body, extensionApiKey, label) {
     throw new Error(json.error || `HTTP ${res.status}`);
   }
   return json;
+}
+
+async function postRelaySnapshotWithRetry(body, extensionApiKey, label, retries = HISTORY_PUSH_RETRIES) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const t0 = Date.now();
+      const json = await postRelaySnapshot(body, extensionApiKey, label);
+      const ms = Date.now() - t0;
+      log(`${label} ok in ${ms}ms (attempt ${attempt}/${retries})`);
+      return { json, durationMs: ms };
+    } catch (err) {
+      lastErr = err;
+      log(`${label} attempt ${attempt}/${retries} failed: ${err?.message || err}`);
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 async function beginCatchUpOnEdge(missingTripIds) {
@@ -632,43 +701,127 @@ async function pushTripsModelImmediate(trips, snapshot, tileCountTab, opts = {})
   const state = await getState();
   if (!state.live || !state.extensionApiKey) return null;
 
-  const edgeTrips = await tripsToEdgePayload(trips);
-  const loads = tripsToCrmLoads(trips);
+  const list = Array.isArray(trips) ? trips : [];
+  const batchSize = Math.max(1, HISTORY_PUSH_BATCH_SIZE || 25);
+  const chunks = [];
+  for (let i = 0; i < list.length; i += batchSize) {
+    chunks.push(list.slice(i, i + batchSize));
+  }
+  // Snapshot-only request when no trips to push (e.g. HISTORY change-only no-op + snapshot).
+  if (!chunks.length && snapshot) chunks.push([]);
+
   const clientId = await ensureClientId();
+  const isHistory = String(tileCountTab || '').toUpperCase() === 'HISTORY';
+  const totalBatches = chunks.length;
+  let lastJson = null;
+  let okBatches = 0;
+  let failedBatches = 0;
+  const batchErrors = [];
+  const allLoads = [];
 
   try {
-    const json = await postRelaySnapshot(
-      {
-        client_id: clientId,
-        trips: edgeTrips,
-        catchUp: Boolean(opts.catchUp),
-        ...(snapshot ? { snapshot } : {}),
-      },
-      state.extensionApiKey,
-      `relay-snapshot ${tileCountTab || ''}${opts.catchUp ? ' catch-up' : ''}`,
-    );
-    if (json.section_counts) {
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const isLast = i === chunks.length - 1;
+      // Attach snapshot only on the final batch so live reconcile sees all upserts first.
+      const batchSnapshot = isLast && snapshot ? snapshot : null;
+      const edgeTrips = chunk.length ? await tripsToEdgePayload(chunk) : [];
+      if (chunk.length) allLoads.push(...tripsToCrmLoads(chunk));
+
+      if (isHistory && totalBatches > 0) {
+        const pct = Math.min(95, Math.round(((i + 0.5) / totalBatches) * 100));
+        await setState({
+          syncProgress: {
+            phase: 'history-push',
+            detail: `History push ${i + 1}/${totalBatches} batches`,
+            percent: pct,
+          },
+        });
+      }
+
+      const label = `relay-snapshot ${tileCountTab || ''} batch ${i + 1}/${totalBatches}${
+        opts.catchUp ? ' catch-up' : ''
+      }`;
+      try {
+        const { json, durationMs } = await postRelaySnapshotWithRetry(
+          {
+            client_id: clientId,
+            trips: edgeTrips,
+            catchUp: Boolean(opts.catchUp),
+            forceResync: Boolean(opts.forceResync),
+            ...(batchSnapshot ? { snapshot: batchSnapshot } : {}),
+          },
+          state.extensionApiKey,
+          label,
+        );
+        log(
+          `${label} duration=${durationMs}ms trips=${edgeTrips.length}` +
+            (durationMs > 5000 ? ' (slow >5s)' : ''),
+        );
+        lastJson = json;
+        okBatches += 1;
+        if (json?.section_counts) {
+          const stNow = await getState();
+          await setState({
+            sectionCounts: {
+              ...(stNow.sectionCounts || {}),
+              ...json.section_counts,
+            },
+            lastSyncAt: new Date().toISOString(),
+          });
+        }
+      } catch (err) {
+        // One failed batch must not abort the rest.
+        failedBatches += 1;
+        const msg = `${label}: ${err?.message || err}`;
+        batchErrors.push(msg);
+        log(`CRM push batch isolated failure: ${msg}`);
+      }
+    }
+
+    if (isHistory && totalBatches > 0) {
       await setState({
-        sectionCounts: {
-          ...(state.sectionCounts || {}),
-          ...json.section_counts,
+        syncProgress: {
+          phase: failedBatches && !okBatches ? 'error' : 'history-push',
+          detail:
+            failedBatches > 0
+              ? `History push done — ${okBatches}/${totalBatches} ok, ${failedBatches} failed`
+              : `History push ${totalBatches}/${totalBatches} batches`,
+          percent: failedBatches && !okBatches ? 0 : 100,
         },
-        lastSyncAt: new Date().toISOString(),
       });
     }
+
+    if (!okBatches && failedBatches) {
+      throw new Error(batchErrors[0] || 'all batches failed');
+    }
+
+    if (batchErrors.length) {
+      const st = await getState();
+      await setState({
+        syncErrors: [
+          ...(st.syncErrors || []).slice(-19),
+          ...batchErrors.slice(-5).map((error) => ({
+            at: new Date().toISOString(),
+            error: `CRM push failed: ${error}`,
+          })),
+        ],
+      });
+    }
+
     // Legacy loads path for existing CRM UI (legs as loads with parent_trip_id)
-    if (loads.length) {
-      await ingestCollection({ section: 'tours', loads, detail_detected: true });
+    if (allLoads.length) {
+      await ingestCollection({ section: 'tours', loads: allLoads, detail_detected: true });
       void flushToEdge();
     }
     await updateSection('tours', {
-      state: 'Synced',
-      lastError: null,
+      state: failedBatches ? 'Error' : 'Synced',
+      lastError: failedBatches ? batchErrors[0] : null,
       lastCollectedAt: new Date().toISOString(),
     });
     // Dedicated heartbeat may be asleep with the SW; sync success also implies alive.
     void pushExtensionAlive('ok', snapshot?.section ? `sync:${snapshot.section}` : 'sync');
-    return json;
+    return lastJson;
   } catch (err) {
     const friendly = `CRM push failed: ${err?.message || err}`;
     log(friendly);
@@ -683,8 +836,8 @@ async function pushTripsModelImmediate(trips, snapshot, tileCountTab, opts = {})
       state: 'Error',
       lastError: friendly,
     });
-    if (loads.length) {
-      await ingestCollection({ section: 'tours', loads, detail_detected: true });
+    if (allLoads.length) {
+      await ingestCollection({ section: 'tours', loads: allLoads, detail_detected: true });
     }
     const delay = flushBackoffMs;
     flushBackoffMs = Math.min(FLUSH_BACKOFF_MAX_MS, flushBackoffMs * 2);

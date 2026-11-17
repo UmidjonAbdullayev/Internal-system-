@@ -101,10 +101,24 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    const upsertStarted = Date.now();
     const upserted = await upsertTrips(sb, tripsIn, now, {
       catchUp,
-      forceHistory: catchUp,
+      forceHistory: catchUp || Boolean(body.forceHistory),
     });
+    const upsertMs = Date.now() - upsertStarted;
+    console.log(
+      JSON.stringify({
+        msg: "relay-snapshot upsert",
+        trips: tripsIn.length,
+        section: snapshot?.section || null,
+        catchUp,
+        duration_ms: upsertMs,
+        trips_upserted: upserted.tripsUpserted,
+        legs_upserted: upserted.legsUpserted,
+        stops_upserted: upserted.stopsUpserted,
+      }),
+    );
     errors.push(...upserted.errors);
 
     if (catchUp && upserted.syncedTripIds.length) {
@@ -142,147 +156,181 @@ Deno.serve(async (req: Request) => {
         const syncedAt = snapshot.syncedAt || now;
         const inSnapshot = new Set(tripIds);
 
-        const { data: sectionRows, count: priorCount } = await sb
-          .from("relay_trips")
-          .select("trip_id, status, section", { count: "exact" })
-          .eq("section", section)
-          .eq("archived", false);
+        // HISTORY: store trip IDs + section only — never reconcile (window ⊂ full CRM history).
+        if (section === "HISTORY") {
+          const { count: crmCount } = await sb
+            .from("relay_trips")
+            .select("trip_id", { count: "exact", head: true })
+            .eq("section", "HISTORY")
+            .eq("archived", false)
+            .neq("status", "removed_from_relay");
 
-        // Never apply empty section sync if CRM previously had trips in this section.
-        if (tripIds.length === 0 && (priorCount || 0) > 0) {
-          const msg =
-            `Skipped empty ${section} snapshot: CRM had ${priorCount} trip(s); refusing wipe`;
-          console.warn(msg);
-          errors.push(msg);
+          await sb.from("relay_section_snapshots").upsert(
+            {
+              section,
+              trip_ids: tripIds,
+              total_records: totalRecords,
+              crm_count: crmCount ?? tripIds.length,
+              mismatch: false,
+              synced_at: syncedAt,
+              updated_at: now,
+            },
+            { onConflict: "section" },
+          );
+          sectionCounts[section] = {
+            relay: tripIds.length,
+            crm: crmCount ?? tripIds.length,
+            mismatch: false,
+          };
           await markSyncAttempt(sb, section, {
+            last_successful_sync_at: syncedAt,
             last_attempt_at: now,
             syncing: false,
-            last_error: msg,
+            last_error: null,
           });
-          sectionCounts[section] = {
-            relay: 0,
-            crm: priorCount || 0,
-            mismatch: true,
-          };
-          return json({
-            success: true,
-            trips_upserted: upserted.tripsUpserted,
-            legs_upserted: upserted.legsUpserted,
-            stops_upserted: upserted.stopsUpserted,
-            snapshot_moved: 0,
-            snapshot_removed: 0,
-            synced_trip_ids: upserted.syncedTripIds,
-            section_counts: sectionCounts,
-            empty_snapshot_skipped: true,
-            errors,
-          });
-        }
-
-        for (const row of sectionRows || []) {
-          if (inSnapshot.has(row.trip_id)) continue;
-          if (LIVE_SECTIONS.has(section)) {
-            liveMissing.push(row.trip_id);
-            // Normal cycle: mark awaiting — History page1 next cycle reconciles
-            const { error } = await sb
-              .from("relay_trips")
-              .update({
-                status: "moved_awaiting_section",
-                updated_at: now,
-              })
-              .eq("trip_id", row.trip_id);
-            if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
-            else {
-              snapshotMoved += 1;
-              await recordTripEvent(sb, {
-                trip_id: row.trip_id,
-                event_type: "moved_awaiting_section",
-                from_section: section,
-                to_section: section,
-                from_status: row.status,
-                to_status: "moved_awaiting_section",
-              });
-            }
-          } else {
-            const { error } = await sb
-              .from("relay_trips")
-              .update({ status: "moved_awaiting_section", updated_at: now })
-              .eq("trip_id", row.trip_id);
-            if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
-            else snapshotMoved += 1;
-          }
-        }
-
-        // Only auto-remove after 10m when NOT in an active catch-up (catch-up owns removals)
-        const { data: cuActive } = await sb
-          .from("relay_catch_up")
-          .select("active")
-          .eq("id", 1)
-          .maybeSingle();
-        if (!cuActive?.active) {
-          const cutoff = new Date(Date.now() - REMOVED_AFTER_MS).toISOString();
-          const { data: stale } = await sb
+        } else {
+          const { data: sectionRows, count: priorCount } = await sb
             .from("relay_trips")
-            .select("trip_id")
-            .eq("archived", false)
-            .eq("status", "moved_awaiting_section")
-            .lt("last_seen_at", cutoff);
+            .select("trip_id, status, section", { count: "exact" })
+            .eq("section", section)
+            .eq("archived", false);
 
-          for (const row of stale || []) {
+          // Never apply empty section sync if CRM previously had trips in this section.
+          if (tripIds.length === 0 && (priorCount || 0) > 0) {
+            const msg =
+              `Skipped empty ${section} snapshot: CRM had ${priorCount} trip(s); refusing wipe`;
+            console.warn(msg);
+            errors.push(msg);
+            await markSyncAttempt(sb, section, {
+              last_attempt_at: now,
+              syncing: false,
+              last_error: msg,
+            });
+            sectionCounts[section] = {
+              relay: 0,
+              crm: priorCount || 0,
+              mismatch: true,
+            };
+            return json({
+              success: true,
+              trips_upserted: upserted.tripsUpserted,
+              legs_upserted: upserted.legsUpserted,
+              stops_upserted: upserted.stopsUpserted,
+              snapshot_moved: 0,
+              snapshot_removed: 0,
+              synced_trip_ids: upserted.syncedTripIds,
+              section_counts: sectionCounts,
+              empty_snapshot_skipped: true,
+              errors,
+            });
+          }
+
+          for (const row of sectionRows || []) {
             if (inSnapshot.has(row.trip_id)) continue;
-            const { error } = await sb
-              .from("relay_trips")
-              .update({
-                status: "removed_from_relay",
-                section: "HISTORY",
-                needs_review: true,
-                updated_at: now,
-              })
-              .eq("trip_id", row.trip_id);
-            if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
-            else {
-              snapshotRemoved += 1;
-              await recordTripEvent(sb, {
-                trip_id: row.trip_id,
-                event_type: "removed_from_relay",
-                from_section: section,
-                to_section: "HISTORY",
-                from_status: "moved_awaiting_section",
-                to_status: "removed_from_relay",
-              });
+            if (LIVE_SECTIONS.has(section)) {
+              liveMissing.push(row.trip_id);
+              // Normal cycle: mark awaiting — History page1 next cycle reconciles
+              const { error } = await sb
+                .from("relay_trips")
+                .update({
+                  status: "moved_awaiting_section",
+                  updated_at: now,
+                })
+                .eq("trip_id", row.trip_id);
+              if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
+              else {
+                snapshotMoved += 1;
+                await recordTripEvent(sb, {
+                  trip_id: row.trip_id,
+                  event_type: "moved_awaiting_section",
+                  from_section: section,
+                  to_section: section,
+                  from_status: row.status,
+                  to_status: "moved_awaiting_section",
+                });
+              }
+            } else {
+              const { error } = await sb
+                .from("relay_trips")
+                .update({ status: "moved_awaiting_section", updated_at: now })
+                .eq("trip_id", row.trip_id);
+              if (error) errors.push(`Snapshot move ${row.trip_id}: ${error.message}`);
+              else snapshotMoved += 1;
             }
           }
+
+          // Only auto-remove after 10m when NOT in an active catch-up (catch-up owns removals)
+          const { data: cuActive } = await sb
+            .from("relay_catch_up")
+            .select("active")
+            .eq("id", 1)
+            .maybeSingle();
+          if (!cuActive?.active) {
+            const cutoff = new Date(Date.now() - REMOVED_AFTER_MS).toISOString();
+            const { data: stale } = await sb
+              .from("relay_trips")
+              .select("trip_id")
+              .eq("archived", false)
+              .eq("status", "moved_awaiting_section")
+              .lt("last_seen_at", cutoff);
+
+            for (const row of stale || []) {
+              if (inSnapshot.has(row.trip_id)) continue;
+              const { error } = await sb
+                .from("relay_trips")
+                .update({
+                  status: "removed_from_relay",
+                  section: "HISTORY",
+                  needs_review: true,
+                  updated_at: now,
+                })
+                .eq("trip_id", row.trip_id);
+              if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
+              else {
+                snapshotRemoved += 1;
+                await recordTripEvent(sb, {
+                  trip_id: row.trip_id,
+                  event_type: "removed_from_relay",
+                  from_section: section,
+                  to_section: "HISTORY",
+                  from_status: "moved_awaiting_section",
+                  to_status: "removed_from_relay",
+                });
+              }
+            }
+          }
+
+          const { count: crmCount } = await sb
+            .from("relay_trips")
+            .select("trip_id", { count: "exact", head: true })
+            .eq("section", section)
+            .eq("archived", false)
+            .neq("status", "removed_from_relay")
+            .neq("status", "moved_awaiting_section");
+
+          const crm = crmCount ?? 0;
+          const mismatch = crm !== tripIds.length;
+          await sb.from("relay_section_snapshots").upsert(
+            {
+              section,
+              trip_ids: tripIds,
+              total_records: totalRecords,
+              crm_count: crm,
+              mismatch,
+              synced_at: syncedAt,
+              updated_at: now,
+            },
+            { onConflict: "section" },
+          );
+          sectionCounts[section] = { relay: tripIds.length, crm, mismatch };
+
+          await markSyncAttempt(sb, section, {
+            last_successful_sync_at: syncedAt,
+            last_attempt_at: now,
+            syncing: false,
+            last_error: null,
+          });
         }
-
-        const { count: crmCount } = await sb
-          .from("relay_trips")
-          .select("trip_id", { count: "exact", head: true })
-          .eq("section", section)
-          .eq("archived", false)
-          .neq("status", "removed_from_relay")
-          .neq("status", "moved_awaiting_section");
-
-        const crm = crmCount ?? 0;
-        const mismatch = crm !== tripIds.length;
-        await sb.from("relay_section_snapshots").upsert(
-          {
-            section,
-            trip_ids: tripIds,
-            total_records: totalRecords,
-            crm_count: crm,
-            mismatch,
-            synced_at: syncedAt,
-            updated_at: now,
-          },
-          { onConflict: "section" },
-        );
-        sectionCounts[section] = { relay: tripIds.length, crm, mismatch };
-
-        await markSyncAttempt(sb, section, {
-          last_successful_sync_at: syncedAt,
-          last_attempt_at: now,
-          syncing: false,
-          last_error: null,
-        });
       }
     }
 
@@ -297,6 +345,7 @@ Deno.serve(async (req: Request) => {
       live_missing: liveMissing,
       section_counts: sectionCounts,
       catch_up: catchUp,
+      duration_ms: upsertMs,
       errors,
     });
   } catch (err) {
