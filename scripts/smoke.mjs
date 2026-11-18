@@ -2,6 +2,7 @@
 /**
  * Startup smoke: build preview + load /loads once.
  * Fails if React boot crashes (blank #root) or page errors fire.
+ * Always process.exit — vite preview must not keep the CI job alive.
  */
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11,12 +12,27 @@ const PORT = Number(process.env.SMOKE_PORT || 4173);
 const BASE = `http://127.0.0.1:${PORT}`;
 const PATH = process.env.SMOKE_PATH || '/loads?tab=in_transit';
 
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 function startPreview() {
+  // detached + new process group so we can SIGKILL the whole vite/npx tree.
   const child = spawn(
     'npx',
     ['vite', 'preview', '--host', '127.0.0.1', '--port', String(PORT), '--strictPort'],
     {
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
       env: { ...process.env, BROWSER: 'none' },
     },
   );
@@ -40,22 +56,7 @@ function startPreview() {
       if (!ready) throw new Error('vite preview did not become ready');
     },
     stop() {
-      if (child.exitCode != null) return;
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        /* ignore */
-      }
-      // Ensure CI does not hang if vite ignores SIGTERM.
-      setTimeout(() => {
-        if (child.exitCode == null) {
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            /* ignore */
-          }
-        }
-      }, 2000).unref?.();
+      killTree(child.pid);
     },
   };
 }
@@ -63,6 +64,7 @@ function startPreview() {
 async function main() {
   const preview = startPreview();
   let browser;
+  let ok = false;
   try {
     await preview.waitReady();
     browser = await chromium.launch({ headless: true });
@@ -78,7 +80,6 @@ async function main() {
       throw new Error(`HTTP ${res?.status()} loading ${PATH}`);
     }
 
-    // Give React a beat to mount (or crash into ErrorBoundary / blank root).
     await delay(1500);
 
     const snapshot = await page.evaluate(() => {
@@ -101,16 +102,17 @@ async function main() {
     if (snapshot.showsErrorUi) {
       throw new Error(`ErrorBoundary rendered: ${snapshot.textSample}`);
     }
-    // App chrome should paint even while data hydrates.
     if (!/Loads|Trips|Drivers|Overview|Gross|Reports|Payments/i.test(snapshot.textSample)) {
       throw new Error(`Unexpected empty shell text: ${snapshot.textSample || '(empty)'}`);
     }
 
     console.log(`smoke ok: ${PATH} → "${snapshot.textSample.slice(0, 80)}…"`);
+    ok = true;
   } finally {
     if (browser) await browser.close().catch(() => {});
     preview.stop();
   }
+  process.exit(ok ? 0 : 1);
 }
 
 main().catch((err) => {
