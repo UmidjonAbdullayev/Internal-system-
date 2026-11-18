@@ -1161,7 +1161,8 @@ async function flushToEdge() {
     );
 
     if (!loads.length && !payments.length) {
-      for (const id of ['tours', 'load_detail', 'payments']) {
+      // Do not touch payments — invoice sync owns that section (lastPayments*).
+      for (const id of ['tours', 'load_detail']) {
         if (latest.sections[id]?.state === 'Collecting' && latest.sections[id]?.lastCollectedAt) {
           await updateSection(id, { state: 'Synced', lastError: null });
         }
@@ -1292,7 +1293,7 @@ async function flushToEdge() {
         syncedSections.add('tours');
         if (loads.some((l) => l.trailer_id || l.tractor_id)) syncedSections.add('load_detail');
       }
-      if (payments.length) syncedSections.add('payments');
+      // Legacy DOM pendingPayments must not overwrite invoice Synced · HH:MM · N label
       for (const id of syncedSections) {
         await updateSection(id, {
           state: 'Synced',
@@ -1311,7 +1312,7 @@ async function flushToEdge() {
     } else if (lastErr) {
       const friendly =
         syncErrors[syncErrors.length - 1]?.error || String(lastErr?.message || lastErr);
-      for (const section of ['tours', 'load_detail', 'payments']) {
+      for (const section of ['tours', 'load_detail']) {
         if (latest.sections[section]?.state === 'Collecting') {
           await updateSection(section, { state: 'Error', lastError: friendly });
         }
