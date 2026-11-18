@@ -5,6 +5,7 @@ import {
   useCallback,
   useMemo,
   useEffect,
+  useRef,
   type ReactNode,
 } from 'react';
 import type {
@@ -38,28 +39,21 @@ import {
   type InvoiceTripRow,
   type PaymentsSummaryRow,
 } from '@/lib/invoiceMoney';
+import { supabase } from '@/lib/supabase';
 import {
-  supabase,
-  fetchAllPages,
-  RELAY_TRIP_LIST_COLUMNS,
-  RELAY_LEG_LIST_COLUMNS,
-  RELAY_STOP_LIST_COLUMNS,
-} from '@/lib/supabase';
-import {
-  assembleRelayTrips,
   loadReportToRow,
   mapActivity,
   mapCharge,
   mapDriver,
   mapFee,
   mapLoad,
-  mapLoadReport,
   mapRelayPayment,
   mapRelaySectionSnapshot,
   mapSettlement,
   mapExtensionHeartbeat,
   mapSyncState,
   mapTripSummary,
+  mapRelayStop,
 } from '@/lib/supabaseMappers';
 import { computeSyncHealth } from '@/lib/relayTrips';
 import { DEFAULT_HISTORY_RETENTION_DAYS } from '@/lib/liveMirrors';
@@ -69,6 +63,14 @@ import {
   type LoadOverrideRow,
   type ReportLoadRow,
 } from '@/lib/reportLoadMoney';
+import {
+  fetchLoadsLean,
+  fetchRelayTripsScoped,
+  fetchReportLoads,
+  fetchStopsForTripIds,
+  countRelayTripsBySection,
+} from '@/lib/crmFetch';
+import type { RelayLeg, RelayStop } from '@/types';
 import { toast } from 'sonner';
 
 interface CompanySettings {
@@ -130,7 +132,15 @@ interface DataContextValue {
   dataSource: 'supabase' | 'local';
   dataReady: boolean;
   dataError: string | null;
+  /** True while a background hydrate chunk is in flight (progress bar). */
+  dataFetching: boolean;
+  /** Server-side section counts (head:exact) — avoids scanning all trips for tabs. */
+  tripSectionCounts: { in_transit: number; upcoming: number; history: number; all: number };
   refreshData: () => Promise<void>;
+  /** Ensure History trips (paged) are loaded for the date window. */
+  ensureHistoryTrips: (opts?: { endFrom?: string; endTo?: string }) => Promise<void>;
+  /** Lazy-load stops for trip ids (expand / history backfill). */
+  ensureTripStops: (tripIds: string[]) => Promise<void>;
   // Drivers
   addDriver: (driver: Omit<Driver, 'id' | 'createdAt' | 'updatedAt'>) => Driver;
   updateDriver: (id: string, patch: Partial<Driver>) => void;
@@ -225,306 +235,388 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [companySettings, setCompanySettings] = useState<CompanySettings>(EMPTY_SETTINGS);
   const [dataReady, setDataReady] = useState(false);
   const [dataError, setDataError] = useState<string | null>(null);
+  const [dataFetching, setDataFetching] = useState(false);
+  const [tripSectionCounts, setTripSectionCounts] = useState({
+    in_transit: 0,
+    upcoming: 0,
+    history: 0,
+    all: 0,
+  });
+  const historyLoadedRef = useRef({ from: '', to: '', loaded: false });
 
-  /** Hydrate from Supabase iiyqkdjwxlnfqvlidbqr — live Relay extension data. */
-  const hydrate = useCallback(async () => {
-    let relayTripsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
-    let relayLegsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
-    let relayStopsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
-    let heartbeatEarly: {
-      data: Record<string, unknown> | null;
-      error: { message: string } | null;
-    } | null = null;
-    try {
-      [relayTripsRes, relayLegsRes, relayStopsRes, heartbeatEarly] = await Promise.all([
-        fetchAllPages<Record<string, unknown>>((from, to) =>
-          supabase
-            .from('relay_trips')
-            .select(RELAY_TRIP_LIST_COLUMNS)
-            .eq('archived', false)
-            .order('last_seen_at', { ascending: false })
-            .range(from, to),
-        ),
-        fetchAllPages<Record<string, unknown>>((from, to) =>
-          supabase
-            .from('relay_legs')
-            .select(RELAY_LEG_LIST_COLUMNS)
-            .eq('archived', false)
-            .range(from, to),
-        ),
-        fetchAllPages<Record<string, unknown>>((from, to) =>
-          supabase
-            .from('relay_stops')
-            .select(RELAY_STOP_LIST_COLUMNS)
-            .eq('archived', false)
-            .order('seq', { ascending: true })
-            .range(from, to),
-        ),
-        supabase.from('extension_heartbeat').select('*').eq('id', 1).maybeSingle(),
-      ]);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : 'Relay hydrate failed';
-      console.error('Relay trips hydrate threw', message);
-      setDataError(message);
-      setDataReady(true);
-      // Keep previous relayTrips — never blank the Trips page on error.
-      // Still refresh liveness so offline chip stays honest during hydrate failures.
-      void supabase
-        .from('extension_heartbeat')
-        .select('*')
-        .eq('id', 1)
-        .maybeSingle()
-        .then(({ data, error }) => {
-          if (error) return;
-          setExtensionHeartbeat(data ? mapExtensionHeartbeat(data as Record<string, unknown>) : null);
+  const mergeTripsById = useCallback((prev: RelayTrip[], next: RelayTrip[]) => {
+    const map = new Map<string, RelayTrip>();
+    for (const t of prev) map.set(t.tripId, t);
+    for (const t of next) {
+      const existing = map.get(t.tripId);
+      // Prefer next legs; keep existing stops if next arrived without stops.
+      if (existing && t.legs.every((l) => l.stops.length === 0) && existing.legs.some((l) => l.stops.length > 0)) {
+        map.set(t.tripId, {
+          ...t,
+          legs: t.legs.map((leg) => {
+            const old = existing.legs.find((x) => x.loadId === leg.loadId);
+            return old && leg.stops.length === 0 ? { ...leg, stops: old.stops } : leg;
+          }),
         });
-      return;
+      } else {
+        map.set(t.tripId, t);
+      }
     }
+    return [...map.values()];
+  }, []);
 
-    const [
-      driversRes,
-      loadsRes,
-      relaySnapshotsRes,
-      syncRunsRes,
-      loadReportsRes,
-      reportLoadsRes,
-      loadOverridesRes,
-      feesRes,
-      chargesRes,
-      settlementsRes,
-      settlementLoadsRes,
-      settlementChargesRes,
-      paymentsRes,
-      invoicesRes,
-      invoiceTripsRes,
-      paymentsSummaryRes,
-      activityRes,
-      syncStateRes,
-      summariesRes,
-      retentionRes,
-    ] = await Promise.all([
-      supabase.from('drivers').select('*').order('created_at', { ascending: true }),
-      supabase.from('loads').select('*').order('created_at', { ascending: false }),
-      supabase.from('relay_section_snapshots').select('*'),
-      supabase
-        .from('relay_sync_runs')
-        .select('finished_at, status, error_count')
-        .order('started_at', { ascending: false })
-        .limit(5),
-      supabase.from('load_reports').select('*').order('pickup_date', { ascending: true }),
-      fetchAllPages<Record<string, unknown>>((from, to) =>
+  const applyTripCounts = useCallback(async () => {
+    try {
+      const c = await countRelayTripsBySection();
+      const all = c.IN_TRANSIT + c.UPCOMING + c.HISTORY;
+      setTripSectionCounts({
+        in_transit: c.IN_TRANSIT,
+        upcoming: c.UPCOMING,
+        history: c.HISTORY,
+        all,
+      });
+    } catch {
+      /* ignore count failures */
+    }
+  }, []);
+
+  /**
+   * Progressive hydrate:
+   * Wave A — shell + live trips (IT/UP) → dataReady (Loads usable ~1s)
+   * Wave B — money + invoices + lean loads in background (Reports/Gross)
+   * History — on demand via ensureHistoryTrips (paged 100)
+   */
+  const hydrate = useCallback(async (opts?: { soft?: boolean }) => {
+    const soft = Boolean(opts?.soft);
+    setDataFetching(true);
+    try {
+      const [
+        driversRes,
+        heartbeatRes,
+        relaySnapshotsRes,
+        syncRunsRes,
+        syncStateRes,
+        retentionRes,
+        activityRes,
+        liveTripsRes,
+      ] = await Promise.all([
+        supabase.from('drivers').select('*').order('created_at', { ascending: true }),
+        supabase.from('extension_heartbeat').select('*').eq('id', 1).maybeSingle(),
+        supabase.from('relay_section_snapshots').select('*'),
         supabase
-          .from('report_loads')
-          .select('*')
-          .order('tour_start_la', { ascending: true })
-          .range(from, to),
-      ),
-      supabase.from('load_overrides').select('*'),
-      supabase.from('driver_fees').select('*'),
-      supabase.from('one_time_charges').select('*'),
-      supabase.from('settlements').select('*'),
-      supabase.from('settlement_loads').select('*'),
-      supabase.from('settlement_charges').select('*'),
-      supabase.from('payments').select('*').order('payment_date', { ascending: false }),
-      // FIXTURE-* verification seeds never hydrate into CRM totals/reports
-      supabase
-        .from('invoices')
-        .select('*')
-        .not('invoice_id', 'like', 'FIXTURE-%')
-        .order('week_start', { ascending: false }),
-      supabase
-        .from('invoice_trips')
-        .select('*')
-        .not('invoice_id', 'like', 'FIXTURE-%'),
-      supabase.from('payments_summary').select('*').eq('id', 1).maybeSingle(),
-      supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
-      supabase.from('sync_state').select('*'),
-      supabase.from('trip_summaries').select('*').order('end_time', { ascending: false }).limit(500),
-      supabase.from('retention_settings').select('*').eq('id', 1).maybeSingle(),
-    ]);
-    const heartbeatRes = heartbeatEarly;
+          .from('relay_sync_runs')
+          .select('finished_at, status, error_count')
+          .order('started_at', { ascending: false })
+          .limit(5),
+        supabase.from('sync_state').select('*'),
+        supabase.from('retention_settings').select('*').eq('id', 1).maybeSingle(),
+        supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
+        fetchRelayTripsScoped({
+          sections: ['IN_TRANSIT', 'UPCOMING'],
+          includeStops: true,
+          limit: 500,
+        }),
+      ]);
 
-    const err =
-      driversRes.error ||
-      loadsRes.error ||
-      loadReportsRes.error ||
-      feesRes.error ||
-      chargesRes.error ||
-      settlementsRes.error ||
-      settlementLoadsRes.error ||
-      settlementChargesRes.error ||
-      paymentsRes.error ||
-      invoicesRes.error ||
-      invoiceTripsRes.error ||
-      activityRes.error;
-    const relayErr =
-      relayTripsRes.error ||
-      relayLegsRes.error ||
-      relayStopsRes.error ||
-      relaySnapshotsRes.error ||
-      syncRunsRes.error;
-    if (err) {
-      console.error('Supabase CRM hydrate failed', err.message);
-      setDataError(err.message);
-      setDataReady(true);
-      return;
-    }
-    if (relayErr) {
-      console.error('Relay trips hydrate failed', relayErr.message);
-      setDataError(relayErr.message);
-      setDataReady(true);
-      // Keep previous relayTrips / snapshots — never replace with [] on error.
-      // Still apply heartbeat + sync_state so offline/delayed banners stay accurate.
-      if (heartbeatRes && !heartbeatRes.error) {
+      if (driversRes.error) {
+        console.error('Supabase CRM hydrate failed', driversRes.error.message);
+        setDataError(driversRes.error.message);
+        setDataReady(true);
+        return;
+      }
+
+      if (liveTripsRes.error) {
+        console.error('Live trips hydrate failed', liveTripsRes.error);
+        setDataError(liveTripsRes.error);
+      } else {
+        setDataError(null);
+        setRelayTrips((prev) =>
+          soft
+            ? mergeTripsById(prev, liveTripsRes.trips)
+            : mergeTripsById(
+                prev.filter((t) => t.section === 'HISTORY'),
+                liveTripsRes.trips,
+              ),
+        );
+      }
+
+      setDrivers((driversRes.data || []).map((r) => mapDriver(r as Record<string, unknown>)));
+
+      const snapshots = (relaySnapshotsRes.data || [])
+        .map((r) => mapRelaySectionSnapshot(r as Record<string, unknown>))
+        .filter((s): s is RelaySectionSnapshot => Boolean(s));
+      const lastRunFinished =
+        (syncRunsRes.data || [])
+          .map((r) => (r as { finished_at?: string | null }).finished_at)
+          .find((v) => Boolean(v)) || null;
+      setRelaySnapshots(snapshots);
+      setSectionSnapshots(snapshots);
+      setRelaySyncHealth(computeSyncHealth(snapshots, liveTripsRes.trips, lastRunFinished));
+
+      if (!syncStateRes.error) {
+        setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
+      }
+      if (!heartbeatRes.error) {
         setExtensionHeartbeat(
           heartbeatRes.data
             ? mapExtensionHeartbeat(heartbeatRes.data as Record<string, unknown>)
             : null,
         );
       }
-      if (!syncStateRes.error) {
-        setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
-      }
-      return;
-    }
-
-    setDataError(null);
-
-    const loadIdsBySettlement = new Map<string, string[]>();
-    for (const row of settlementLoadsRes.data || []) {
-      const sid = String((row as { settlement_id: string }).settlement_id);
-      const lid = String((row as { load_id: string }).load_id);
-      const list = loadIdsBySettlement.get(sid) || [];
-      list.push(lid);
-      loadIdsBySettlement.set(sid, list);
-    }
-
-    const chargesBySettlement = new Map<string, Settlement['charges']>();
-    for (const row of settlementChargesRes.data || []) {
-      const r = row as Record<string, unknown>;
-      const sid = String(r.settlement_id);
-      const list = chargesBySettlement.get(sid) || [];
-      list.push({
-        id: String(r.id),
-        chargeName: String(r.charge_name ?? ''),
-        category: r.category as Settlement['charges'][number]['category'],
-        calculationType: r.calculation_type as Settlement['charges'][number]['calculationType'],
-        originalAmountOrRate: Number(r.original_amount_or_rate) || 0,
-        appliedAmount: Number(r.applied_amount) || 0,
-        frequency: r.frequency as Settlement['charges'][number]['frequency'],
-        chargeType: r.charge_type as Settlement['charges'][number]['chargeType'],
-        sourceId: String(r.source_id ?? ''),
-      });
-      chargesBySettlement.set(sid, list);
-    }
-
-    const paymentsBySettlement = new Map<string, Settlement['payments']>();
-    const mappedPayments = (paymentsRes.data || []).map((r) =>
-      mapRelayPayment(r as Record<string, unknown>),
-    );
-    for (const p of mappedPayments) {
-      if (!p.settlementId) continue;
-      const list = paymentsBySettlement.get(p.settlementId) || [];
-      list.push({
-        id: p.id,
-        date: p.paymentDate,
-        method: p.method,
-        referenceId: p.referenceId,
-        amount: p.amount,
-        notes: p.notes,
-      });
-      paymentsBySettlement.set(p.settlementId, list);
-    }
-
-    setDrivers((driversRes.data || []).map((r) => mapDriver(r as Record<string, unknown>)));
-    setLoads((loadsRes.data || []).map((r) => mapLoad(r as Record<string, unknown>)));
-
-    const assembledTrips = assembleRelayTrips(
-      relayTripsRes.data,
-      relayLegsRes.data,
-      relayStopsRes.data,
-    );
-    const snapshots = (relaySnapshotsRes.data || [])
-      .map((r) => mapRelaySectionSnapshot(r as Record<string, unknown>))
-      .filter((s): s is RelaySectionSnapshot => Boolean(s));
-    const lastRunFinished =
-      (syncRunsRes.data || [])
-        .map((r) => (r as { finished_at?: string | null }).finished_at)
-        .find((v) => Boolean(v)) || null;
-    setRelayTrips(assembledTrips);
-    setRelaySnapshots(snapshots);
-    setSectionSnapshots(snapshots);
-    setRelaySyncHealth(computeSyncHealth(snapshots, assembledTrips, lastRunFinished));
-
-    if (!syncStateRes.error) {
-      setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
-    }
-    if (!heartbeatRes.error) {
-      setExtensionHeartbeat(
-        heartbeatRes.data
-          ? mapExtensionHeartbeat(heartbeatRes.data as Record<string, unknown>)
-          : null,
-      );
-    }
-    if (!summariesRes.error) {
-      setTripSummaries(
-        (summariesRes.data || []).map((r) => mapTripSummary(r as Record<string, unknown>)),
-      );
-    }
-    if (!retentionRes.error && retentionRes.data) {
-      const days = Number(
-        (retentionRes.data as { history_retention_days?: number }).history_retention_days,
-      );
-      if (Number.isFinite(days) && days >= 1) {
-        setCompanySettings((prev) => ({ ...prev, historyRetentionDays: days }));
-      }
-    }
-
-    setLoadReports(
-      (loadReportsRes.data || []).map((r) => mapLoadReport(r as Record<string, unknown>)),
-    );
-    if (!reportLoadsRes.error) {
-      setReportLoads((reportLoadsRes.data || []).map((r) => mapReportLoad(r)));
-    } else {
-      console.error('report_loads hydrate failed', reportLoadsRes.error.message);
-    }
-    if (!loadOverridesRes.error) {
-      setLoadOverrides(
-        (loadOverridesRes.data || []).map((r) => mapLoadOverride(r as Record<string, unknown>)),
-      );
-    }
-    setPayments(mappedPayments);
-    setInvoices(
-      excludeFixtureInvoices(
-        (invoicesRes.data || []).map((r) => mapInvoice(r as Record<string, unknown>)),
-      ),
-    );
-    setInvoiceTrips(
-      excludeFixtureInvoices(
-        (invoiceTripsRes.data || []).map((r) => mapInvoiceTrip(r as Record<string, unknown>)),
-      ),
-    );
-    setPaymentsSummary(
-      paymentsSummaryRes.data
-        ? mapPaymentsSummary(paymentsSummaryRes.data as Record<string, unknown>)
-        : null,
-    );
-    setDriverFees((feesRes.data || []).map((r) => mapFee(r as Record<string, unknown>)));
-    setOneTimeCharges((chargesRes.data || []).map((r) => mapCharge(r as Record<string, unknown>)));
-    setSettlements(
-      (settlementsRes.data || []).map((r) => {
-        const row = r as Record<string, unknown>;
-        const id = String(row.id);
-        return mapSettlement(
-          row,
-          loadIdsBySettlement.get(id) || [],
-          chargesBySettlement.get(id) || [],
-          paymentsBySettlement.get(id) || [],
+      if (!retentionRes.error && retentionRes.data) {
+        const days = Number(
+          (retentionRes.data as { history_retention_days?: number }).history_retention_days,
         );
+        if (Number.isFinite(days) && days >= 1) {
+          setCompanySettings((prev) => ({ ...prev, historyRetentionDays: days }));
+        }
+      }
+      if (!activityRes.error) {
+        setActivityLogs((activityRes.data || []).map((r) => mapActivity(r as Record<string, unknown>)));
+      }
+
+      // Wave A complete — layout + Loads/Trips usable.
+      setDataReady(true);
+      void applyTripCounts();
+
+      // Wave B — money + payments + lean loads (does not block first paint).
+      void (async () => {
+        const [
+          reportLoadsRes,
+          loadOverridesRes,
+          invoicesRes,
+          invoiceTripsRes,
+          paymentsSummaryRes,
+          paymentsRes,
+          feesRes,
+          chargesRes,
+          settlementsRes,
+          settlementLoadsRes,
+          settlementChargesRes,
+          summariesRes,
+          loadsRes,
+        ] = await Promise.all([
+          fetchReportLoads(),
+          supabase.from('load_overrides').select('*'),
+          supabase
+            .from('invoices')
+            .select('*')
+            .not('invoice_id', 'like', 'FIXTURE-%')
+            .order('week_start', { ascending: false }),
+          supabase.from('invoice_trips').select('*').not('invoice_id', 'like', 'FIXTURE-%'),
+          supabase.from('payments_summary').select('*').eq('id', 1).maybeSingle(),
+          supabase.from('payments').select('*').order('payment_date', { ascending: false }),
+          supabase.from('driver_fees').select('*'),
+          supabase.from('one_time_charges').select('*'),
+          supabase.from('settlements').select('*'),
+          supabase.from('settlement_loads').select('*'),
+          supabase.from('settlement_charges').select('*'),
+          supabase
+            .from('trip_summaries')
+            .select('*')
+            .order('end_time', { ascending: false })
+            .limit(500),
+          fetchLoadsLean(),
+        ]);
+
+        if (!reportLoadsRes.error) {
+          setReportLoads(reportLoadsRes.data.map((r) => mapReportLoad(r)));
+        } else {
+          console.error('report_loads hydrate failed', reportLoadsRes.error);
+        }
+        if (!loadOverridesRes.error) {
+          setLoadOverrides(
+            (loadOverridesRes.data || []).map((r) => mapLoadOverride(r as Record<string, unknown>)),
+          );
+        }
+
+        const loadIdsBySettlement = new Map<string, string[]>();
+        for (const row of settlementLoadsRes.data || []) {
+          const sid = String((row as { settlement_id: string }).settlement_id);
+          const lid = String((row as { load_id: string }).load_id);
+          const list = loadIdsBySettlement.get(sid) || [];
+          list.push(lid);
+          loadIdsBySettlement.set(sid, list);
+        }
+
+        const chargesBySettlement = new Map<string, Settlement['charges']>();
+        for (const row of settlementChargesRes.data || []) {
+          const r = row as Record<string, unknown>;
+          const sid = String(r.settlement_id);
+          const list = chargesBySettlement.get(sid) || [];
+          list.push({
+            id: String(r.id),
+            chargeName: String(r.charge_name ?? ''),
+            category: r.category as Settlement['charges'][number]['category'],
+            calculationType: r.calculation_type as Settlement['charges'][number]['calculationType'],
+            originalAmountOrRate: Number(r.original_amount_or_rate) || 0,
+            appliedAmount: Number(r.applied_amount) || 0,
+            frequency: r.frequency as Settlement['charges'][number]['frequency'],
+            chargeType: r.charge_type as Settlement['charges'][number]['chargeType'],
+            sourceId: String(r.source_id ?? ''),
+          });
+          chargesBySettlement.set(sid, list);
+        }
+
+        const paymentsBySettlement = new Map<string, Settlement['payments']>();
+        const mappedPayments = (paymentsRes.data || []).map((r) =>
+          mapRelayPayment(r as Record<string, unknown>),
+        );
+        for (const p of mappedPayments) {
+          if (!p.settlementId) continue;
+          const list = paymentsBySettlement.get(p.settlementId) || [];
+          list.push({
+            id: p.id,
+            date: p.paymentDate,
+            method: p.method,
+            referenceId: p.referenceId,
+            amount: p.amount,
+            notes: p.notes,
+          });
+          paymentsBySettlement.set(p.settlementId, list);
+        }
+
+        if (!paymentsRes.error) setPayments(mappedPayments);
+        if (!invoicesRes.error) {
+          setInvoices(
+            excludeFixtureInvoices(
+              (invoicesRes.data || []).map((r) => mapInvoice(r as Record<string, unknown>)),
+            ),
+          );
+        }
+        if (!invoiceTripsRes.error) {
+          setInvoiceTrips(
+            excludeFixtureInvoices(
+              (invoiceTripsRes.data || []).map((r) => mapInvoiceTrip(r as Record<string, unknown>)),
+            ),
+          );
+        }
+        if (!paymentsSummaryRes.error) {
+          setPaymentsSummary(
+            paymentsSummaryRes.data
+              ? mapPaymentsSummary(paymentsSummaryRes.data as Record<string, unknown>)
+              : null,
+          );
+        }
+        if (!feesRes.error) {
+          setDriverFees((feesRes.data || []).map((r) => mapFee(r as Record<string, unknown>)));
+        }
+        if (!chargesRes.error) {
+          setOneTimeCharges((chargesRes.data || []).map((r) => mapCharge(r as Record<string, unknown>)));
+        }
+        if (!settlementsRes.error) {
+          setSettlements(
+            (settlementsRes.data || []).map((r) => {
+              const row = r as Record<string, unknown>;
+              const id = String(row.id);
+              return mapSettlement(
+                row,
+                loadIdsBySettlement.get(id) || [],
+                chargesBySettlement.get(id) || [],
+                paymentsBySettlement.get(id) || [],
+              );
+            }),
+          );
+        }
+        if (!summariesRes.error) {
+          setTripSummaries(
+            (summariesRes.data || []).map((r) => mapTripSummary(r as Record<string, unknown>)),
+          );
+        }
+        if (!loadsRes.error) {
+          setLoads(loadsRes.data.map((r) => mapLoad(r)));
+        } else {
+          console.error('loads lean hydrate failed', loadsRes.error);
+        }
+      })();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Hydrate failed';
+      console.error('CRM hydrate threw', message);
+      setDataError(message);
+      setDataReady(true);
+    } finally {
+      setDataFetching(false);
+    }
+  }, [applyTripCounts, mergeTripsById]);
+
+  const ensureHistoryTrips = useCallback(
+    async (opts?: { endFrom?: string; endTo?: string }) => {
+      const endFrom = opts?.endFrom ?? '';
+      const endTo = opts?.endTo ?? '';
+      if (
+        historyLoadedRef.current.loaded &&
+        historyLoadedRef.current.from === endFrom &&
+        historyLoadedRef.current.to === endTo
+      ) {
+        return;
+      }
+      setDataFetching(true);
+      try {
+        // First page fast (100), then backfill remaining HISTORY without blocking UI.
+        const page = await fetchRelayTripsScoped({
+          sections: ['HISTORY'],
+          endFrom: endFrom || null,
+          endTo: endTo || null,
+          limit: 100,
+          offset: 0,
+          includeStops: true,
+        });
+        if (page.error) {
+          setDataError(page.error);
+          return;
+        }
+        setRelayTrips((prev) => mergeTripsById(prev, page.trips));
+        historyLoadedRef.current = { loaded: true, from: endFrom, to: endTo };
+
+        // Remaining history pages (stops included per chunk of 100).
+        let offset = 100;
+        for (;;) {
+          const more = await fetchRelayTripsScoped({
+            sections: ['HISTORY'],
+            endFrom: endFrom || null,
+            endTo: endTo || null,
+            limit: 100,
+            offset,
+            includeStops: true,
+          });
+          if (more.error || more.trips.length === 0) break;
+          setRelayTrips((prev) => mergeTripsById(prev, more.trips));
+          if (more.trips.length < 100) break;
+          offset += 100;
+        }
+        void applyTripCounts();
+      } finally {
+        setDataFetching(false);
+      }
+    },
+    [applyTripCounts, historyLoadedRef, mergeTripsById],
+  );
+
+  const ensureTripStops = useCallback(async (tripIds: string[]) => {
+    const missing = tripIds.filter(Boolean);
+    if (!missing.length) return;
+    const { data, error } = await fetchStopsForTripIds(missing);
+    if (error || !data.length) return;
+
+    const stopsByLoad = new Map<string, RelayStop[]>();
+    for (const row of data) {
+      const stop = mapRelayStop(row);
+      if (stop.archived) continue;
+      const list = stopsByLoad.get(stop.loadId) || [];
+      list.push(stop);
+      stopsByLoad.set(stop.loadId, list);
+    }
+
+    setRelayTrips((prev) =>
+      prev.map((trip) => {
+        if (!missing.includes(trip.tripId)) return trip;
+        const legs: RelayLeg[] = trip.legs.map((leg) => {
+          const stops = stopsByLoad.get(leg.loadId);
+          return stops ? { ...leg, stops } : leg;
+        });
+        return { ...trip, legs };
       }),
     );
-    setActivityLogs((activityRes.data || []).map((r) => mapActivity(r as Record<string, unknown>)));
-    setDataReady(true);
   }, []);
 
   useEffect(() => {
@@ -532,8 +624,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
     void hydrate().then(() => {
       if (cancelled) return;
     });
+    // Soft incremental refresh — live sections + money, keep History in memory.
     const timer = window.setInterval(() => {
-      if (!cancelled) void hydrate();
+      if (!cancelled) void hydrate({ soft: true });
     }, 30_000);
     return () => {
       cancelled = true;
@@ -849,6 +942,53 @@ export function DataProvider({ children }: { children: ReactNode }) {
         toast.error('Missing tour id');
         return;
       }
+      const ts = now();
+      const prevOverride = loadOverrides.find((o) => o.tourId === bare);
+      const prevReport = reportLoads.find((r) => r.tourId === bare);
+
+      // Optimistic UI — same fields Reports edits; money amazon_paid untouched.
+      setLoadOverrides((prev) => {
+        const next: LoadOverrideRow = {
+          tourId: bare,
+          driverName: patch.driverName ?? prevOverride?.driverName ?? null,
+          driverPaid: patch.driverPaid ?? prevOverride?.driverPaid ?? null,
+          comment: patch.comment ?? prevOverride?.comment ?? null,
+          dispatch: patch.dispatch ?? prevOverride?.dispatch ?? null,
+          mile: patch.mile ?? prevOverride?.mile ?? null,
+          broker: patch.broker ?? prevOverride?.broker ?? 'Amazon',
+          source: 'manual',
+          legacyReportIds: prevOverride?.legacyReportIds ?? [],
+          createdAt: prevOverride?.createdAt ?? ts,
+          updatedAt: ts,
+        };
+        const idx = prev.findIndex((o) => o.tourId === bare);
+        if (idx >= 0) {
+          const copy = [...prev];
+          copy[idx] = next;
+          return copy;
+        }
+        return [...prev, next];
+      });
+      if (prevReport) {
+        setReportLoads((prev) =>
+          prev.map((r) =>
+            r.tourId === bare
+              ? {
+                  ...r,
+                  driverName: patch.driverName ?? r.driverName,
+                  driverPaid: patch.driverPaid ?? r.driverPaid,
+                  comment: patch.comment ?? r.comment,
+                  dispatch: patch.dispatch ?? r.dispatch,
+                  mile: patch.mile ?? r.mile,
+                  broker: patch.broker ?? r.broker,
+                  hasOverride: true,
+                  overrideSource: 'manual',
+                }
+              : r,
+          ),
+        );
+      }
+
       const row = {
         tour_id: bare,
         driver_name: patch.driverName ?? null,
@@ -858,17 +998,23 @@ export function DataProvider({ children }: { children: ReactNode }) {
         mile: patch.mile ?? null,
         broker: patch.broker ?? 'Amazon',
         source: 'manual',
-        updated_at: now(),
+        updated_at: ts,
       };
       const { error } = await supabase.from('load_overrides').upsert(row, { onConflict: 'tour_id' });
       if (error) {
         toast.error(`Override save failed: ${error.message}`);
+        // Soft refresh money rows only
+        void fetchReportLoads().then((res) => {
+          if (!res.error) setReportLoads(res.data.map((r) => mapReportLoad(r)));
+        });
         return;
       }
       toast.success('Saved');
-      await hydrate();
+      void fetchReportLoads().then((res) => {
+        if (!res.error) setReportLoads(res.data.map((r) => mapReportLoad(r)));
+      });
     },
-    [hydrate],
+    [loadOverrides, reportLoads],
   );
 
   const addFee = useCallback(
@@ -1271,7 +1417,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
       dataSource: 'supabase',
       dataReady,
       dataError,
-      refreshData: hydrate,
+      dataFetching,
+      tripSectionCounts,
+      refreshData: () => hydrate(),
+      ensureHistoryTrips,
+      ensureTripStops,
       addDriver,
       updateDriver,
       deactivateDriver,
@@ -1328,7 +1478,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
       companySettings,
       dataReady,
       dataError,
+      dataFetching,
+      tripSectionCounts,
       hydrate,
+      ensureHistoryTrips,
+      ensureTripStops,
       addDriver,
       updateDriver,
       deactivateDriver,

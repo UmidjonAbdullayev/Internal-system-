@@ -15,8 +15,11 @@ import {
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react';
+import { useQueryClient } from '@tanstack/react-query';
 import { cn } from '@/lib/utils';
 import { useData } from '@/context/DataContext';
+import { crmKeys } from '@/lib/queryClient';
+import { countRelayTripsBySection, fetchRelayTripsScoped, fetchReportLoads } from '@/lib/crmFetch';
 
 const NAV = [
   { to: '/', label: 'Overview', icon: LayoutDashboard },
@@ -40,6 +43,31 @@ export function Sidebar({
   onToggle: () => void;
 }) {
   const { companySettings } = useData();
+  const queryClient = useQueryClient();
+
+  const prefetch = (to: string) => {
+    if (to === '/loads') {
+      void queryClient.prefetchQuery({
+        queryKey: crmKeys.liveTrips,
+        queryFn: () =>
+          fetchRelayTripsScoped({
+            sections: ['IN_TRANSIT', 'UPCOMING'],
+            includeStops: true,
+            limit: 200,
+          }),
+      });
+      void queryClient.prefetchQuery({
+        queryKey: crmKeys.tripCounts,
+        queryFn: () => countRelayTripsBySection(),
+      });
+    }
+    if (to === '/reports' || to === '/gross-board' || to === '/drivers') {
+      void queryClient.prefetchQuery({
+        queryKey: crmKeys.reportLoads(),
+        queryFn: () => fetchReportLoads(),
+      });
+    }
+  };
 
   return (
     <aside
@@ -68,6 +96,8 @@ export function Sidebar({
             key={item.to}
             to={item.to}
             end={item.to === '/'}
+            onMouseEnter={() => prefetch(item.to)}
+            onFocus={() => prefetch(item.to)}
             className={({ isActive }) =>
               cn(
                 'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all duration-150',
