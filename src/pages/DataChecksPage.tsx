@@ -6,11 +6,12 @@ import { Badge } from '@/components/ui/Badge';
 import { formatCurrency } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
 import {
+  compareCrmIncomeToMainInvoices,
   filterReportLoadsByWeek,
   sumWeekIncomeReconciled,
 } from '@/lib/reportLoadMoney';
 
-/** Real AZNG W46 invoice total (exclude SMOKE/FIXTURE). Acceptance: $295,660.37. */
+/** Real AZNG week totals (all AZNG rows) — comparison only; MAIN is largest. */
 const AMAZON_INVOICE_WEEK46 = 295660.37;
 const AMAZON_INVOICE_WEEK45 = 306609.2;
 
@@ -113,6 +114,12 @@ export function DataChecksPage() {
   const invoiceDelta45 = week45.amazon - AMAZON_INVOICE_WEEK45;
   const invoiceDelta = week46.amazon - AMAZON_INVOICE_WEEK46;
 
+  /** Per invoiced week: CRM income vs Amazon MAIN invoice (red if |Δ| > $1). */
+  const weekVsMain = useMemo(
+    () => compareCrmIncomeToMainInvoices(reportLoads, invoices),
+    [invoices, reportLoads],
+  );
+
   return (
     <div>
       <PageHeader
@@ -155,8 +162,62 @@ export function DataChecksPage() {
 
       <Card className="mb-6">
         <CardHeader>
+          <CardTitle>CRM income vs Amazon MAIN invoice (every invoiced week)</CardTitle>
+        </CardHeader>
+        <CardContent className="overflow-x-auto">
+          <table className="w-full text-sm min-w-[720px]">
+            <thead>
+              <tr className="border-b border-border text-left text-xs text-text-secondary">
+                <th className="py-2 pr-2">Week</th>
+                <th className="py-2 pr-2 text-right">CRM income</th>
+                <th className="py-2 pr-2 text-right">MAIN invoice</th>
+                <th className="py-2 pr-2 text-right">Δ</th>
+                <th className="py-2 pr-2">Trips</th>
+                <th className="py-2 pr-2">MAIN id</th>
+              </tr>
+            </thead>
+            <tbody>
+              {weekVsMain.map((w) => (
+                <tr key={`${w.amazonWeekYear}-${w.amazonWeek}`} className="border-b border-border/60">
+                  <td className="py-2 pr-2 font-medium">{w.weekLabel}</td>
+                  <td className="py-2 pr-2 text-right tabular-nums">{formatCurrency(w.crmIncome)}</td>
+                  <td className="py-2 pr-2 text-right tabular-nums">
+                    {formatCurrency(w.mainInvoiceAmount)}
+                  </td>
+                  <td
+                    className={`py-2 pr-2 text-right tabular-nums font-medium ${
+                      w.mismatch ? 'text-danger' : 'text-success'
+                    }`}
+                  >
+                    {formatCurrency(w.delta)}
+                    {w.mismatch ? ' ✗' : ''}
+                  </td>
+                  <td className="py-2 pr-2 tabular-nums">{w.incomeTripCount}</td>
+                  <td className="py-2 pr-2 text-xs font-mono truncate max-w-[140px]" title={w.mainInvoiceId}>
+                    {w.mainInvoiceId.slice(0, 12)}…
+                  </td>
+                </tr>
+              ))}
+              {!weekVsMain.length && (
+                <tr>
+                  <td colSpan={6} className="py-3 text-text-secondary">
+                    No invoiced weeks loaded yet.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          <p className="mt-3 text-xs text-text-secondary">
+            CRM income = Σ trip payouts (COMPLETED/TONU on MAIN). Red when |Δ| &gt; $1 vs MAIN
+            (largest AZNG invoice that week). Adj invoices are comparison-only.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card className="mb-6">
+        <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            Week 45/46 vs Amazon invoices
+            Week 45/46 detail (all AZNG invoice rows)
             <Badge status={Math.abs(invoiceDelta) < 1 ? 'Paid' : 'On Hold'} />
           </CardTitle>
         </CardHeader>
@@ -164,7 +225,7 @@ export function DataChecksPage() {
           <p>
             <span className="font-medium">Week45 income (Σ trip payouts):</span>{' '}
             {week45.count} trips · {formatCurrency(week45.income)} · Δ{' '}
-            {formatCurrency(invoiceDelta45)} vs invoice {formatCurrency(AMAZON_INVOICE_WEEK45)}
+            {formatCurrency(invoiceDelta45)} vs all-AZNG {formatCurrency(AMAZON_INVOICE_WEEK45)}
             {week45.adjustments > 0
               ? ` · adj invoices (comparison only) ${formatCurrency(week45.adjustments)}`
               : ''}
@@ -174,7 +235,7 @@ export function DataChecksPage() {
           <p>
             <span className="font-medium">Week46 income (Σ trip payouts):</span>{' '}
             {week46.count} trips · {formatCurrency(week46.income)} · Δ{' '}
-            {formatCurrency(invoiceDelta)} vs invoice {formatCurrency(AMAZON_INVOICE_WEEK46)}
+            {formatCurrency(invoiceDelta)} vs all-AZNG {formatCurrency(AMAZON_INVOICE_WEEK46)}
             {week46.adjustments > 0
               ? ` · adj invoices (comparison only) ${formatCurrency(week46.adjustments)}`
               : ''}
@@ -182,9 +243,7 @@ export function DataChecksPage() {
             {week46.expected > 0 ? ` · expected ${formatCurrency(week46.expected)}` : ''}
           </p>
           <p className="text-xs text-text-secondary">
-            Week income = SUM of trip payouts (completed/TONU on MAIN) — never invoice totals.
-            Invoices are comparison-only. Estimated week = final delivery LA. See{' '}
-            <code>docs/week-invoice-reconciliation.md</code>.
+            Prefer the MAIN table above for guardrails. All-AZNG totals include adjustment invoices.
           </p>
         </CardContent>
       </Card>

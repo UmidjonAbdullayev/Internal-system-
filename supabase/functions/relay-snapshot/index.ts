@@ -11,6 +11,7 @@ import {
   LIVE_SECTIONS,
   REMOVED_AFTER_MS,
   recordTripEvent,
+  recordIncomeStatusChange,
   isFullyCancelledTrip,
 } from "./shared.ts";
 import { upsertTrips } from "./upsert.ts";
@@ -431,7 +432,32 @@ Deno.serve(async (req: Request) => {
                   to_section: "HISTORY",
                   from_status: "moved_awaiting_section",
                   to_status: nextStatus != null ? String(nextStatus) : null,
-                  detail: { source: "stale_soft_remove", preserved_cancel: keepCancel },
+                  detail: {
+                    source: "stale_soft_remove",
+                    preserved_cancel: keepCancel,
+                    code_path: "relay-snapshot/index.ts:stale_soft_remove",
+                    reason: keepCancel
+                      ? "preserve_cancel_for_tonu"
+                      : "stale_moved_awaiting",
+                  },
+                });
+                await recordIncomeStatusChange(sb, {
+                  trip_id: row.trip_id,
+                  from_status: "moved_awaiting_section",
+                  to_status: nextStatus != null ? String(nextStatus) : null,
+                  from_execution: staleFull?.execution_status != null
+                    ? String(staleFull.execution_status)
+                    : null,
+                  to_execution: staleFull?.execution_status != null
+                    ? String(staleFull.execution_status)
+                    : null,
+                  payout: Number(staleFull?.payout) || 0,
+                  reason: keepCancel
+                    ? "soft_remove_preserve_cancel"
+                    : "soft_remove_to_removed_from_relay",
+                  code_path: "relay-snapshot/index.ts:stale_soft_remove",
+                  from_section: section,
+                  to_section: "HISTORY",
                 });
               }
             }

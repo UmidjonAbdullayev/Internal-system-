@@ -251,11 +251,72 @@ export function mainMenuKeyboard() {
         { text: "Find trip", callback_data: "menu:find" },
       ],
       [
+        { text: "Payments", callback_data: "menu:payments" },
         { text: "Driver groups", callback_data: "menu:groups" },
-        { text: "Help", callback_data: "menu:help" },
       ],
+      [{ text: "Help", callback_data: "menu:help" }],
     ],
   };
+}
+
+/** On-demand only: CRM income vs Amazon MAIN invoice per week (no auto messages). */
+export async function buildPaymentsIncomeVsMain(sb: SupabaseClient): Promise<string> {
+  const { data: invoices } = await sb
+    .from("invoices")
+    .select("invoice_id, amazon_week, amazon_week_year, week_label, week_start, amount")
+    .like("invoice_id", "AZNG%")
+    .order("amazon_week_year", { ascending: true })
+    .order("amazon_week", { ascending: true });
+
+  const byWeek = new Map<
+    string,
+    { week: number; year: number; label: string; mainId: string; mainAmt: number }
+  >();
+  for (const inv of invoices || []) {
+    const id = String(inv.invoice_id || "");
+    if (!/^AZNG[0-9A-F]/i.test(id) || id.startsWith("FIXTURE-")) continue;
+    const key = `${inv.amazon_week_year}-${inv.amazon_week}`;
+    const amt = Number(inv.amount) || 0;
+    const prev = byWeek.get(key);
+    if (!prev || amt > prev.mainAmt) {
+      byWeek.set(key, {
+        week: Number(inv.amazon_week) || 0,
+        year: Number(inv.amazon_week_year) || 0,
+        label: String(inv.week_label || `Week${inv.amazon_week}`),
+        mainId: id,
+        mainAmt: amt,
+      });
+    }
+  }
+
+  const { data: incomeRows } = await sb
+    .from("report_loads")
+    .select("amazon_week, amazon_week_year, amazon_paid, money_bucket")
+    .eq("money_bucket", "income");
+
+  const incomeByWeek = new Map<string, { sum: number; n: number }>();
+  for (const r of incomeRows || []) {
+    const key = `${r.amazon_week_year}-${r.amazon_week}`;
+    const cur = incomeByWeek.get(key) || { sum: 0, n: 0 };
+    cur.sum += Number(r.amazon_paid) || 0;
+    cur.n += 1;
+    incomeByWeek.set(key, cur);
+  }
+
+  const lines = ["💵 Payments — CRM income vs MAIN invoice", "(on demand · no auto alerts)", ""];
+  let anyMismatch = false;
+  for (const [key, main] of [...byWeek.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const crm = incomeByWeek.get(key) || { sum: 0, n: 0 };
+    const delta = Math.round((crm.sum - main.mainAmt) * 100) / 100;
+    const bad = Math.abs(delta) > 1;
+    if (bad) anyMismatch = true;
+    lines.push(
+      `${main.label}: CRM $${crm.sum.toFixed(2)} (${crm.n}) · MAIN $${main.mainAmt.toFixed(2)} · Δ $${delta.toFixed(2)}${bad ? " ✗" : " ✓"}`,
+    );
+  }
+  if (lines.length === 3) lines.push("No invoiced weeks found.");
+  lines.push("", anyMismatch ? "Mismatch: investigate Data checks / report_loads." : "All weeks within $1.");
+  return lines.join("\n").slice(0, 3500);
 }
 
 /** CRM drivers for /link buttons (name + DRV id). */
@@ -897,6 +958,11 @@ export async function handleCallback(
     }
     if (lines.length === 2) lines.push("None linked. In a group: /link then pick a driver.");
     await reply(botToken, chatId, lines.join("\n").slice(0, 3500), mainMenuKeyboard());
+    return;
+  }
+  if (data === "menu:payments") {
+    const text = await buildPaymentsIncomeVsMain(sb);
+    await reply(botToken, chatId, text, mainMenuKeyboard());
     return;
   }
 

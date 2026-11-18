@@ -801,14 +801,46 @@ Deno.serve(async (req: Request) => {
             if (error) errors.push(`Snapshot remove ${row.trip_id}: ${error.message}`);
             else {
               snapshotRemoved += 1;
+              const fromStatus = row.status != null ? String(row.status) : null;
+              const toStatus = nextStatus != null ? String(nextStatus) : null;
               await sb.from("trip_events").insert({
                 trip_id: row.trip_id,
-                event_type: "removed_from_relay",
+                event_type: keepCancel ? "cancelled_to_history" : "removed_from_relay",
                 from_section: section,
                 to_section: "HISTORY",
-                from_status: row.status,
-                to_status: "removed_from_relay",
+                from_status: fromStatus,
+                to_status: toStatus,
+                detail: {
+                  source: "stale_soft_remove",
+                  preserved_cancel: keepCancel,
+                  code_path: "relay-sync/index.ts:stale_soft_remove",
+                  reason: keepCancel
+                    ? "preserve_cancel_for_tonu"
+                    : "stale_soft_remove",
+                  from_execution: staleFull?.execution_status ?? null,
+                  to_execution: staleFull?.execution_status ?? null,
+                  payout: Number(staleFull?.payout) || 0,
+                  income_status_change: true,
+                },
               }).then(() => null, () => null);
+              // Explicit income audit row (old→new + reason + code path).
+              if (fromStatus !== toStatus) {
+                await sb.from("trip_events").insert({
+                  trip_id: row.trip_id,
+                  event_type: "income_status_change",
+                  from_section: section,
+                  to_section: "HISTORY",
+                  from_status: fromStatus,
+                  to_status: toStatus,
+                  detail: {
+                    reason: keepCancel
+                      ? "soft_remove_preserve_cancel"
+                      : "soft_remove_to_removed_from_relay",
+                    code_path: "relay-sync/index.ts:stale_soft_remove",
+                    payout: Number(staleFull?.payout) || 0,
+                  },
+                }).then(() => null, () => null);
+              }
             }
           }
 

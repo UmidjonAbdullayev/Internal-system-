@@ -127,21 +127,118 @@ export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
   };
 }
 
-/** Client fallback if view columns not yet migrated. */
-function deriveMoneyBucketFallback(row: Record<string, unknown>): MoneyBucket {
-  const status = String(row.status || '').toUpperCase();
-  const exec = String(row.execution_status || '').toUpperCase();
-  const mile = String(row.mile || '').toUpperCase();
-  const paid = Number(row.amazon_paid) || 0;
-  const isTonu =
+/**
+ * Canonical TONU / income-bucket classifier (mirrors report_loads SQL).
+ * Cancelled (status OR execution_status) with payout > 0 always counts as TONU.
+ * Soft-remove `removed_from_relay` must NOT drop TONU when execution_status is cancelled.
+ */
+export function isTonuTrip(input: {
+  status?: string | null;
+  executionStatus?: string | null;
+  mile?: string | null;
+  payout?: number | null;
+}): boolean {
+  const status = String(input.status || '').toUpperCase();
+  const exec = String(input.executionStatus || '').toUpperCase();
+  const mile = String(input.mile || '').toUpperCase();
+  const paid = Number(input.payout) || 0;
+  return (
     status.includes('TONU') ||
     exec.includes('TONU') ||
     mile.includes('TONU') ||
-    (paid > 0 && (status.includes('CANCEL') || exec.includes('CANCEL')));
-  const isIncome = status === 'COMPLETED' || isTonu;
-  if (!isIncome) return 'expected';
-  const weekSource = String(row.week_source || '');
-  return weekSource === 'invoice_main' ? 'income' : 'pending_invoice';
+    (paid > 0 && (status.includes('CANCEL') || exec.includes('CANCEL')))
+  );
+}
+
+/** Classify money_bucket from trip fields (same rules as report_loads view). */
+export function classifyMoneyBucket(input: {
+  status?: string | null;
+  executionStatus?: string | null;
+  mile?: string | null;
+  payout?: number | null;
+  weekSource?: string | null;
+}): MoneyBucket {
+  const status = String(input.status || '').toUpperCase();
+  const tonu = isTonuTrip(input);
+  const isIncomeEligible = status === 'COMPLETED' || tonu;
+  if (!isIncomeEligible) return 'expected';
+  return String(input.weekSource || '') === 'invoice_main' ? 'income' : 'pending_invoice';
+}
+
+/** Client fallback if view columns not yet migrated. */
+function deriveMoneyBucketFallback(row: Record<string, unknown>): MoneyBucket {
+  return classifyMoneyBucket({
+    status: row.status == null ? null : String(row.status),
+    executionStatus: row.execution_status == null ? null : String(row.execution_status),
+    mile: row.mile == null ? null : String(row.mile),
+    payout: Number(row.amazon_paid) || 0,
+    weekSource: row.week_source == null ? null : String(row.week_source),
+  });
+}
+
+/** CRM week income vs Amazon MAIN invoice for every invoiced week. */
+export function compareCrmIncomeToMainInvoices(
+  reportLoads: ReportLoadRow[],
+  invoices: InvoiceRow[],
+): Array<{
+  amazonWeek: number;
+  amazonWeekYear: number;
+  weekLabel: string;
+  weekStart: string;
+  mainInvoiceId: string;
+  mainInvoiceAmount: number;
+  crmIncome: number;
+  incomeTripCount: number;
+  delta: number;
+  mismatch: boolean;
+}> {
+  const real = excludeFixtureInvoices(invoices).filter((i) => /^AZNG[0-9A-F]/i.test(i.invoiceId));
+  const byWeek = new Map<string, InvoiceRow[]>();
+  for (const inv of real) {
+    const key = `${inv.amazonWeekYear}-${inv.amazonWeek}`;
+    const arr = byWeek.get(key) || [];
+    arr.push(inv);
+    byWeek.set(key, arr);
+  }
+  const out: Array<{
+    amazonWeek: number;
+    amazonWeekYear: number;
+    weekLabel: string;
+    weekStart: string;
+    mainInvoiceId: string;
+    mainInvoiceAmount: number;
+    crmIncome: number;
+    incomeTripCount: number;
+    delta: number;
+    mismatch: boolean;
+  }> = [];
+  for (const [, weekInvs] of [...byWeek.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const main = [...weekInvs].sort(
+      (a, b) => b.amount - a.amount || a.invoiceId.localeCompare(b.invoiceId),
+    )[0];
+    if (!main) continue;
+    const weekRows = reportLoads.filter(
+      (r) =>
+        r.amazonWeek === main.amazonWeek &&
+        r.amazonWeekYear === main.amazonWeekYear &&
+        isWeekIncomeRow(r),
+    );
+    const crmIncome = roundMoney(weekRows.reduce((s, r) => s + (Number(r.amazonPaid) || 0), 0));
+    const delta = roundMoney(crmIncome - main.amount);
+    out.push({
+      amazonWeek: main.amazonWeek,
+      amazonWeekYear: main.amazonWeekYear,
+      weekLabel: main.weekLabel || `Week${main.amazonWeek}`,
+      weekStart: main.weekStart,
+      mainInvoiceId: main.invoiceId,
+      mainInvoiceAmount: main.amount,
+      crmIncome,
+      incomeTripCount: weekRows.length,
+      delta,
+      mismatch: Math.abs(delta) > 1,
+    });
+  }
+  return out;
 }
 
 function isEstimatedWeekSource(weekSource: string): boolean {
@@ -152,7 +249,12 @@ export function isIncomeStatus(row: ReportLoadRow): boolean {
   if (row.moneyBucket === 'income' || row.moneyBucket === 'pending_invoice') return true;
   if (row.isTonu) return true;
   const status = (row.status || '').toUpperCase();
-  return status === 'COMPLETED' || status.includes('TONU');
+  if (status === 'COMPLETED' || status.includes('TONU')) return true;
+  return isTonuTrip({
+    status: row.status,
+    executionStatus: row.executionStatus,
+    payout: row.amazonPaid,
+  });
 }
 
 export function isWeekIncomeRow(row: ReportLoadRow): boolean {
