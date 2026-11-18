@@ -2,10 +2,10 @@
  * Money math for Drivers / Gross Board / Reports — all from report_loads.
  * Do not use getLoadFinalGross / loads.rate_gross for these pages.
  *
- * Week income = COMPLETED or TONU only (money_bucket=income).
- * Expected = in-transit/upcoming/planned (money_bucket=expected).
- * Pending invoice = completed/TONU not yet on MAIN (money_bucket=pending_invoice).
- * MAIN invoice week wins; adjustment invoices do not move trips.
+ * Week income = SUM of trip payouts for COMPLETED/TONU on MAIN only (never invoice $).
+ * Invoices are comparison-only; adjustment lines are shown separately, not added to income.
+ * Expected = in-transit/upcoming/planned. Pending invoice = completed/TONU not yet on MAIN.
+ * Estimated week (no MAIN) = final delivery LA Sun–Sat (week_source=delivery_estimate).
  */
 import type { Driver, GrossAdjustment } from '@/types';
 import { getDriverFullName, roundMoney } from '@/lib/utils';
@@ -38,8 +38,8 @@ export interface ReportLoadRow {
   weekLabel: string;
   /** True when week comes from pickup-date estimate (not MAIN invoice). */
   estimatedWeek: boolean;
-  /** 'invoice_main' | 'pickup_estimate' */
-  weekSource: 'invoice_main' | 'pickup_estimate' | string;
+  /** 'invoice_main' | 'delivery_estimate' (legacy: pickup_estimate) */
+  weekSource: 'invoice_main' | 'delivery_estimate' | 'pickup_estimate' | string;
   invoiceId: string | null;
   /** Paid / Pending from MAIN invoice when week_source=invoice_main. */
   paidStatus: string;
@@ -106,7 +106,7 @@ export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
     amazonWeekYear: row.amazon_week_year == null ? null : num(row.amazon_week_year),
     weekLabel: str(row.week_label),
     estimatedWeek: row.estimated_week == null ? true : Boolean(row.estimated_week),
-    weekSource: str(row.week_source) || 'pickup_estimate',
+    weekSource: str(row.week_source) || 'delivery_estimate',
     invoiceId: strOrNull(row.invoice_id),
     paidStatus: str(row.paid_status),
     mile: str(row.mile),
@@ -144,6 +144,10 @@ function deriveMoneyBucketFallback(row: Record<string, unknown>): MoneyBucket {
   return weekSource === 'invoice_main' ? 'income' : 'pending_invoice';
 }
 
+function isEstimatedWeekSource(weekSource: string): boolean {
+  return weekSource !== 'invoice_main';
+}
+
 export function isIncomeStatus(row: ReportLoadRow): boolean {
   if (row.moneyBucket === 'income' || row.moneyBucket === 'pending_invoice') return true;
   if (row.isTonu) return true;
@@ -162,7 +166,7 @@ export function isExpectedRow(row: ReportLoadRow): boolean {
 export function isPendingInvoiceRow(row: ReportLoadRow): boolean {
   return (
     row.moneyBucket === 'pending_invoice' ||
-    (isIncomeStatus(row) && row.weekSource === 'pickup_estimate')
+    (isIncomeStatus(row) && isEstimatedWeekSource(row.weekSource))
   );
 }
 
@@ -201,42 +205,39 @@ export function sumAdjustmentInvoices(invoices: InvoiceRow[]): number {
 }
 
 /**
- * Amazon-compare week total = MAIN income trips + adjustment invoice amounts
- * only when those adj lines are not already covered by this week's income tours
- * (adj must not move trips; W46 $34.07 for a W45 MAIN tour is additive).
+ * Week income = SUM of trip payouts (completed/TONU on MAIN) only.
+ * `adjustments` = adj invoice amounts for comparison display — NEVER added into income/total.
+ * Invoices are comparison-only.
  */
 export function sumWeekIncomeReconciled(
   weekRows: ReportLoadRow[],
   invoices: InvoiceRow[],
   weekStart: string,
   weekEnd: string,
-  invoiceTrips: InvoiceTripRow[] = [],
-): { income: number; adjustments: number; pending: number; expected: number; total: number } {
+  _invoiceTrips: InvoiceTripRow[] = [],
+): {
+  income: number;
+  adjustments: number;
+  pending: number;
+  expected: number;
+  /** Same as income — trip payout sum only. */
+  total: number;
+  incomeTripCount: number;
+} {
   const incomeRows = filterWeekIncome(weekRows);
   const income = sumAmazonPaid(incomeRows);
   const pending = sumAmazonPaid(filterWeekPendingInvoice(weekRows));
   const expected = sumAmazonPaid(filterWeekExpected(weekRows));
-  const incomeTours = new Set(incomeRows.map((r) => normalizeTourId(r.tourId)));
-  const adjInvs = adjustmentInvoicesForWeek(invoices, weekStart, weekEnd);
-  let adjustments = 0;
-  for (const inv of adjInvs) {
-    const members = invoiceTrips.filter((t) => t.invoiceId === inv.invoiceId);
-    const memberTours = members
-      .map((m) => normalizeTourId(m.tourId || m.loadId || ''))
-      .filter(Boolean);
-    // Additive only when no member is already in this week's MAIN income
-    // (e.g. W46 $34.07 for a tour that stays on W45 MAIN). If any member is
-    // already counted, the adj is a settlement correction — show the line, don't add $.
-    const anyAlreadyInIncome = memberTours.some((t) => incomeTours.has(t));
-    if (!anyAlreadyInIncome) adjustments += inv.amount;
-  }
-  adjustments = roundMoney(adjustments);
+  // Comparison-only: sum of adj invoice amounts for the week (not mixed into income).
+  const adjustments = sumAdjustmentInvoices(adjustmentInvoicesForWeek(invoices, weekStart, weekEnd));
+  void _invoiceTrips;
   return {
     income,
     adjustments,
     pending,
     expected,
-    total: roundMoney(income + adjustments),
+    total: income,
+    incomeTripCount: incomeRows.length,
   };
 }
 

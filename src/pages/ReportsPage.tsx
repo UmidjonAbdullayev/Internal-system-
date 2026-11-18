@@ -140,10 +140,11 @@ export function ReportsPage() {
     [incomeRows, sortDir, sortKey],
   );
 
-  const amazonTotal = reconciled.total;
+  // Week income = SUM of trip payouts only (never invoice amounts).
+  const amazonTotal = reconciled.income;
   const driverTotal = sumDriverPaid(incomeRows);
   const estimatedCount = pendingRows.length;
-  const invoiceWeekCount = incomeRows.length;
+  const invoiceWeekCount = reconciled.incomeTripCount;
   const paidCount = incomeRows.filter((r) => /paid/i.test(r.paidStatus)).length;
   const pendingCount = incomeRows.filter((r) => /pend/i.test(r.paidStatus)).length;
 
@@ -202,7 +203,7 @@ export function ReportsPage() {
     <div>
       <PageHeader
         title="Reports"
-        subtitle={`${week.header} · income = completed/TONU on MAIN · adj lines separate · one row per tour`}
+        subtitle={`${week.header} · income = Σ trip payouts (completed/TONU on MAIN) · invoices comparison-only · one row per tour`}
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={refreshing}>
@@ -244,10 +245,10 @@ export function ReportsPage() {
       </div>
 
       <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-6">
-        <Stat label="Income tours" value={String(invoiceWeekCount)} />
-        <Stat label="Week income" value={formatCurrency(amazonTotal)} />
+        <Stat label="Income trips" value={String(invoiceWeekCount)} />
+        <Stat label="Week income (Σ payouts)" value={formatCurrency(amazonTotal)} />
         <Stat label="Driver Paid" value={formatCurrency(driverTotal)} />
-        <Stat label="Adjustments" value={formatCurrency(reconciled.adjustments)} />
+        <Stat label="Adj invoices (compare)" value={formatCurrency(reconciled.adjustments)} />
         <Stat label="Pending invoice" value={`${estimatedCount} · ${formatCurrency(reconciled.pending)}`} />
         <Stat
           label="Paid status"
@@ -263,14 +264,15 @@ export function ReportsPage() {
         <div className="mb-4 rounded-xl border border-border bg-white px-4 py-3 text-sm space-y-1">
           {adjInvoices.map((inv) => (
             <p key={inv.invoiceId}>
-              <span className="font-medium">Adjustment</span> {inv.invoiceId.slice(0, 12)}…{' '}
-              {formatCurrency(inv.amount)} · {inv.status} (does not move trips)
+              <span className="font-medium">Adj invoice (comparison only)</span>{' '}
+              {inv.invoiceId.slice(0, 12)}… {formatCurrency(inv.amount)} · {inv.status} — not in
+              week income
             </p>
           ))}
           {pendingRows.length > 0 && (
             <p className="text-text-secondary">
-              Pending invoice (completed/TONU, not on MAIN): {pendingRows.length} tours ·{' '}
-              {formatCurrency(sumAmazonPaid(pendingRows))} — excluded from week income
+              Pending invoice (completed/TONU, estimated by final delivery): {pendingRows.length}{' '}
+              tours · {formatCurrency(sumAmazonPaid(pendingRows))} — excluded from week income
             </p>
           )}
           {expectedRows.filter((r) => r.amazonPaid > 0).length > 0 && (

@@ -86,8 +86,8 @@ export function DataChecksPage() {
     const rows = filterReportLoadsByWeek(reportLoads, '2026-11-01', '2026-11-07');
     const rec = sumWeekIncomeReconciled(rows, invoices, '2026-11-01', '2026-11-07', invoiceTrips);
     return {
-      count: rows.filter((r) => r.moneyBucket === 'income').length,
-      amazon: rec.total,
+      count: rec.incomeTripCount,
+      amazon: rec.income,
       income: rec.income,
       adjustments: rec.adjustments,
       pending: rec.pending,
@@ -99,8 +99,8 @@ export function DataChecksPage() {
     const rows = filterReportLoadsByWeek(reportLoads, '2026-11-08', '2026-11-14');
     const rec = sumWeekIncomeReconciled(rows, invoices, '2026-11-08', '2026-11-14', invoiceTrips);
     return {
-      count: rows.filter((r) => r.moneyBucket === 'income').length,
-      amazon: rec.total,
+      count: rec.incomeTripCount,
+      amazon: rec.income,
       income: rec.income,
       adjustments: rec.adjustments,
       pending: rec.pending,
@@ -162,24 +162,28 @@ export function DataChecksPage() {
         </CardHeader>
         <CardContent className="text-sm space-y-2">
           <p>
-            <span className="font-medium">Week45 income+adj:</span>{' '}
-            {week45.count} income tours · {formatCurrency(week45.amazon)} (income{' '}
-            {formatCurrency(week45.income)} + adj {formatCurrency(week45.adjustments)}) · Δ{' '}
-            {formatCurrency(invoiceDelta45)} vs {formatCurrency(AMAZON_INVOICE_WEEK45)}
+            <span className="font-medium">Week45 income (Σ trip payouts):</span>{' '}
+            {week45.count} trips · {formatCurrency(week45.income)} · Δ{' '}
+            {formatCurrency(invoiceDelta45)} vs invoice {formatCurrency(AMAZON_INVOICE_WEEK45)}
+            {week45.adjustments > 0
+              ? ` · adj invoices (comparison only) ${formatCurrency(week45.adjustments)}`
+              : ''}
             {week45.pending > 0 ? ` · pending ${formatCurrency(week45.pending)}` : ''}
             {week45.expected > 0 ? ` · expected ${formatCurrency(week45.expected)}` : ''}
           </p>
           <p>
-            <span className="font-medium">Week46 income+adj:</span>{' '}
-            {week46.count} income tours · {formatCurrency(week46.amazon)} (income{' '}
-            {formatCurrency(week46.income)} + adj {formatCurrency(week46.adjustments)}) · Δ{' '}
-            {formatCurrency(invoiceDelta)} vs {formatCurrency(AMAZON_INVOICE_WEEK46)}
+            <span className="font-medium">Week46 income (Σ trip payouts):</span>{' '}
+            {week46.count} trips · {formatCurrency(week46.income)} · Δ{' '}
+            {formatCurrency(invoiceDelta)} vs invoice {formatCurrency(AMAZON_INVOICE_WEEK46)}
+            {week46.adjustments > 0
+              ? ` · adj invoices (comparison only) ${formatCurrency(week46.adjustments)}`
+              : ''}
             {week46.pending > 0 ? ` · pending ${formatCurrency(week46.pending)}` : ''}
             {week46.expected > 0 ? ` · expected ${formatCurrency(week46.expected)}` : ''}
           </p>
           <p className="text-xs text-text-secondary">
-            Income = completed/TONU on MAIN only. Adj invoices shown as lines (do not move trips).
-            Pending invoice / expected excluded from week income. See{' '}
+            Week income = SUM of trip payouts (completed/TONU on MAIN) — never invoice totals.
+            Invoices are comparison-only. Estimated week = final delivery LA. See{' '}
             <code>docs/week-invoice-reconciliation.md</code>.
           </p>
         </CardContent>
