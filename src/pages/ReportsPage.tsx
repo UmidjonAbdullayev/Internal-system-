@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import { Download, Pencil, RefreshCw } from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Modal } from '@/components/ui/Modal';
 import { Field, Input, Select } from '@/components/ui/Input';
+import { KpiSkeletonRow, TableSkeleton } from '@/components/ui/Skeleton';
 import { downloadCSV, formatCurrency } from '@/lib/utils';
 import {
   amazonWeekRangeFromAnchor,
@@ -96,6 +97,8 @@ export function ReportsPage() {
     refreshData,
     upsertLoadOverride,
     dataReady,
+    dataError,
+    dataFetching,
   } = useData();
 
   const today = laTodayISO();
@@ -244,21 +247,39 @@ export function ReportsPage() {
         </span>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-6">
-        <Stat label="Income trips" value={String(invoiceWeekCount)} />
-        <Stat label="Week income (Σ payouts)" value={formatCurrency(amazonTotal)} />
-        <Stat label="Driver Paid" value={formatCurrency(driverTotal)} />
-        <Stat label="Adj invoices (compare)" value={formatCurrency(reconciled.adjustments)} />
-        <Stat label="Pending invoice" value={`${estimatedCount} · ${formatCurrency(reconciled.pending)}`} />
-        <Stat
-          label="Paid status"
-          value={
-            paidCount || pendingCount
-              ? `${paidCount} Paid · ${pendingCount} Pending`
-              : '—'
-          }
-        />
-      </div>
+      {!dataReady ? (
+        <div className="mb-4">
+          <KpiSkeletonRow n={6} />
+        </div>
+      ) : (
+        <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-6">
+          <Stat label="Income trips" value={String(invoiceWeekCount)} />
+          <Stat label="Week income (Σ payouts)" value={formatCurrency(amazonTotal)} />
+          <Stat label="Driver Paid" value={formatCurrency(driverTotal)} />
+          <Stat label="Adj invoices (compare)" value={formatCurrency(reconciled.adjustments)} />
+          <Stat label="Pending invoice" value={`${estimatedCount} · ${formatCurrency(reconciled.pending)}`} />
+          <Stat
+            label="Paid status"
+            value={
+              paidCount || pendingCount
+                ? `${paidCount} Paid · ${pendingCount} Pending`
+                : '—'
+            }
+          />
+        </div>
+      )}
+
+      {dataError && dataReady && (
+        <div className="mb-4 flex items-center justify-between rounded-xl border border-danger/30 bg-danger-bg px-4 py-3 text-sm">
+          <span>Could not refresh data: {dataError}</span>
+          <Button size="sm" variant="outline" onClick={() => void refresh()}>
+            Retry
+          </Button>
+        </div>
+      )}
+      {dataFetching && dataReady && (
+        <p className="mb-2 text-xs text-text-secondary">Updating in background…</p>
+      )}
 
       {(adjInvoices.length > 0 || expectedRows.length > 0 || pendingRows.length > 0) && (
         <div className="mb-4 rounded-xl border border-border bg-white px-4 py-3 text-sm space-y-1">
@@ -286,7 +307,9 @@ export function ReportsPage() {
       )}
 
       {!dataReady ? (
-        <EmptyState title="Loading…" description="Hydrating report_loads" />
+        <div className="overflow-hidden rounded-xl border border-border bg-white">
+          <TableSkeleton rows={12} cols={8} />
+        </div>
       ) : incomeRows.length === 0 ? (
         <EmptyState
           title="No income tours this Amazon week"
@@ -413,7 +436,7 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function GroupRows({
+const GroupRows = memo(function GroupRows({
   week,
   rows,
   onEdit,
@@ -433,7 +456,21 @@ function GroupRows({
         </td>
       </tr>
       {rows.map((r) => (
-        <tr key={r.tourId} className="table-row-hover border-b border-border/60">
+        <ReportLoadRowView key={r.tourId} r={r} onEdit={onEdit} />
+      ))}
+    </>
+  );
+});
+
+const ReportLoadRowView = memo(function ReportLoadRowView({
+  r,
+  onEdit,
+}: {
+  r: ReportLoadRow;
+  onEdit: (r: ReportLoadRow) => void;
+}) {
+  return (
+        <tr className="table-row-hover border-b border-border/60">
           <td className="whitespace-nowrap px-2 py-1.5">{r.broker}</td>
           <td className="whitespace-nowrap px-2 py-1.5 font-medium text-primary">{r.tripDisplay}</td>
           <td className="max-w-[140px] truncate px-2 py-1.5 text-xs tabular-nums" title={r.loadIds}>
@@ -505,7 +542,5 @@ function GroupRows({
             </Button>
           </td>
         </tr>
-      ))}
-    </>
   );
-}
+});

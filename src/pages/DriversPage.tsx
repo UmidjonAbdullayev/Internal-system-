@@ -54,8 +54,18 @@ const emptyForm = {
 };
 
 export function DriversPage() {
-  const { drivers, loads, settlements, reportLoads, addDriver, updateDriver, deactivateDriver } =
-    useData();
+  const {
+    drivers,
+    loads,
+    settlements,
+    reportLoads,
+    addDriver,
+    updateDriver,
+    deactivateDriver,
+    dataReady,
+    dataError,
+    refreshData,
+  } = useData();
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const importRef = useRef<HTMLInputElement>(null);
@@ -252,6 +262,9 @@ export function DriversPage() {
                 e.target.value = '';
               }}
             />
+            <Button variant="outline" size="sm" onClick={() => void refreshData()}>
+              Retry
+            </Button>
             <Button variant="outline" size="sm" onClick={() => importRef.current?.click()}>
               <Upload className="h-4 w-4" /> Import
             </Button>
@@ -264,6 +277,18 @@ export function DriversPage() {
           </>
         }
       />
+
+      {!dataReady && (
+        <p className="mb-3 text-sm text-text-secondary">Loading drivers…</p>
+      )}
+      {dataReady && dataError && (
+        <div className="mb-3 flex items-center justify-between rounded-lg border border-danger/30 bg-danger-bg px-3 py-2 text-sm">
+          <span>{dataError}</span>
+          <Button size="sm" variant="outline" onClick={() => void refreshData()}>
+            Retry
+          </Button>
+        </div>
+      )}
 
       <Card className="mb-4 p-3">
         <div className="flex flex-wrap gap-2">

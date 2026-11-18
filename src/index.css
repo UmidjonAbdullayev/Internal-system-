@@ -74,6 +74,20 @@ body {
   100% { background-position: -200% 0; }
 }
 
+@keyframes navProgress {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(100%); }
+  100% { transform: translateX(300%); }
+}
+
+.animate-skeleton {
+  animation: skeleton 1.4s ease-in-out infinite;
+}
+
+.animate-nav-progress {
+  animation: navProgress 1.1s ease-in-out infinite;
+}
+
 .animate-fade-in {
   animation: fadeIn 0.25s ease-out;
 }
