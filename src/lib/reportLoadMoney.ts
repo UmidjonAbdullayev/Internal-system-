@@ -189,9 +189,7 @@ export function adjustmentInvoicesForWeek(
   weekStart: string,
   _weekEnd?: string,
 ): InvoiceRow[] {
-  const real = excludeFixtureInvoices(invoices).filter((i) =>
-    /^AZNG[0-9A-F]/i.test(i.invoiceId),
-  );
+  const real = excludeFixtureInvoices(invoices);
   const inWeek = real.filter((i) => i.weekStart === weekStart);
   if (!inWeek.length) return [];
   const mainId = [...inWeek].sort(

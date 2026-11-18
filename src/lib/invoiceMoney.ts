@@ -3,13 +3,22 @@
  */
 import { roundMoney } from '@/lib/utils';
 
-/** Verification seeds — never count in reports/totals/CRM money. */
+/** Real Relay settlement IDs: AZNG + 32 hex, no dashes. */
+export const REAL_AZNG_INVOICE_ID = /^AZNG[0-9A-F]{32}$/;
+
+/** True for FIXTURE-*, AZNG-SMOKE-*, dashed ids, or anything not real AZNG. */
 export function isFixtureInvoiceId(id: string | null | undefined): boolean {
-  return String(id || '').startsWith('FIXTURE-');
+  const s = String(id || '');
+  if (!s) return true;
+  return !REAL_AZNG_INVOICE_ID.test(s);
+}
+
+export function isRealAzngInvoiceId(id: string | null | undefined): boolean {
+  return REAL_AZNG_INVOICE_ID.test(String(id || ''));
 }
 
 export function excludeFixtureInvoices<T extends { invoiceId: string }>(rows: T[]): T[] {
-  return rows.filter((r) => !isFixtureInvoiceId(r.invoiceId));
+  return rows.filter((r) => isRealAzngInvoiceId(r.invoiceId));
 }
 
 export interface InvoiceRow {

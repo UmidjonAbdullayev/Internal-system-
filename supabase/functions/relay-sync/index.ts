@@ -1276,8 +1276,11 @@ Deno.serve(async (req: Request) => {
         errors.push("Invoice missing invoice_id");
         continue;
       }
-      // Never persist verification seeds via sync
-      if (invoiceId.startsWith("FIXTURE-")) continue;
+      // Never persist test/fixture/smoke ids — prod accepts real AZNG+32hex only
+      if (!/^AZNG[0-9A-F]{32}$/.test(invoiceId)) {
+        errors.push(`Invoice rejected (not real AZNG id): ${invoiceId}`);
+        continue;
+      }
       if (
         inv.amazon_week_year == null ||
         inv.amazon_week == null ||
@@ -1373,22 +1376,34 @@ Deno.serve(async (req: Request) => {
       if (sumErr) errors.push(`payments_summary: ${sumErr.message}`);
     }
 
-    // After first successful live settlements upsert (real AZNG… ids), explicitly
-    // delete all FIXTURE-* rows — upsert cannot replace them (different PKs).
+    // Defense: purge any leftover non-canonical invoice rows (SMOKE/FIXTURE/dashed).
+    // CHECK constraint also blocks new inserts; this cleans historical leaks.
     if (invoicesUpserted > 0) {
-      const { error: fixTripErr } = await sb
-        .from("invoice_trips")
-        .delete()
-        .like("invoice_id", "FIXTURE-%");
-      if (fixTripErr) {
-        errors.push(`FIXTURE invoice_trips delete: ${fixTripErr.message}`);
-      }
-      const { error: fixInvErr } = await sb
+      const { data: badInv, error: badInvSelErr } = await sb
         .from("invoices")
-        .delete()
-        .like("invoice_id", "FIXTURE-%");
-      if (fixInvErr) {
-        errors.push(`FIXTURE invoices delete: ${fixInvErr.message}`);
+        .select("invoice_id");
+      if (badInvSelErr) {
+        errors.push(`invoice purge select: ${badInvSelErr.message}`);
+      } else {
+        const badIds = (badInv || [])
+          .map((r: { invoice_id?: string }) => String(r.invoice_id || ""))
+          .filter((id: string) => id && !/^AZNG[0-9A-F]{32}$/.test(id));
+        if (badIds.length) {
+          const { error: fixTripErr } = await sb
+            .from("invoice_trips")
+            .delete()
+            .in("invoice_id", badIds);
+          if (fixTripErr) {
+            errors.push(`fake invoice_trips delete: ${fixTripErr.message}`);
+          }
+          const { error: fixInvErr } = await sb
+            .from("invoices")
+            .delete()
+            .in("invoice_id", badIds);
+          if (fixInvErr) {
+            errors.push(`fake invoices delete: ${fixInvErr.message}`);
+          }
+        }
       }
     }
 

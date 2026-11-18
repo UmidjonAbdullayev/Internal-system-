@@ -9,9 +9,10 @@ import {
   filterReportLoadsByWeek,
   sumWeekIncomeReconciled,
 } from '@/lib/reportLoadMoney';
+import { isRealAzngInvoiceId } from '@/lib/invoiceMoney';
 
-/** Real AZNG W46 invoice total (exclude SMOKE/FIXTURE). Acceptance: $295,660.37. */
-const AMAZON_INVOICE_WEEK46 = 295660.37;
+/** Real AZNG W46 invoice total (exclude SMOKE/FIXTURE). Acceptance: $295,660.38. */
+const AMAZON_INVOICE_WEEK46 = 295660.38;
 const AMAZON_INVOICE_WEEK45 = 306609.2;
 
 type TwinRow = {
@@ -113,6 +114,25 @@ export function DataChecksPage() {
   const invoiceDelta45 = week45.amazon - AMAZON_INVOICE_WEEK45;
   const invoiceDelta = week46.amazon - AMAZON_INVOICE_WEEK46;
 
+  const fakeInvoiceRows = useMemo(() => {
+    const badInv = invoices.filter((i) => !isRealAzngInvoiceId(i.invoiceId));
+    const badTrips = invoiceTrips.filter((t) => !isRealAzngInvoiceId(t.invoiceId));
+    return badInv.length + badTrips.length;
+  }, [invoiceTrips, invoices]);
+
+  const week46InvoiceTotal = useMemo(() => {
+    const rows = invoices.filter(
+      (i) =>
+        isRealAzngInvoiceId(i.invoiceId) &&
+        i.amazonWeek === 46 &&
+        i.amazonWeekYear === 2026,
+    );
+    return {
+      count: rows.length,
+      total: rows.reduce((s, i) => s + i.amount, 0),
+    };
+  }, [invoices]);
+
   return (
     <div>
       <PageHeader
@@ -123,7 +143,7 @@ export function DataChecksPage() {
       {!dataReady && <p className="text-sm text-text-secondary mb-4">Loading…</p>}
       {error && <p className="text-sm text-danger mb-4">{error}</p>}
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4 mb-6">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5 mb-6">
         <Metric
           title="Week 45"
           subtitle="Sun Nov 1 – Sat Nov 7, 2026 (LA)"
@@ -140,8 +160,14 @@ export function DataChecksPage() {
           subtitle="W45 Paid · W46 Pending"
           lines={[
             `W45 ${formatCurrency(AMAZON_INVOICE_WEEK45)}`,
-            `W46 ${formatCurrency(AMAZON_INVOICE_WEEK46)}`,
+            `W46 ${week46InvoiceTotal.count} inv · ${formatCurrency(week46InvoiceTotal.total)}`,
           ]}
+        />
+        <Metric
+          title="test/fake rows in production"
+          subtitle="invoices + invoice_trips not ^AZNG[0-9A-F]{32}$"
+          lines={[`${fakeInvoiceRows}`]}
+          highlight={fakeInvoiceRows === 0}
         />
         <Metric
           title="Overrides"

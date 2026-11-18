@@ -326,16 +326,18 @@ export function DataProvider({ children }: { children: ReactNode }) {
       supabase.from('settlement_loads').select('*'),
       supabase.from('settlement_charges').select('*'),
       supabase.from('payments').select('*').order('payment_date', { ascending: false }),
-      // FIXTURE-* verification seeds never hydrate into CRM totals/reports
+      // Real AZNG settlement IDs only (DB CHECK + client exclude; never hydrate SMOKE/FIXTURE)
       supabase
         .from('invoices')
         .select('*')
-        .not('invoice_id', 'like', 'FIXTURE-%')
+        .like('invoice_id', 'AZNG%')
+        .not('invoice_id', 'like', '%-%')
         .order('week_start', { ascending: false }),
       supabase
         .from('invoice_trips')
         .select('*')
-        .not('invoice_id', 'like', 'FIXTURE-%'),
+        .like('invoice_id', 'AZNG%')
+        .not('invoice_id', 'like', '%-%'),
       supabase.from('payments_summary').select('*').eq('id', 1).maybeSingle(),
       supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
       supabase.from('sync_state').select('*'),

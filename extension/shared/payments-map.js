@@ -89,7 +89,8 @@ function toTimestamptz(v) {
 export function mapSettlementToInvoice(item) {
   if (!item || typeof item !== 'object') return null;
   const invoiceId = String(item.id || '').trim();
-  if (!invoiceId) return null;
+  // Real Relay settlement IDs only — never map FIXTURE/SMOKE/dashed test ids
+  if (!invoiceId || !/^AZNG[0-9A-F]{32}$/.test(invoiceId)) return null;
 
   const meta = item.settlementsMetadata || item.settlementMetadata || {};
   const ctx = parseContextId(meta.contextId);

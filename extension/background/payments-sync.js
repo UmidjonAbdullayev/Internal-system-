@@ -178,7 +178,7 @@ export async function ingestSettlementsPayload(data, { source = 'passive' } = {}
       ? data
       : [];
   const mapped = mapSettlementList(list).filter(
-    (inv) => inv?.invoice_id && !String(inv.invoice_id).startsWith('FIXTURE-'),
+    (inv) => inv?.invoice_id && /^AZNG[0-9A-F]{32}$/.test(String(inv.invoice_id)),
   );
   if (!mapped.length) {
     log(`${source}: 0 invoices mapped from ${list.length} settlement row(s)`);
