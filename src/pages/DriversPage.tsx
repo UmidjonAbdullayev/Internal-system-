@@ -13,16 +13,21 @@ import { SortHeader, useSort, type SortDir } from '@/components/shared/SortHeade
 import {
   deriveDriverStatus,
   getActiveLoadsForDriver,
-  getDriverGross,
-  getEligibleLoads,
 } from '@/lib/calculations';
 import {
   formatCurrency,
   formatDate,
   downloadCSV,
-  getWeekRange,
   getDriverFullName,
 } from '@/lib/utils';
+import {
+  amazonWeekRangeFromAnchor,
+  laTodayISO,
+} from '@/lib/amazonWeek';
+import {
+  getDriverAmazonGross,
+  reportLoadsForDriver,
+} from '@/lib/reportLoadMoney';
 import { csvToObjects, mapDriverCsvRow } from '@/lib/csvImport';
 import { toast } from 'sonner';
 import type { Driver, DriverStatus } from '@/types';
@@ -49,7 +54,8 @@ const emptyForm = {
 };
 
 export function DriversPage() {
-  const { drivers, loads, settlements, addDriver, updateDriver, deactivateDriver } = useData();
+  const { drivers, loads, settlements, reportLoads, addDriver, updateDriver, deactivateDriver } =
+    useData();
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const importRef = useRef<HTMLInputElement>(null);
@@ -62,7 +68,7 @@ export function DriversPage() {
   const [form, setForm] = useState(emptyForm);
   const [deactivateId, setDeactivateId] = useState<string | null>(null);
 
-  const week = getWeekRange(new Date());
+  const week = amazonWeekRangeFromAnchor(laTodayISO());
 
   useEffect(() => {
     if (params.get('action') === 'new') {
@@ -77,8 +83,14 @@ export function DriversPage() {
       .map((driver) => {
         const liveStatus = deriveDriverStatus(driver, loads);
         const activeLoads = getActiveLoadsForDriver(loads, driver.id);
-        const weeklyGross = getDriverGross(loads, driver.id, week);
-        const totalLoads = getEligibleLoads(loads, driver.id).length;
+        const weeklyGross = getDriverAmazonGross(
+          reportLoads,
+          drivers,
+          driver.id,
+          week.start,
+          week.end,
+        );
+        const totalLoads = reportLoadsForDriver(reportLoads, drivers, driver.id).length;
         const latestSettlement = settlements
           .filter((s) => s.driverId === driver.id)
           .sort((a, b) => b.weekStart.localeCompare(a.weekStart))[0];
@@ -109,7 +121,7 @@ export function DriversPage() {
           notes.includes(q)
         );
       });
-  }, [drivers, loads, settlements, search, statusFilter, week]);
+  }, [drivers, loads, settlements, reportLoads, search, statusFilter, week]);
 
   const sorted = useSort(rows, sortKey, sortDir, {
     name: (r) => getDriverFullName(r.driver.firstName, r.driver.lastName),

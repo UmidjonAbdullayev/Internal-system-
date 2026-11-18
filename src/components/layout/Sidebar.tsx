@@ -8,6 +8,7 @@ import {
   Wallet,
   Receipt,
   BarChart3,
+  ClipboardCheck,
   Settings,
   Truck,
   ChevronLeft,
@@ -25,6 +26,7 @@ const NAV = [
   { to: '/payments', label: 'Payments / Paycheck', icon: Wallet, highlight: true },
   { to: '/settlements', label: 'Settlements & Charges', icon: Receipt },
   { to: '/reports', label: 'Reports', icon: BarChart3 },
+  { to: '/data-checks', label: 'Data checks', icon: ClipboardCheck },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 
