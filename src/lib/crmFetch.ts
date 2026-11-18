@@ -113,6 +113,23 @@ export async function countRelayTripsBySection(): Promise<Record<RelaySection, n
   };
   await Promise.all(
     sections.map(async (section) => {
+      // Live tabs: active-only (same rule as list / popup "Relay active").
+      // Fully cancelled trips belong in HISTORY and must not inflate Upcoming/In Transit.
+      // Filter in JS so null tour_state/status are not dropped by PostgREST NOT ILIKE.
+      if (section === 'UPCOMING' || section === 'IN_TRANSIT') {
+        const { data, error } = await supabase
+          .from('relay_trips')
+          .select('tour_state, status')
+          .eq('archived', false)
+          .eq('section', section);
+        if (!error) {
+          counts[section] = (data || []).filter((r) => {
+            const blob = `${r.tour_state || ''} ${r.status || ''}`.toLowerCase();
+            return !/cancel/.test(blob);
+          }).length;
+        }
+        return;
+      }
       const { count, error } = await supabase
         .from('relay_trips')
         .select('id', { count: 'exact', head: true })

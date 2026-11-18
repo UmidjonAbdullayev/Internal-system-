@@ -63,9 +63,10 @@ export function allLegsCancelledFromLegs(
 }
 
 /**
- * Fully cancelled for History override:
- * tourState cancelled OR every load CANCELLED.
+ * Fully cancelled → ALWAYS section=HISTORY (Cancelled), whatever Relay tab
+ * the trip arrived on. tourState cancelled OR every load CANCELLED.
  * One cancelled leg does NOT cancel the trip. Derived status (Delivered) is ignored.
+ * Partial cancels keep live-tab membership (#44).
  */
 export function isFullyCancelledTrip(
   tourState: unknown,

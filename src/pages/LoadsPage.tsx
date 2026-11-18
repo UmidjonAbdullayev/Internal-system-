@@ -228,8 +228,23 @@ export function LoadsPage() {
   const relayTileHint = useMemo(() => {
     const it = snapshots.find((s) => s.section === 'IN_TRANSIT');
     const up = snapshots.find((s) => s.section === 'UPCOMING');
-    if (!it && !up) return null;
-    return `Relay total incl. cancelled: Upcoming ${up?.totalRecords ?? '—'} · In Transit ${it?.totalRecords ?? '—'}`;
+    const hist = snapshots.find((s) => s.section === 'HISTORY');
+    if (!it && !up && !hist) return null;
+    const parts: string[] = [];
+    if (up) {
+      parts.push(
+        `Upcoming active ${up.crmCount ?? '—'} (Relay response ${up.totalRecords ?? '—'} incl. cancelled)`,
+      );
+    }
+    if (it) {
+      parts.push(
+        `In Transit active ${it.crmCount ?? '—'} (Relay response ${it.totalRecords ?? '—'})`,
+      );
+    }
+    if (hist) {
+      parts.push(`CRM History ${hist.crmCount ?? '—'} (same as History tab badge)`);
+    }
+    return parts.join(' · ');
   }, [snapshots]);
 
   // History is loaded on demand (paged 100) — keeps initial hydrate under ~1s.
@@ -484,6 +499,13 @@ export function LoadsPage() {
             key={t.id}
             type="button"
             onClick={() => selectTab(t.id)}
+            title={
+              t.id === 'upcoming' || t.id === 'in_transit'
+                ? 'Active trips only (fully cancelled → History)'
+                : t.id === 'history'
+                  ? 'CRM History section rows (same definition as extension popup CRM History)'
+                  : undefined
+            }
             className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
               tab === t.id
                 ? 'border-primary text-primary'
@@ -515,7 +537,7 @@ export function LoadsPage() {
       {(tab === 'upcoming' || tab === 'in_transit') && (
         <LiveMirrorBanner
           mode={mirrorMode}
-          relayCount={sectionSnap?.totalRecords}
+          relayCount={sectionSnap?.crmCount ?? sectionSnap?.totalRecords}
           sectionLabel={liveSection || 'IN_TRANSIT'}
           lastSuccessfulSyncAt={sectionSync?.lastSuccessfulSyncAt}
           extensionAliveAt={
