@@ -19,6 +19,17 @@ export const ENTITIES_V2_URL = 'https://relay.amazon.com/api/tours/entitiesV2';
 /** Prefer Trips board so Relay fires entitiesV2 on first load. */
 export const RELAY_TRIPS_URL = 'https://relay.amazon.com/tours/';
 
+/** Relay financials (Payments page) — GET, page-context credentials. */
+export const SETTLEMENTS_PATH = '/api/financials/v1/settlements';
+export const SETTLEMENTS_URL =
+  'https://relay.amazon.com/api/financials/v1/settlements?paymentAccountType=PAYABLES&pageSize=200';
+export const PAYMENTS_SUMMARY_PATH = '/api/financials/v1/payments-summary';
+export const PAYMENTS_SUMMARY_URL = 'https://relay.amazon.com/api/financials/v1/payments-summary';
+/** Low-priority scheduled payments sync. */
+export const PAYMENTS_SYNC_INTERVAL_MS = 30 * 60 * 1000;
+export const PAYMENTS_ALARM = 'relay-payments-sync';
+export const RELAY_PAYMENTS_URL = 'https://relay.amazon.com/payment-history';
+
 export const SECTIONS = [
   {
     id: 'tours',
@@ -37,9 +48,9 @@ export const SECTIONS = [
   {
     id: 'payments',
     label: 'Payment information',
-    urlHints: ['/payment', '/settlement', '/invoice'],
+    urlHints: ['/payment', '/settlement', '/invoice', '/financial'],
     required: true,
-    collects: 'payment JSON when captured',
+    collects: 'settlements + payments-summary JSON',
   },
 ];
 

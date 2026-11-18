@@ -49,6 +49,33 @@ type PaymentIn = {
   notes?: string | null;
 };
 
+type InvoiceIn = {
+  invoice_id: string;
+  amazon_week_year: number;
+  amazon_week: number;
+  week_label: string;
+  week_start: string;
+  week_end: string;
+  work_type?: string | null;
+  amount: number;
+  status: string;
+  payment_status_raw?: string | null;
+  invoice_date?: string | null;
+  expected_payment_date?: string | null;
+  paid_at?: string | null;
+  invoice_status?: string | null;
+  credit_note?: string | null;
+  tour_ids?: string[];
+  load_ids?: string[];
+};
+
+type PaymentsSummaryIn = {
+  year_to_date_payment_amt?: number | null;
+  pending_invoice_payment_amt?: number | null;
+  expected_payment_date?: string | null;
+  time_zone?: string | null;
+};
+
 type StopIn = {
   seq?: number | null;
   stopType?: string | null;
@@ -435,6 +462,11 @@ Deno.serve(async (req: Request) => {
     const body = await req.json();
     const loads: LoadIn[] = Array.isArray(body.loads) ? body.loads : [];
     const payments: PaymentIn[] = Array.isArray(body.payments) ? body.payments : [];
+    const invoicesIn: InvoiceIn[] = Array.isArray(body.invoices) ? body.invoices : [];
+    const paymentsSummaryIn: PaymentsSummaryIn | null =
+      body.payments_summary && typeof body.payments_summary === "object"
+        ? body.payments_summary
+        : null;
     const tripsIn: TripIn[] = Array.isArray(body.trips) ? body.trips : [];
     const snapshot: SnapshotIn | null =
       body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null;
@@ -467,6 +499,8 @@ Deno.serve(async (req: Request) => {
     let loadsUpdated = 0;
     let loadsPaymentUpdated = 0;
     let paymentsUpserted = 0;
+    let invoicesUpserted = 0;
+    let invoiceTripsUpserted = 0;
     let tripsUpserted = 0;
     let legsUpserted = 0;
     let stopsUpserted = 0;
@@ -1233,6 +1267,116 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    // ---- Invoices from Relay settlements (PAYABLES) — upsert only, no deletes ----
+    for (const inv of invoicesIn) {
+      const invoiceId = String(inv?.invoice_id || "").trim();
+      if (!invoiceId) {
+        errors.push("Invoice missing invoice_id");
+        continue;
+      }
+      if (
+        inv.amazon_week_year == null ||
+        inv.amazon_week == null ||
+        inv.amount == null ||
+        !inv.week_start ||
+        !inv.week_end
+      ) {
+        errors.push(`Invoice incomplete ${invoiceId}`);
+        continue;
+      }
+
+      const tourIds = Array.isArray(inv.tour_ids)
+        ? inv.tour_ids.map((x) => String(x).trim()).filter(Boolean)
+        : [];
+      const loadIds = Array.isArray(inv.load_ids)
+        ? inv.load_ids.map((x) => String(x).trim()).filter(Boolean)
+        : [];
+
+      const row = {
+        invoice_id: invoiceId,
+        amazon_week_year: Number(inv.amazon_week_year),
+        amazon_week: Number(inv.amazon_week),
+        week_label: String(inv.week_label || `Week${inv.amazon_week}`),
+        week_start: inv.week_start,
+        week_end: inv.week_end,
+        work_type: inv.work_type ?? null,
+        amount: Number(inv.amount),
+        status: String(inv.status || "Unknown"),
+        payment_status_raw: inv.payment_status_raw ?? null,
+        invoice_date: inv.invoice_date ?? null,
+        expected_payment_date: inv.expected_payment_date ?? null,
+        paid_at: inv.paid_at ?? null,
+        invoice_status: inv.invoice_status ?? null,
+        credit_note: inv.credit_note ?? null,
+        tour_ids: tourIds,
+        load_ids: loadIds,
+        last_synced_at: now,
+        updated_at: now,
+      };
+
+      const { error: invErr } = await sb.from("invoices").upsert(row, {
+        onConflict: "invoice_id",
+      });
+      if (invErr) {
+        errors.push(`Invoice upsert ${invoiceId}: ${invErr.message}`);
+        continue;
+      }
+      invoicesUpserted += 1;
+
+      // Replace membership rows for this invoice (upsert-friendly: delete then insert)
+      await sb.from("invoice_trips").delete().eq("invoice_id", invoiceId);
+      const memberRows: Array<Record<string, unknown>> = [];
+      for (const t of tourIds) {
+        memberRows.push({
+          invoice_id: invoiceId,
+          amazon_week_year: row.amazon_week_year,
+          amazon_week: row.amazon_week,
+          week_label: row.week_label,
+          tour_id: t.replace(/^T-/i, "").toUpperCase(),
+          load_id: null,
+        });
+      }
+      for (const l of loadIds) {
+        memberRows.push({
+          invoice_id: invoiceId,
+          amazon_week_year: row.amazon_week_year,
+          amazon_week: row.amazon_week,
+          week_label: row.week_label,
+          tour_id: null,
+          load_id: l,
+        });
+      }
+      if (memberRows.length) {
+        const { error: memErr } = await sb.from("invoice_trips").insert(memberRows);
+        if (memErr) errors.push(`invoice_trips ${invoiceId}: ${memErr.message}`);
+        else invoiceTripsUpserted += memberRows.length;
+      }
+    }
+
+    if (paymentsSummaryIn) {
+      const { error: sumErr } = await sb.from("payments_summary").upsert(
+        {
+          id: 1,
+          year_to_date_payment_amt: paymentsSummaryIn.year_to_date_payment_amt ?? null,
+          pending_invoice_payment_amt: paymentsSummaryIn.pending_invoice_payment_amt ?? null,
+          expected_payment_date: paymentsSummaryIn.expected_payment_date ?? null,
+          time_zone: paymentsSummaryIn.time_zone ?? null,
+          last_synced_at: now,
+          updated_at: now,
+        },
+        { onConflict: "id" },
+      );
+      if (sumErr) errors.push(`payments_summary: ${sumErr.message}`);
+    }
+
+    // Drop verification seeds once real Relay invoices arrive
+    const realInvoice = invoicesIn.some(
+      (i) => i?.invoice_id && !String(i.invoice_id).startsWith("FIXTURE-"),
+    );
+    if (realInvoice) {
+      await sb.from("invoices").delete().like("invoice_id", "FIXTURE-%");
+    }
+
     // Mark loads not observed recently as stale (36h)
     const staleBefore = new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString();
     await sb
@@ -1326,10 +1470,12 @@ Deno.serve(async (req: Request) => {
       .update({
         finished_at: finishedAt,
         status: errors.length ? "completed_with_errors" : "completed",
-        records_collected: loads.length + payments.length + tripsIn.length,
+        records_collected:
+          loads.length + payments.length + tripsIn.length + invoicesIn.length,
         records_updated:
           loadsUpdated +
           paymentsUpserted +
+          invoicesUpserted +
           loadsPaymentUpdated +
           loadsReconciled +
           tripsUpserted +
@@ -1361,6 +1507,8 @@ Deno.serve(async (req: Request) => {
       loads_payment_updated: loadsPaymentUpdated,
       loads_reconciled: loadsReconciled,
       payments_upserted: paymentsUpserted,
+      invoices_upserted: invoicesUpserted,
+      invoice_trips_upserted: invoiceTripsUpserted,
       trips_upserted: tripsUpserted,
       legs_upserted: legsUpserted,
       stops_upserted: stopsUpserted,

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys \u2014 Amazon Relay Sync",
-  "version": "1.8.2",
-  "description": "Stop times from actions[] CHECKIN/CHECKOUT (ISO-aware); force re-sync ignores version; Telegram stay OFF.",
+  "version": "1.9.0",
+  "description": "Payments sync via financials settlements + payments-summary capture; 30m low-priority fetch.",
   "permissions": [
     "storage",
     "tabs",

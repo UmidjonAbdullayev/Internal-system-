@@ -10,6 +10,8 @@
     const CAPTURE_TYPE = '__RELAY_CAPTURE__';
     const FETCH_REQ = '__RELAY_FETCH_ENTITIES_V2_REQ__';
     const FETCH_RES = '__RELAY_FETCH_ENTITIES_V2_RES__';
+    const FIN_FETCH_REQ = '__RELAY_FETCH_FINANCIALS_REQ__';
+    const FIN_FETCH_RES = '__RELAY_FETCH_FINANCIALS_RES__';
     const DEBUG = true;
 
     const pendingFetches = new Map();
@@ -30,6 +32,7 @@
                 requestBody: msg.requestBody || null,
                 requestHeaders: msg.requestHeaders || null,
                 data: msg.data,
+                captureKind: msg.captureKind || null,
                 capturedAt: new Date().toISOString(),
                 pageUrl: location.href,
               },
@@ -38,14 +41,22 @@
               },
             );
             if (DEBUG) {
-              const tab = msg.requestBody?.tileCountTab || '?';
-              // eslint-disable-next-line no-console
-              console.log('[RelayCapture bridge] forwarded entitiesV2', tab);
+              if (msg.captureKind) {
+                // eslint-disable-next-line no-console
+                console.log('[RelayCapture bridge] forwarded financials', msg.captureKind);
+              } else {
+                const tab = msg.requestBody?.tileCountTab || '?';
+                // eslint-disable-next-line no-console
+                console.log('[RelayCapture bridge] forwarded entitiesV2', tab);
+              }
             }
             return;
           }
 
-          if (msg.type === FETCH_RES && msg.requestId) {
+          if (
+            (msg.type === FETCH_RES || msg.type === FIN_FETCH_RES) &&
+            msg.requestId
+          ) {
             const pending = pendingFetches.get(msg.requestId);
             if (pending) {
               pendingFetches.delete(msg.requestId);
@@ -60,48 +71,92 @@
     );
 
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-      if (msg?.type !== 'RELAY_FETCH_ENTITIES_V2') return;
-      (async () => {
-        try {
-          const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-          const result = await new Promise((resolve) => {
-            const timer = setTimeout(() => {
-              pendingFetches.delete(requestId);
-              resolve({
-                ok: false,
-                context: 'content',
-                url: msg.url || '',
-                error: 'entitiesV2 fetch timed out',
-                at: new Date().toISOString(),
+      if (msg?.type === 'RELAY_FETCH_ENTITIES_V2') {
+        (async () => {
+          try {
+            const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+            const result = await new Promise((resolve) => {
+              const timer = setTimeout(() => {
+                pendingFetches.delete(requestId);
+                resolve({
+                  ok: false,
+                  context: 'content',
+                  url: msg.url || '',
+                  error: 'entitiesV2 fetch timed out',
+                  at: new Date().toISOString(),
+                });
+              }, 45000);
+              pendingFetches.set(requestId, (res) => {
+                clearTimeout(timer);
+                resolve(res);
               });
-            }, 45000);
-            pendingFetches.set(requestId, (res) => {
-              clearTimeout(timer);
-              resolve(res);
+              window.postMessage(
+                {
+                  type: FETCH_REQ,
+                  requestId,
+                  url: msg.url,
+                  body: msg.body,
+                  headers: msg.headers || null,
+                },
+                location.origin,
+              );
             });
-            window.postMessage(
-              {
-                type: FETCH_REQ,
-                requestId,
-                url: msg.url,
-                body: msg.body,
-                headers: msg.headers || null,
-              },
-              location.origin,
-            );
-          });
-          sendResponse(result);
-        } catch (err) {
-          sendResponse({
-            ok: false,
-            context: 'content',
-            url: msg.url || '',
-            error: String(err?.message || err),
-            at: new Date().toISOString(),
-          });
-        }
-      })();
-      return true;
+            sendResponse(result);
+          } catch (err) {
+            sendResponse({
+              ok: false,
+              context: 'content',
+              url: msg.url || '',
+              error: String(err?.message || err),
+              at: new Date().toISOString(),
+            });
+          }
+        })();
+        return true;
+      }
+
+      if (msg?.type === 'RELAY_FETCH_FINANCIALS') {
+        (async () => {
+          try {
+            const requestId = `fin_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+            const result = await new Promise((resolve) => {
+              const timer = setTimeout(() => {
+                pendingFetches.delete(requestId);
+                resolve({
+                  ok: false,
+                  context: 'content',
+                  url: msg.url || '',
+                  error: 'financials fetch timed out',
+                  at: new Date().toISOString(),
+                });
+              }, 45000);
+              pendingFetches.set(requestId, (res) => {
+                clearTimeout(timer);
+                resolve(res);
+              });
+              window.postMessage(
+                {
+                  type: FIN_FETCH_REQ,
+                  requestId,
+                  url: msg.url,
+                  headers: msg.headers || null,
+                },
+                location.origin,
+              );
+            });
+            sendResponse(result);
+          } catch (err) {
+            sendResponse({
+              ok: false,
+              context: 'content',
+              url: msg.url || '',
+              error: String(err?.message || err),
+              at: new Date().toISOString(),
+            });
+          }
+        })();
+        return true;
+      }
     });
 
     // Page heartbeat every 30s so SW can reload stale sync tabs.
@@ -119,7 +174,7 @@
 
     if (DEBUG) {
       // eslint-disable-next-line no-console
-      console.log('[RelayCapture bridge] listening for entitiesV2 captures');
+      console.log('[RelayCapture bridge] listening for entitiesV2 + financials captures');
     }
   } catch {
     /* never break the page */

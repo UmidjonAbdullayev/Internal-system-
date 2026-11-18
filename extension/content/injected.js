@@ -1,5 +1,5 @@
 /**
- * MAIN-world hooks — capture ONLY POST /api/tours/entitiesV2.
+ * MAIN-world hooks — capture entitiesV2 POST + financials GET.
  * Also serves scheduled fetches for always-on sync (same credentials).
  * Never touches the DOM. Never consumes/alters original responses.
  */
@@ -11,7 +11,11 @@
     const CAPTURE_TYPE = '__RELAY_CAPTURE__';
     const FETCH_REQ = '__RELAY_FETCH_ENTITIES_V2_REQ__';
     const FETCH_RES = '__RELAY_FETCH_ENTITIES_V2_RES__';
+    const FIN_FETCH_REQ = '__RELAY_FETCH_FINANCIALS_REQ__';
+    const FIN_FETCH_RES = '__RELAY_FETCH_FINANCIALS_RES__';
     const TARGET = '/api/tours/entitiesV2';
+    const SETTLEMENTS = '/api/financials/v1/settlements';
+    const PAYMENTS_SUMMARY = '/api/financials/v1/payments-summary';
     const DEBUG = true;
 
     let lastHeaders = null;
@@ -22,6 +26,17 @@
       } catch {
         return false;
       }
+    }
+
+    function financialKind(url) {
+      try {
+        const u = String(url || '');
+        if (u.includes(SETTLEMENTS)) return 'settlements';
+        if (u.includes(PAYMENTS_SUMMARY)) return 'payments-summary';
+      } catch {
+        /* ignore */
+      }
+      return null;
     }
 
     function stripCookieHeaders(headers) {
@@ -78,7 +93,7 @@
       return null;
     }
 
-    function safePost(url, requestBody, data) {
+    function safePost(url, requestBody, data, kind) {
       try {
         window.postMessage(
           {
@@ -87,13 +102,19 @@
             requestBody: requestBody || null,
             requestHeaders: lastHeaders,
             data,
+            captureKind: kind || null,
           },
           location.origin,
         );
         if (DEBUG) {
-          const tab = requestBody?.tileCountTab || '?';
-          // eslint-disable-next-line no-console
-          console.log('[RelayCapture MAIN] entitiesV2 captured', tab);
+          if (kind) {
+            // eslint-disable-next-line no-console
+            console.log('[RelayCapture MAIN] financials captured', kind);
+          } else {
+            const tab = requestBody?.tileCountTab || '?';
+            // eslint-disable-next-line no-console
+            console.log('[RelayCapture MAIN] entitiesV2 captured', tab);
+          }
         }
       } catch {
         /* ignore */
@@ -105,6 +126,7 @@
       window.fetch = async function relayCaptureFetch(input, init) {
         let reqUrl = '';
         let reqBody = null;
+        let finKind = null;
         try {
           reqUrl =
             typeof input === 'string'
@@ -118,6 +140,12 @@
             reqBody = parseRequestBody(rawBody);
             const hdrs = headersToObject(init?.headers) || headersToObject(input?.headers);
             if (hdrs && Object.keys(hdrs).length) lastHeaders = hdrs;
+          } else {
+            finKind = financialKind(reqUrl);
+            if (finKind) {
+              const hdrs = headersToObject(init?.headers) || headersToObject(input?.headers);
+              if (hdrs && Object.keys(hdrs).length) lastHeaders = hdrs;
+            }
           }
         } catch {
           /* ignore */
@@ -130,9 +158,17 @@
             res
               .clone()
               .json()
-              .then((data) => safePost(reqUrl, reqBody, data))
+              .then((data) => safePost(reqUrl, reqBody, data, null))
               .catch(() => {
                 /* ignore non-json */
+              });
+          } else if (finKind) {
+            res
+              .clone()
+              .json()
+              .then((data) => safePost(reqUrl, null, data, finKind))
+              .catch(() => {
+                /* ignore */
               });
           }
         } catch {
@@ -151,6 +187,7 @@
       XHR.prototype.open = function relayCaptureOpen(method, url) {
         try {
           this.__relayCaptureUrl = String(url || '');
+          this.__relayCaptureMethod = String(method || 'GET');
           this.__relayCaptureHeaders = {};
         } catch {
           /* ignore */
@@ -187,13 +224,39 @@
                         : '';
                   if (!text) return;
                   const data = JSON.parse(text);
-                  safePost(url, this.__relayCaptureRequestBody || null, data);
+                  safePost(url, this.__relayCaptureRequestBody || null, data, null);
                 } catch {
                   /* ignore */
                 }
               },
               { once: true },
             );
+          } else {
+            const kind = financialKind(url);
+            if (kind) {
+              if (this.__relayCaptureHeaders && Object.keys(this.__relayCaptureHeaders).length) {
+                lastHeaders = stripCookieHeaders(this.__relayCaptureHeaders);
+              }
+              this.addEventListener(
+                'load',
+                function onFinLoad() {
+                  try {
+                    const text =
+                      typeof this.responseText === 'string'
+                        ? this.responseText
+                        : typeof this.response === 'string'
+                          ? this.response
+                          : '';
+                    if (!text) return;
+                    const data = JSON.parse(text);
+                    safePost(url, null, data, kind);
+                  } catch {
+                    /* ignore */
+                  }
+                },
+                { once: true },
+              );
+            }
           }
         } catch {
           /* ignore */
@@ -202,102 +265,169 @@
       };
     }
 
+    function postAuthOrError(type, requestId, res, finalUrl, url) {
+      const ct = res.headers?.get?.('content-type') || '';
+      if (/signin|ap\/signin|login/i.test(finalUrl) || res.status === 401 || res.status === 403) {
+        window.postMessage(
+          {
+            type,
+            requestId,
+            ok: false,
+            status: res.status || 401,
+            authRequired: true,
+            error: 'Log in to Relay',
+            url,
+            at: new Date().toISOString(),
+          },
+          location.origin,
+        );
+        return true;
+      }
+      if (!/json/i.test(ct)) {
+        window.postMessage(
+          {
+            type,
+            requestId,
+            ok: false,
+            status: res.status,
+            authRequired: /signin|login/i.test(finalUrl),
+            error: `Non-JSON response (${res.status})`,
+            url,
+            at: new Date().toISOString(),
+          },
+          location.origin,
+        );
+        return true;
+      }
+      return false;
+    }
+
     // Always-on / scheduled fetch: isolated → MAIN with template headers
     window.addEventListener('message', (e) => {
       try {
         if (e.source !== window) return;
         const msg = e.data;
-        if (!msg || msg.type !== FETCH_REQ) return;
-        const { requestId, url, body, headers: tplHeaders } = msg;
-        (async () => {
-          try {
-            const headers = {
-              Accept: 'application/json',
-              'Content-Type': 'application/json',
-              ...stripCookieHeaders(lastHeaders || {}),
-              ...stripCookieHeaders(tplHeaders || {}),
-            };
-            headers['Content-Type'] = 'application/json';
-            delete headers.Cookie;
-            delete headers.cookie;
+        if (!msg) return;
 
-            const res = await originalFetch(url || `https://relay.amazon.com${TARGET}`, {
-              method: 'POST',
-              credentials: 'include',
-              headers,
-              body: JSON.stringify(body || {}),
-              redirect: 'follow',
-            });
+        if (msg.type === FETCH_REQ) {
+          const { requestId, url, body, headers: tplHeaders } = msg;
+          (async () => {
+            try {
+              const headers = {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                ...stripCookieHeaders(lastHeaders || {}),
+                ...stripCookieHeaders(tplHeaders || {}),
+              };
+              headers['Content-Type'] = 'application/json';
+              delete headers.Cookie;
+              delete headers.cookie;
 
-            const ct = res.headers?.get?.('content-type') || '';
-            const finalUrl = res.url || '';
-            if (/signin|ap\/signin|login/i.test(finalUrl) || res.status === 401 || res.status === 403) {
+              const res = await originalFetch(url || `https://relay.amazon.com${TARGET}`, {
+                method: 'POST',
+                credentials: 'include',
+                headers,
+                body: JSON.stringify(body || {}),
+                redirect: 'follow',
+              });
+
+              const finalUrl = res.url || '';
+              if (postAuthOrError(FETCH_RES, requestId, res, finalUrl, url || TARGET)) return;
+
+              const data = await res.json();
+              if (res.ok) safePost(url || TARGET, body, data, null);
               window.postMessage(
                 {
                   type: FETCH_RES,
                   requestId,
-                  ok: false,
-                  status: res.status || 401,
-                  authRequired: true,
-                  error: 'Log in to Relay',
-                },
-                location.origin,
-              );
-              return;
-            }
-
-            if (!/json/i.test(ct)) {
-              const text = await res.text().catch(() => '');
-              const auth =
-                /signin|Sign in|amazon\.com\/ap\//i.test(text) ||
-                /signin|login/i.test(finalUrl);
-              window.postMessage(
-                {
-                  type: FETCH_RES,
-                  requestId,
-                  ok: false,
+                  ok: res.ok,
                   status: res.status,
-                  authRequired: auth,
-                  error: auth ? 'Log in to Relay' : `Non-JSON response (${res.status})`,
+                  context: 'page',
+                  url: url || `https://relay.amazon.com${TARGET}`,
+                  data: res.ok ? data : null,
+                  error: res.ok ? null : `HTTP ${res.status}`,
+                  at: new Date().toISOString(),
                 },
                 location.origin,
               );
-              return;
+            } catch (err) {
+              window.postMessage(
+                {
+                  type: FETCH_RES,
+                  requestId,
+                  ok: false,
+                  status: null,
+                  context: 'page',
+                  url: url || `https://relay.amazon.com${TARGET}`,
+                  error: String(err?.message || err),
+                  at: new Date().toISOString(),
+                },
+                location.origin,
+              );
             }
+          })();
+          return;
+        }
 
-            const data = await res.json();
-            // Scheduled fetches also emit capture so template/passive path stays warm
-            if (res.ok) safePost(url || TARGET, body, data);
-            window.postMessage(
-              {
-                type: FETCH_RES,
-                requestId,
-                ok: res.ok,
-                status: res.status,
-                context: 'page',
-                url: url || `https://relay.amazon.com${TARGET}`,
-                data: res.ok ? data : null,
-                error: res.ok ? null : `HTTP ${res.status}`,
-                at: new Date().toISOString(),
-              },
-              location.origin,
-            );
-          } catch (err) {
-            window.postMessage(
-              {
-                type: FETCH_RES,
-                requestId,
-                ok: false,
-                status: null,
-                context: 'page',
-                url: url || `https://relay.amazon.com${TARGET}`,
-                error: String(err?.message || err),
-                at: new Date().toISOString(),
-              },
-              location.origin,
-            );
-          }
-        })();
+        if (msg.type === FIN_FETCH_REQ) {
+          const { requestId, url, headers: tplHeaders } = msg;
+          (async () => {
+            try {
+              const headers = {
+                Accept: 'application/json',
+                ...stripCookieHeaders(lastHeaders || {}),
+                ...stripCookieHeaders(tplHeaders || {}),
+              };
+              delete headers.Cookie;
+              delete headers.cookie;
+              delete headers['Content-Type'];
+              delete headers['content-type'];
+
+              const res = await originalFetch(url, {
+                method: 'GET',
+                credentials: 'include',
+                headers,
+                redirect: 'follow',
+              });
+
+              const finalUrl = res.url || '';
+              const kind = financialKind(url);
+              if (postAuthOrError(FIN_FETCH_RES, requestId, res, finalUrl, url)) return;
+
+              const data = await res.json();
+              if (res.ok) safePost(url, null, data, kind);
+              window.postMessage(
+                {
+                  type: FIN_FETCH_RES,
+                  requestId,
+                  ok: res.ok,
+                  status: res.status,
+                  context: 'page',
+                  url,
+                  kind,
+                  data: res.ok ? data : null,
+                  error: res.ok ? null : `HTTP ${res.status}`,
+                  at: new Date().toISOString(),
+                },
+                location.origin,
+              );
+            } catch (err) {
+              window.postMessage(
+                {
+                  type: FIN_FETCH_RES,
+                  requestId,
+                  ok: false,
+                  status: null,
+                  context: 'page',
+                  url,
+                  error: String(err?.message || err),
+                  at: new Date().toISOString(),
+                },
+                location.origin,
+              );
+            }
+          })();
+        }
       } catch {
         /* ignore */
       }
@@ -305,7 +435,7 @@
 
     if (DEBUG) {
       // eslint-disable-next-line no-console
-      console.log('[RelayCapture MAIN] entitiesV2 hooks installed');
+      console.log('[RelayCapture MAIN] entitiesV2 + financials hooks installed');
     }
   } catch {
     /* never break the page */
