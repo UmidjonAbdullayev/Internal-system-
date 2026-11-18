@@ -40,7 +40,22 @@ function startPreview() {
       if (!ready) throw new Error('vite preview did not become ready');
     },
     stop() {
-      if (child.exitCode == null) child.kill('SIGTERM');
+      if (child.exitCode != null) return;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
+      // Ensure CI does not hang if vite ignores SIGTERM.
+      setTimeout(() => {
+        if (child.exitCode == null) {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* ignore */
+          }
+        }
+      }, 2000).unref?.();
     },
   };
 }
