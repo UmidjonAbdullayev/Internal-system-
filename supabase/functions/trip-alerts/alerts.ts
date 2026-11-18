@@ -130,6 +130,41 @@ function isCancelledTrip(trip: Record<string, unknown>): boolean {
   return /CANCEL/.test(status);
 }
 
+function isCancelledStatus(status: unknown): boolean {
+  return /CANCEL/.test(String(status || "").toUpperCase());
+}
+
+/** Load IDs marked CANCELLED on the trip raw payload. */
+export function extractCancelledLoadIdsFromRaw(raw: unknown): Set<string> {
+  const out = new Set<string>();
+  if (!raw || typeof raw !== "object") return out;
+  const loads = (raw as Record<string, unknown>).loads;
+  if (!Array.isArray(loads)) return out;
+  for (const load of loads) {
+    if (!load || typeof load !== "object") continue;
+    const row = load as Record<string, unknown>;
+    if (!isCancelledStatus(row.executionStatus ?? row.execution_status ?? row.status)) {
+      continue;
+    }
+    const id = row.id ?? row.loadId ?? row.load_id;
+    if (id) out.add(String(id));
+  }
+  return out;
+}
+
+function isCancelledLoadStop(
+  stop: Record<string, unknown>,
+  cancelledLoadIds: Set<string>,
+): boolean {
+  const loadId = String(stop.load_id || "").trim();
+  return Boolean(loadId) && cancelledLoadIds.has(loadId);
+}
+
+/** Alertable stops only — cancelled-load stops never participate in next-stop or sends. */
+function alertableStops(ctx: TripCtx): Array<Record<string, unknown>> {
+  return ctx.stops.filter((s) => !isCancelledLoadStop(s, ctx.cancelledLoadIds));
+}
+
 function stopIsNext(
   stop: Record<string, unknown>,
   allStops: Array<Record<string, unknown>>,
@@ -148,6 +183,7 @@ function stopIsNext(
 type TripCtx = {
   trip: Record<string, unknown>;
   stops: Array<Record<string, unknown>>;
+  cancelledLoadIds: Set<string>;
   crmDriverIds: string[];
   relayDriverIds: string[];
   tractor: string | null;
@@ -165,6 +201,7 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
   const map = new Map<string, TripCtx>();
   const tripIds = (trips || []).map((t) => t.trip_id);
   let stops: Array<Record<string, unknown>> = [];
+  const cancelledByTrip = new Map<string, Set<string>>();
   if (tripIds.length) {
     const { data: stopRows } = await sb
       .from("relay_stops")
@@ -174,18 +211,37 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
       .in("trip_id", tripIds)
       .eq("archived", false);
     stops = stopRows || [];
+
+    const { data: legRows } = await sb
+      .from("relay_legs")
+      .select("trip_id, load_id, execution_status")
+      .in("trip_id", tripIds)
+      .eq("archived", false);
+    for (const leg of legRows || []) {
+      if (!isCancelledStatus(leg.execution_status)) continue;
+      const tid = String(leg.trip_id || "");
+      const lid = String(leg.load_id || "").trim();
+      if (!tid || !lid) continue;
+      if (!cancelledByTrip.has(tid)) cancelledByTrip.set(tid, new Set());
+      cancelledByTrip.get(tid)!.add(lid);
+    }
   }
 
   for (const trip of trips || []) {
     const tripStops = stops
       .filter((s) => String(s.trip_id) === trip.trip_id)
       .sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
+    const cancelledLoadIds = new Set<string>([
+      ...extractCancelledLoadIdsFromRaw(trip.raw),
+      ...(cancelledByTrip.get(trip.trip_id) || []),
+    ]);
     const crmDriverIds = await matchCrmDriverIds(sb, trip.driver_name_raw);
     const relayDriverIds = extractRelayDriverIds(trip.raw);
     const tractor = tractorFromTripRaw(trip.raw);
     map.set(trip.trip_id, {
       trip: trip as Record<string, unknown>,
       stops: tripStops,
+      cancelledLoadIds,
       crmDriverIds,
       relayDriverIds,
       tractor,
@@ -199,13 +255,15 @@ function buildArrivedAlert(
   stop: Record<string, unknown>,
   opts: { test?: boolean; dryRun?: boolean; reason?: string; syncBasis?: string; force?: boolean },
 ): OutgoingAlert | null {
+  if (isCancelledLoadStop(stop, ctx.cancelledLoadIds)) return null;
   const actual = stop.actual_arrival ? String(stop.actual_arrival) : null;
   if (!actual) return null;
   const planned = stop.scheduled_arrival ? String(stop.scheduled_arrival) : null;
   const tz = String(stop.time_zone || "America/Los_Angeles");
   const facility = String(stop.facility_code || stop.stop_type || "Stop");
   const loadId = String(stop.load_id || stop.trip_id);
-  const stopCount = Math.max(1, ctx.stops.length);
+  const eligible = alertableStops(ctx);
+  const stopCount = Math.max(1, eligible.length);
   const seq = Number(stop.seq ?? 1);
   const trailer = trailerFromStopRaw(stop.raw, null);
   const driverName = ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null;
@@ -260,19 +318,21 @@ function buildNotAtStopAlert(
   now: number,
   opts: { test?: boolean; dryRun?: boolean; reason?: string; syncBasis?: string; force?: boolean },
 ): OutgoingAlert | null {
+  if (isCancelledLoadStop(stop, ctx.cancelledLoadIds)) return null;
   if (stop.actual_arrival) return null;
   const planned = stop.scheduled_arrival ? new Date(String(stop.scheduled_arrival)).getTime() : NaN;
   if (Number.isNaN(planned)) return null;
   const overdue = now - planned;
   if (overdue < LATE_GRACE_MS) return null;
   if (overdue > MAX_STOP_AGE_MS) return null;
-  if (!stopIsNext(stop, ctx.stops)) return null;
+  const eligible = alertableStops(ctx);
+  if (!stopIsNext(stop, eligible)) return null;
   if (isCancelledTrip(ctx.trip)) return null;
 
   const tz = String(stop.time_zone || "America/Los_Angeles");
   const facility = String(stop.facility_code || stop.stop_type || "Stop");
   const loadId = String(stop.load_id || stop.trip_id);
-  const stopCount = Math.max(1, ctx.stops.length);
+  const stopCount = Math.max(1, eligible.length);
   const seq = Number(stop.seq ?? 1);
   const trailer = trailerFromStopRaw(stop.raw, null);
   const driverName = ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null;
@@ -352,8 +412,19 @@ export async function processStatusEvents(
       results.push({ alertType: "arrived", tripId: ev.tripId, status: "trip_not_active" });
       continue;
     }
-    const stop = ctx.stops.find((s) => String(s.stop_id) === String(ev.stopId || "")) ||
-      ctx.stops.find((s) => s.actual_arrival);
+    const eligible = alertableStops(ctx);
+    const stop = eligible.find((s) => String(s.stop_id) === String(ev.stopId || "")) ||
+      eligible.find((s) => s.actual_arrival);
+    if (ev.stopId && ctx.stops.some((s) => String(s.stop_id) === String(ev.stopId)) &&
+      !eligible.some((s) => String(s.stop_id) === String(ev.stopId))) {
+      results.push({
+        alertType: "arrived",
+        tripId: ev.tripId,
+        stopId: ev.stopId,
+        status: "skipped_cancelled_load",
+      });
+      continue;
+    }
     if (!stop?.actual_arrival) {
       results.push({ alertType: "arrived", tripId: ev.tripId, status: "no_actual" });
       continue;
@@ -409,12 +480,14 @@ export async function runCronChecks(
       if (isCancelledTrip(ctx.trip)) continue;
       const section = String(ctx.trip.section || "");
 
-      // NOT AT STOP — at most one next-stop per trip (earliest overdue eligible)
+      // NOT AT STOP — at most one next-stop per trip (earliest overdue eligible).
+      // Cancelled-load stops are excluded from alertableStops / buildNotAtStopAlert.
       if (section === "IN_TRANSIT" || section === "UPCOMING") {
+        const eligible = alertableStops(ctx);
         const candidates: OutgoingAlert[] = [];
-        for (const stop of ctx.stops) {
+        for (const stop of eligible) {
           if (section === "UPCOMING") {
-            const firstPickup = ctx.stops.find(
+            const firstPickup = eligible.find(
               (s) => /pick/i.test(String(s.stop_type || "")) || Number(s.seq) === 1,
             );
             if (firstPickup && String(firstPickup.stop_id) !== String(stop.stop_id)) {
@@ -447,7 +520,7 @@ export async function runCronChecks(
       // Dry-run ARRIVED: actual_arrival timestamp within the last ~1h only
       // (do not use updated_at — remaps/re-syncs would inflate the preview)
       if (dryRun) {
-        for (const stop of ctx.stops) {
+        for (const stop of alertableStops(ctx)) {
           if (!stop.actual_arrival) continue;
           const actual = new Date(String(stop.actual_arrival)).getTime();
           const recent = !Number.isNaN(actual) && now - actual <= windowMs && actual <= now;
