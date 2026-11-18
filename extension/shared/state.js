@@ -38,6 +38,9 @@ const DEFAULT_STATE = {
   financialHeaders: null,
   settlementsNextPageToken: null,
   lastPaymentsInvoiceCount: 0,
+  /** Dedicated payments-sync fields (popup prefers these over DOM section state). */
+  lastPaymentsAttemptAt: null,
+  lastPaymentsError: null,
   collectionLocks: {},
   detailScraped: {},
   extensionApiKey: '',
@@ -138,9 +141,16 @@ const DEFAULT_STATE = {
   },
 };
 
+const DEFAULT_SECTION_ENTRY = { state: 'Not checked', lastError: null, lastCollectedAt: null };
+
 export async function getState() {
   const stored = await chrome.storage.local.get(['relayState']);
   const merged = { ...DEFAULT_STATE, ...(stored.relayState || {}) };
+  merged.sections = {
+    tours: { ...DEFAULT_SECTION_ENTRY, ...(merged.sections?.tours || {}) },
+    load_detail: { ...DEFAULT_SECTION_ENTRY, ...(merged.sections?.load_detail || {}) },
+    payments: { ...DEFAULT_SECTION_ENTRY, ...(merged.sections?.payments || {}) },
+  };
   merged.syncProgress = { ...DEFAULT_STATE.syncProgress, ...(merged.syncProgress || {}) };
   merged.health = { ...DEFAULT_STATE.health, ...(merged.health || {}) };
   merged.scheduleMs = { ...SCHEDULE_DEFAULTS, ...(merged.scheduleMs || {}) };
@@ -216,11 +226,18 @@ export async function getState() {
   return merged;
 }
 
-export async function setState(patch) {
-  const current = await getState().catch(() => ({}));
+/** Serialize read-modify-write so concurrent always-on + payments setState cannot clobber. */
+let stateWriteChain = Promise.resolve();
+
+async function setStateUnlocked(patch) {
+  const current = await getState().catch(() => ({ ...DEFAULT_STATE }));
   const next = { ...current, ...patch };
   if (patch.sections) {
-    next.sections = { ...(current.sections || {}), ...patch.sections };
+    const base = current.sections || DEFAULT_STATE.sections;
+    next.sections = { ...base };
+    for (const [id, secPatch] of Object.entries(patch.sections)) {
+      next.sections[id] = { ...(base[id] || DEFAULT_SECTION_ENTRY), ...secPatch };
+    }
   }
   if (patch.syncProgress) {
     next.syncProgress = { ...(current.syncProgress || {}), ...patch.syncProgress };
@@ -275,14 +292,22 @@ export async function setState(patch) {
   return next;
 }
 
+export function setState(patch) {
+  const run = stateWriteChain.then(() => setStateUnlocked(patch));
+  // Keep the chain alive even if a write fails
+  stateWriteChain = run.catch((err) => {
+    console.warn('[setState] queued write failed', err);
+  });
+  return run;
+}
+
 
 export async function updateSection(sectionId, patch) {
-  const current = await getState();
-  const sections = {
-    ...current.sections,
-    [sectionId]: { ...current.sections[sectionId], ...patch },
-  };
-  return setState({ sections });
+  return setState({
+    sections: {
+      [sectionId]: patch,
+    },
+  });
 }
 
 export async function ensureClientId() {

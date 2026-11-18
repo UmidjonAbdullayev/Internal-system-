@@ -142,15 +142,42 @@ function render(state) {
   $('sections').innerHTML = SECTIONS.map((section) => {
     const sec = state.sections?.[section.id] || {};
     let st = sec.state || 'Not checked';
-    // Payments: surface real error or Synced · HH:MM · N invoices
-    if (section.id === 'payments' && sec.lastError && st === 'Error') {
+    let title = sec.lastError || st;
+
+    // Payments: prefer dedicated sync fields (not old DOM section state alone).
+    // After any fetch attempt → Synced · HH:MM · N invoices, Collecting, or real error.
+    if (section.id === 'payments') {
+      const err = state.lastPaymentsError || sec.lastError || null;
+      const attempted = Boolean(state.lastPaymentsAttemptAt || state.paymentsScanInProgress);
+      if (state.paymentsScanInProgress) {
+        st = 'Collecting';
+      } else if (err) {
+        st = `Error · ${err}`;
+        title = err;
+      } else if (state.lastPaymentsScanAt) {
+        const d = new Date(state.lastPaymentsScanAt);
+        const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        const n = Number(state.lastPaymentsInvoiceCount) || 0;
+        st = `Synced · ${hhmm} · ${n} invoice${n === 1 ? '' : 's'}`;
+        title = st;
+      } else if (/^Synced/i.test(String(sec.state || ''))) {
+        st = sec.state;
+      } else if (attempted) {
+        // Attempt recorded but no terminal sync yet — never show "Not checked"
+        st = sec.state && sec.state !== 'Not checked' ? sec.state : 'Collecting';
+      } else {
+        st = 'Not checked';
+      }
+    } else if (sec.lastError && st === 'Error') {
       st = `Error · ${sec.lastError}`;
+      title = sec.lastError;
     }
+
     const syncedOk = /^Synced/i.test(String(st));
     const errOk = /^Error/i.test(String(st));
     const cls = errOk ? 'error' : syncedOk ? 'synced' : badgeClass(st);
     return `<li><span>${section.label}</span><span class="badge ${cls}" title="${escapeAttr(
-      sec.lastError || st,
+      title,
     )}">${st}</span></li>`;
   }).join('');
 

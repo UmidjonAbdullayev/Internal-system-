@@ -13,7 +13,7 @@ import {
   SUPABASE_ANON_KEY,
   FLUSH_TIMEOUT_MS,
 } from '../shared/config.js';
-import { getState, setState, updateSection, ensureClientId } from '../shared/state.js';
+import { getState, setState, ensureClientId } from '../shared/state.js';
 import {
   mapSettlementList,
   mapPaymentsSummary,
@@ -40,7 +40,7 @@ export async function ensurePaymentsAlarm() {
   });
 }
 
-function formatSyncedLabel(atIso, count) {
+export function formatSyncedLabel(atIso, count) {
   let hhmm = '—';
   try {
     const d = new Date(atIso || Date.now());
@@ -48,15 +48,71 @@ function formatSyncedLabel(atIso, count) {
   } catch {
     /* ignore */
   }
-  return `Synced · ${hhmm} · ${count} invoice${count === 1 ? '' : 's'}`;
+  const n = Number(count) || 0;
+  return `Synced · ${hhmm} · ${n} invoice${n === 1 ? '' : 's'}`;
 }
 
-async function fetchFinancialsGet(tabId, url) {
+/** Popup + section label after a fetch attempt — never leave "Not checked". */
+async function markPaymentsAttempt(patch = {}) {
+  const at = patch.lastPaymentsAttemptAt || new Date().toISOString();
+  const next = {
+    lastPaymentsAttemptAt: at,
+    lastPaymentsError: patch.lastError !== undefined ? patch.lastError : null,
+    sections: {
+      payments: {
+        state: patch.state || 'Collecting',
+        lastError: patch.lastError !== undefined ? patch.lastError : null,
+        lastCollectedAt: patch.lastCollectedAt || at,
+      },
+    },
+  };
+  for (const key of [
+    'paymentsScanInProgress',
+    'paymentsScanStartedAt',
+    'lastPaymentsScanAt',
+    'lastPaymentsInvoiceCount',
+    'pendingInvoices',
+    'pendingPaymentsSummary',
+    'recordsCollected',
+    'recordsUpdated',
+    'financialHeaders',
+    'settlementsNextPageToken',
+  ]) {
+    if (patch[key] !== undefined) next[key] = patch[key];
+  }
+  return setState(next);
+}
+
+async function markPaymentsError(error) {
+  const msg = String(error || 'payments sync failed');
+  log('payments error', msg);
+  return markPaymentsAttempt({
+    state: 'Error',
+    lastError: msg,
+    paymentsScanInProgress: false,
+  });
+}
+
+async function markPaymentsSynced(atIso, count) {
+  const at = atIso || new Date().toISOString();
+  const label = formatSyncedLabel(at, count);
+  return markPaymentsAttempt({
+    state: label,
+    lastError: null,
+    lastCollectedAt: at,
+    lastPaymentsScanAt: at,
+    lastPaymentsInvoiceCount: Number(count) || 0,
+    paymentsScanInProgress: false,
+  });
+}
+
+async function fetchFinancialsGet(tabId, url, headers) {
   if (!tabId) return { ok: false, error: 'No Relay sync tab' };
   try {
     const res = await hooks.sendToTab(tabId, {
       type: 'RELAY_FETCH_FINANCIALS',
       url,
+      headers: headers || null,
     });
     return res || { ok: false, error: 'Empty financials response' };
   } catch (err) {
@@ -102,6 +158,10 @@ async function postInvoices(invoices, summary, extensionApiKey) {
         `HTTP ${res.status}`;
       throw new Error(err);
     }
+    log(
+      'relay-sync invoices response',
+      `http=${res.status} upserted=${json.invoices_upserted ?? '?'} trips=${json.invoice_trips_upserted ?? '?'}`,
+    );
     return json;
   } finally {
     clearTimeout(timer);
@@ -120,7 +180,10 @@ export async function ingestSettlementsPayload(data, { source = 'passive' } = {}
   const mapped = mapSettlementList(list).filter(
     (inv) => inv?.invoice_id && !String(inv.invoice_id).startsWith('FIXTURE-'),
   );
-  if (!mapped.length) return { invoices: 0 };
+  if (!mapped.length) {
+    log(`${source}: 0 invoices mapped from ${list.length} settlement row(s)`);
+    return { invoices: 0, raw: list.length };
+  }
 
   const state = await getState();
   const pending = { ...(state.pendingInvoices || {}) };
@@ -129,10 +192,9 @@ export async function ingestSettlementsPayload(data, { source = 'passive' } = {}
   }
   await setState({
     pendingInvoices: pending,
-    paymentsScanInProgress: false,
   });
   log(`${source}: queued ${mapped.length} invoice(s); pending=${Object.keys(pending).length}`);
-  return { invoices: mapped.length, pageToken: data?.pageToken ?? null };
+  return { invoices: mapped.length, pageToken: data?.pageToken ?? null, raw: list.length };
 }
 
 export async function ingestPaymentsSummary(data) {
@@ -159,79 +221,98 @@ export async function handleFinancialCapture(msg) {
 
   const data = msg.data;
   const capturedAt = msg.capturedAt || new Date().toISOString();
+  log('capture', kind, url.slice(0, 120));
 
-  // Remember headers from Payments page for scheduled GETs
-  if (msg.requestHeaders && Object.keys(msg.requestHeaders).length) {
-    await setState({ financialHeaders: msg.requestHeaders });
-  }
+  const headerPatch =
+    msg.requestHeaders && Object.keys(msg.requestHeaders).length
+      ? { financialHeaders: msg.requestHeaders }
+      : {};
 
   if (!state.live || !state.loggedIn) {
-    // Still mark section seen so popup isn't stuck on Not checked after browsing
-    if (kind === 'settlements' && Array.isArray(data?.settlementList)) {
-      await updateSection('payments', {
-        state: 'Collecting',
-        lastError: null,
-        lastCollectedAt: capturedAt,
-      });
-    }
+    // Mark attempt so popup leaves "Not checked" after browsing Payments
+    await markPaymentsAttempt({
+      state: 'Collecting',
+      lastError: null,
+      lastCollectedAt: capturedAt,
+      lastPaymentsAttemptAt: capturedAt,
+      ...headerPatch,
+    });
     return;
   }
 
   try {
+    if (Object.keys(headerPatch).length) {
+      await setState(headerPatch);
+    }
+    await markPaymentsAttempt({
+      state: 'Collecting',
+      lastError: null,
+      lastCollectedAt: capturedAt,
+      lastPaymentsAttemptAt: capturedAt,
+    });
     if (kind === 'settlements') {
-      await updateSection('payments', {
-        state: 'Collecting',
-        lastError: null,
-        lastCollectedAt: capturedAt,
-      });
       await ingestSettlementsPayload(data, { source: 'passive' });
-      // Paginate passively if pageToken present (scheduled path also paginates)
       const token = data?.pageToken;
       if (token) {
         await setState({ settlementsNextPageToken: token });
       }
-      void flushPendingInvoices();
+      await flushPendingInvoices({ allowEmpty: false });
     } else if (kind === 'payments-summary') {
       await ingestPaymentsSummary(data);
-      void flushPendingInvoices();
+      await flushPendingInvoices({ allowEmpty: false });
     }
   } catch (err) {
-    const error = String(err?.message || err);
-    log('handleFinancialCapture error', error);
-    await updateSection('payments', { state: 'Error', lastError: error });
+    await markPaymentsError(err?.message || err);
   }
 }
 
-export async function flushPendingInvoices() {
+export async function flushPendingInvoices({ allowEmpty = false } = {}) {
   const state = await getState();
-  if (!state.live || !state.loggedIn || !state.extensionApiKey) return;
+  if (!state.live || !state.loggedIn || !state.extensionApiKey) {
+    if (allowEmpty) {
+      await markPaymentsError('Not live or missing extension API key');
+    }
+    return null;
+  }
   const invoices = Object.values(state.pendingInvoices || {});
   const summary = state.pendingPaymentsSummary || null;
-  if (!invoices.length && !summary) return;
+  if (!invoices.length && !summary) {
+    if (allowEmpty) {
+      // Successful settlements fetch that mapped nothing — still terminal Synced
+      await markPaymentsSynced(new Date().toISOString(), state.lastPaymentsInvoiceCount || 0);
+    }
+    return null;
+  }
 
   try {
     const json = await postInvoices(invoices, summary, state.extensionApiKey);
     const upserted = json.invoices_upserted ?? invoices.length;
     const at = new Date().toISOString();
-    const label = formatSyncedLabel(at, upserted || invoices.length);
+    const count = upserted || invoices.length;
+    const prev = await getState();
     await setState({
       pendingInvoices: {},
       pendingPaymentsSummary: null,
       lastPaymentsScanAt: at,
-      lastPaymentsInvoiceCount: upserted || invoices.length,
-      recordsCollected: (state.recordsCollected || 0) + (upserted || invoices.length),
-      recordsUpdated: (state.recordsUpdated || 0) + (upserted || 0),
+      lastPaymentsInvoiceCount: count,
+      lastPaymentsAttemptAt: at,
+      lastPaymentsError: null,
+      recordsCollected: (prev.recordsCollected || 0) + count,
+      recordsUpdated: (prev.recordsUpdated || 0) + (upserted || 0),
+      paymentsScanInProgress: false,
+      sections: {
+        payments: {
+          state: formatSyncedLabel(at, count),
+          lastError: null,
+          lastCollectedAt: at,
+        },
+      },
     });
-    await updateSection('payments', {
-      state: label,
-      lastError: null,
-      lastCollectedAt: at,
-    });
-    log('flushed invoices', label);
+    log('flushed invoices', formatSyncedLabel(at, count));
+    return json;
   } catch (err) {
-    const error = String(err?.message || err);
-    await updateSection('payments', { state: 'Error', lastError: error });
-    log('flush invoices failed', error);
+    await markPaymentsError(err?.message || err);
+    return null;
   }
 }
 
@@ -249,10 +330,13 @@ export async function syncPaymentsNow({ force = false } = {}) {
   }
 
   syncRunning = true;
-  await setState({ paymentsScanInProgress: true, paymentsScanStartedAt: new Date().toISOString() });
-  await updateSection('payments', {
+  const startedAt = new Date().toISOString();
+  await markPaymentsAttempt({
     state: 'Collecting',
     lastError: null,
+    lastPaymentsAttemptAt: startedAt,
+    paymentsScanInProgress: true,
+    paymentsScanStartedAt: startedAt,
   });
 
   try {
@@ -261,8 +345,16 @@ export async function syncPaymentsNow({ force = false } = {}) {
       throw new Error('Open a Relay tab (Payments or Trips) so financials can fetch');
     }
 
+    const headers = (await getState()).financialHeaders || null;
+
     // payments-summary first
-    const sumRes = await fetchFinancialsGet(tabId, PAYMENTS_SUMMARY_URL);
+    const sumRes = await fetchFinancialsGet(tabId, PAYMENTS_SUMMARY_URL, headers);
+    log('payments-summary fetch', {
+      ok: sumRes?.ok,
+      status: sumRes?.status,
+      authRequired: sumRes?.authRequired,
+      error: sumRes?.error,
+    });
     if (sumRes?.authRequired) {
       throw new Error(sumRes.error || 'Log in to Relay');
     }
@@ -275,9 +367,18 @@ export async function syncPaymentsNow({ force = false } = {}) {
     let url = SETTLEMENTS_URL;
     let pages = 0;
     let totalMapped = 0;
+    let totalRaw = 0;
     const maxPages = 50;
     while (pages < maxPages) {
-      const res = await fetchFinancialsGet(tabId, url);
+      const res = await fetchFinancialsGet(tabId, url, headers);
+      log('settlements fetch', {
+        page: pages + 1,
+        ok: res?.ok,
+        status: res?.status,
+        authRequired: res?.authRequired,
+        error: res?.error,
+        url: url.slice(0, 120),
+      });
       if (res?.authRequired) {
         throw new Error(res.error || 'Log in to Relay');
       }
@@ -286,24 +387,32 @@ export async function syncPaymentsNow({ force = false } = {}) {
       }
       const ingested = await ingestSettlementsPayload(res.data, { source: 'scheduled' });
       totalMapped += ingested.invoices || 0;
+      totalRaw += ingested.raw || 0;
       pages += 1;
       const token = res.data?.pageToken;
       if (!token) break;
       url = `${SETTLEMENTS_URL}&pageToken=${encodeURIComponent(token)}`;
     }
 
-    await flushPendingInvoices();
+    await flushPendingInvoices({ allowEmpty: true });
     const after = await getState();
-    log(`payments sync done pages=${pages} mapped=${totalMapped}`);
+    // If flush left an error, surface it
+    if (after.lastPaymentsError) {
+      return { ok: false, error: after.lastPaymentsError, pages, invoices: totalMapped };
+    }
+    // Guarantee terminal Synced label even if flush was a no-op race
+    if (!after.lastPaymentsScanAt || !/^Synced/i.test(String(after.sections?.payments?.state || ''))) {
+      await markPaymentsSynced(new Date().toISOString(), totalMapped);
+    }
+    log(`payments sync done pages=${pages} raw=${totalRaw} mapped=${totalMapped}`);
     return {
       ok: true,
       pages,
-      invoices: after.lastPaymentsInvoiceCount || totalMapped,
+      invoices: (await getState()).lastPaymentsInvoiceCount || totalMapped,
     };
   } catch (err) {
     const error = String(err?.message || err);
-    await updateSection('payments', { state: 'Error', lastError: error });
-    log('syncPaymentsNow error', error);
+    await markPaymentsError(error);
     return { ok: false, error };
   } finally {
     syncRunning = false;
