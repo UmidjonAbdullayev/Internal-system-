@@ -77,9 +77,23 @@ export type DriverGroupChat = {
   chat_id: string;
   driver_id: string | null;
   relay_driver_id: string | null;
+  driver_name: string | null;
+  group_title: string | null;
   alerts_enabled: boolean;
   quiet: boolean;
 };
+
+function mapGroupRow(r: Record<string, unknown>): DriverGroupChat {
+  return {
+    chat_id: String(r.chat_id),
+    driver_id: r.driver_id ? String(r.driver_id) : null,
+    relay_driver_id: r.relay_driver_id ? String(r.relay_driver_id) : null,
+    driver_name: r.driver_name ? String(r.driver_name) : null,
+    group_title: r.group_title ? String(r.group_title) : null,
+    alerts_enabled: Boolean(r.alerts_enabled),
+    quiet: Boolean(r.quiet),
+  };
+}
 
 /** Resolve linked groups for CRM driver ids and/or Relay driver ids. */
 export async function resolveDriverGroupChats(
@@ -89,38 +103,19 @@ export async function resolveDriverGroupChats(
   const crm = [...new Set((opts.crmDriverIds || []).map((x) => String(x || "").trim()).filter(Boolean))];
   const relay = [...new Set((opts.relayDriverIds || []).map((x) => String(x || "").trim()).filter(Boolean))];
   const out = new Map<string, DriverGroupChat>();
+  const cols = "chat_id, driver_id, relay_driver_id, driver_name, group_title, alerts_enabled, quiet";
 
   if (crm.length) {
-    const { data } = await sb
-      .from("driver_groups")
-      .select("chat_id, driver_id, relay_driver_id, alerts_enabled, quiet")
-      .in("driver_id", crm)
-      .eq("active", true);
-    for (const r of data || []) {
-      out.set(String(r.chat_id), {
-        chat_id: String(r.chat_id),
-        driver_id: r.driver_id ? String(r.driver_id) : null,
-        relay_driver_id: r.relay_driver_id ? String(r.relay_driver_id) : null,
-        alerts_enabled: Boolean(r.alerts_enabled),
-        quiet: Boolean(r.quiet),
-      });
-    }
+    const { data } = await sb.from("driver_groups").select(cols).in("driver_id", crm).eq("active", true);
+    for (const r of data || []) out.set(String(r.chat_id), mapGroupRow(r as Record<string, unknown>));
   }
   if (relay.length) {
     const { data } = await sb
       .from("driver_groups")
-      .select("chat_id, driver_id, relay_driver_id, alerts_enabled, quiet")
+      .select(cols)
       .in("relay_driver_id", relay)
       .eq("active", true);
-    for (const r of data || []) {
-      out.set(String(r.chat_id), {
-        chat_id: String(r.chat_id),
-        driver_id: r.driver_id ? String(r.driver_id) : null,
-        relay_driver_id: r.relay_driver_id ? String(r.relay_driver_id) : null,
-        alerts_enabled: Boolean(r.alerts_enabled),
-        quiet: Boolean(r.quiet),
-      });
-    }
+    for (const r of data || []) out.set(String(r.chat_id), mapGroupRow(r as Record<string, unknown>));
   }
   return [...out.values()];
 }
@@ -271,6 +266,10 @@ async function notAtStopMessageId(
   return data?.telegram_message_id != null ? Number(data.telegram_message_id) : null;
 }
 
+/**
+ * At most one dry-run row per (trip, stop, alert_type, chat).
+ * chat_id null = unlinked candidate (still one row).
+ */
 export async function writeDryRun(
   sb: SupabaseClient,
   row: {
@@ -284,12 +283,25 @@ export async function writeDryRun(
     reason?: string;
     syncBasis?: string;
   },
-): Promise<void> {
-  await sb.from("dry_run_alerts").insert({
+): Promise<{ written: boolean }> {
+  const stopId = row.stopId || "";
+  const chatId = row.chatId || null;
+  let q = sb
+    .from("dry_run_alerts")
+    .select("id")
+    .eq("trip_id", row.tripId)
+    .eq("stop_id", stopId)
+    .eq("alert_type", row.alertType)
+    .limit(1);
+  q = chatId == null ? q.is("chat_id", null) : q.eq("chat_id", chatId);
+  const { data: existing } = await q.maybeSingle();
+  if (existing?.id) return { written: false };
+
+  const { error } = await sb.from("dry_run_alerts").insert({
     trip_id: row.tripId,
-    stop_id: row.stopId || "",
+    stop_id: stopId,
     alert_type: row.alertType,
-    chat_id: row.chatId || null,
+    chat_id: chatId,
     driver_id: row.driverId || null,
     html: row.html,
     meta: row.meta || {},
@@ -297,6 +309,12 @@ export async function writeDryRun(
     sync_basis: row.syncBasis || null,
     would_send_at: new Date().toISOString(),
   });
+  if (error) {
+    if (String(error.code) === "23505" || /duplicate|unique/i.test(error.message || "")) {
+      return { written: false };
+    }
+  }
+  return { written: !error };
 }
 
 async function sendOneChat(
@@ -304,28 +322,42 @@ async function sendOneChat(
   botToken: string,
   config: AlertConfig,
   alert: OutgoingAlert,
-  group: DriverGroupChat | { chat_id: string; driver_id?: string | null; alerts_enabled?: boolean; quiet?: boolean },
+  group: DriverGroupChat | {
+    chat_id: string;
+    driver_id?: string | null;
+    driver_name?: string | null;
+    group_title?: string | null;
+    alerts_enabled?: boolean;
+    quiet?: boolean;
+  },
 ): Promise<{ status: string; error?: string; messageId?: number; chatId?: string; dryRun?: boolean }> {
   const chatId = group.chat_id;
   if (group.quiet && !alert.force) {
     return { status: "quiet", chatId };
   }
 
+  const previewMeta = {
+    ...(alert.meta || {}),
+    driver: group.driver_name || alert.meta?.driver || null,
+    group_title: group.group_title || null,
+    chat_id: chatId,
+  };
+
   // Dry-run or kill switch OFF → log would-send, never Bot API (except /test force)
   const killOff = !isTelegramAlertsEnabled(config);
   if (alert.dryRun || (killOff && !alert.force)) {
-    await writeDryRun(sb, {
+    const wr = await writeDryRun(sb, {
       tripId: alert.tripId,
       stopId: alert.stopId,
       alertType: alert.alertType,
       chatId,
       driverId: group.driver_id || null,
       html: alert.html,
-      meta: alert.meta,
+      meta: previewMeta,
       reason: alert.reason || (killOff ? "kill_switch_off" : "dry_run"),
       syncBasis: alert.syncBasis,
     });
-    return { status: "dry_run", chatId, dryRun: true };
+    return { status: wr.written ? "dry_run" : "deduped", chatId, dryRun: true };
   }
 
   // Live send also requires per-group enable (pilot) unless force/test
@@ -337,7 +369,7 @@ async function sendOneChat(
       chatId,
       driverId: group.driver_id || null,
       html: alert.html,
-      meta: { ...(alert.meta || {}), blocked: "group_disabled" },
+      meta: { ...previewMeta, blocked: "group_disabled" },
       reason: "group_alerts_disabled",
       syncBasis: alert.syncBasis,
     });
@@ -425,19 +457,25 @@ export async function dispatchAlert(
   }
 
   if (!groups.length) {
-    // Still dry-run log with null chat so Alert preview shows candidates
+    // Still dry-run log with null chat so Alert preview shows unlinked candidates
     if (alert.dryRun || !isTelegramAlertsEnabled(config)) {
-      await writeDryRun(sb, {
+      const wr = await writeDryRun(sb, {
         tripId: alert.tripId,
         stopId: alert.stopId,
         alertType: alert.alertType,
         chatId: null,
+        driverId: alert.crmDriverIds?.[0] || null,
         html: alert.html,
-        meta: alert.meta,
+        meta: {
+          ...(alert.meta || {}),
+          driver: alert.meta?.driver || null,
+          group_title: null,
+          chat_id: null,
+        },
         reason: alert.reason || "no_linked_group",
         syncBasis: alert.syncBasis,
       });
-      return { status: "dry_run_no_chat" };
+      return { status: wr.written ? "dry_run_no_chat" : "deduped" };
     }
     return { status: "no_chat", error: "No linked driver_groups for this trip" };
   }

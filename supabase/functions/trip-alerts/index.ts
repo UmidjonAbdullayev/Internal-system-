@@ -103,14 +103,23 @@ Deno.serve(async (req: Request) => {
 
     if (action === "dry_run") {
       const hours = Number(body.window_hours || url.searchParams.get("window_hours") || 1);
+      // Fresh window only — never accumulate / never seed
+      await sb.from("dry_run_alerts").delete().neq("id", "00000000-0000-0000-0000-000000000000");
       const out = await runDryRunWindow(sb, botToken, config, settings, hours);
       const { data: preview, count } = await sb
         .from("dry_run_alerts")
-        .select("id, trip_id, stop_id, alert_type, chat_id, reason, would_send_at, html", {
-          count: "exact",
-        })
+        .select(
+          "id, trip_id, stop_id, alert_type, chat_id, driver_id, reason, sync_basis, would_send_at, html, meta",
+          { count: "exact" },
+        )
         .order("would_send_at", { ascending: false })
-        .limit(100);
+        .limit(200);
+      const grouped: Record<string, number> = {};
+      for (const row of preview || []) {
+        const key = `${row.trip_id}|${row.stop_id}|${row.alert_type}|${row.chat_id || "(none)"}`;
+        grouped[key] = (grouped[key] || 0) + 1;
+      }
+      const dupes = Object.entries(grouped).filter(([, n]) => n > 1);
       return json({
         success: true,
         dry_run: true,
@@ -118,9 +127,11 @@ Deno.serve(async (req: Request) => {
         window_hours: hours,
         evaluated: out.count,
         preview_count: count,
+        unique_keys: Object.keys(grouped).length,
+        duplicate_keys: dupes.length,
         preview: preview || [],
         results: out.results,
-        note: "No Telegram messages sent. Review CRM Alert preview before enabling.",
+        note: "No Telegram messages sent. Table cleared then rebuilt from live 1h window. Never seed prod.",
       });
     }
 
@@ -142,19 +153,24 @@ Deno.serve(async (req: Request) => {
           note: "First sync after install — baseline only, no status alerts",
         });
       }
-      // Always dry-run when kill switch OFF
-      const results = await processStatusEvents(
-        sb,
-        botToken,
-        config,
-        settings,
-        events,
-        { dryRun: !isTelegramAlertsEnabled(config) },
-      );
+      // Kill switch OFF: do not accumulate dry_run on every sync (explicit dry_run only)
+      if (!isTelegramAlertsEnabled(config)) {
+        return json({
+          success: true,
+          skipped: true,
+          reason: "kill_switch_off",
+          events_seen: events.length,
+          kill_switch: false,
+          note: "Status edges ignored for send/dry_run while OFF. Use action=dry_run.",
+        });
+      }
+      const results = await processStatusEvents(sb, botToken, config, settings, events, {
+        dryRun: false,
+      });
       return json({
         success: true,
         results,
-        kill_switch: isTelegramAlertsEnabled(config),
+        kill_switch: true,
       });
     }
 
@@ -176,14 +192,23 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "cron") {
-      // While kill switch OFF, cron writes dry_run_alerts instead of sending
+      // Kill switch OFF → no send and no dry_run spam (use action=dry_run for preview)
+      if (!isTelegramAlertsEnabled(config)) {
+        return json({
+          success: true,
+          skipped: true,
+          reason: "kill_switch_off",
+          kill_switch: false,
+          note: "Cron idle while OFF. Run action=dry_run for a fresh 1h preview.",
+        });
+      }
       const results = await runCronChecks(sb, botToken, config, settings, {
-        dryRun: !isTelegramAlertsEnabled(config),
+        dryRun: false,
       });
       return json({
         success: true,
         ...results,
-        kill_switch: isTelegramAlertsEnabled(config),
+        kill_switch: true,
       });
     }
 

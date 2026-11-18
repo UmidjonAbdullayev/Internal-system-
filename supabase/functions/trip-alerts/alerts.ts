@@ -208,6 +208,7 @@ function buildArrivedAlert(
   const stopCount = Math.max(1, ctx.stops.length);
   const seq = Number(stop.seq ?? 1);
   const trailer = trailerFromStopRaw(stop.raw, null);
+  const driverName = ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null;
   const html = formatArrivedHtml({
     facility,
     city: stop.city ? String(stop.city) : null,
@@ -232,9 +233,16 @@ function buildArrivedAlert(
     html,
     meta: {
       facility,
+      city: stop.city || null,
+      state: stop.state || null,
       actual,
       planned,
       source: stop.arrival_time_source,
+      driver: driverName,
+      tractor: ctx.tractor,
+      trailer: trailer || "Bobtail",
+      stop_seq: seq,
+      stop_type: stop.stop_type || null,
     },
     dryRun: opts.dryRun,
     force: opts.force,
@@ -267,6 +275,7 @@ function buildNotAtStopAlert(
   const stopCount = Math.max(1, ctx.stops.length);
   const seq = Number(stop.seq ?? 1);
   const trailer = trailerFromStopRaw(stop.raw, null);
+  const driverName = ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null;
   const html = formatNotAtStopHtml({
     facility,
     city: stop.city ? String(stop.city) : null,
@@ -291,8 +300,17 @@ function buildNotAtStopAlert(
     html,
     meta: {
       facility,
+      city: stop.city || null,
+      state: stop.state || null,
       overdue_ms: overdue,
       planned: stop.scheduled_arrival,
+      actual: null,
+      eta: stop.eta || null,
+      driver: driverName,
+      tractor: ctx.tractor,
+      trailer: trailer || "Bobtail",
+      stop_seq: seq,
+      stop_type: stop.stop_type || null,
     },
     dryRun: opts.dryRun,
     force: opts.force,
@@ -367,9 +385,14 @@ export async function runCronChecks(
 ): Promise<{ paused?: boolean; reason?: string; results: unknown[] }> {
   const results: unknown[] = [];
   const dryRun = Boolean(opts?.dryRun);
-  const { data: locked } = await sb.rpc("try_trip_alerts_lock");
-  if (locked === false) {
-    return { paused: true, reason: "advisory_lock", results: [{ status: "locked" }] };
+  // Advisory lock only for live cron sends — dry-run skips (pooler can stick session locks)
+  let holdLock = false;
+  if (!dryRun) {
+    const { data: locked } = await sb.rpc("try_trip_alerts_lock");
+    if (locked === false) {
+      return { paused: true, reason: "advisory_lock", results: [{ status: "locked" }] };
+    }
+    holdLock = true;
   }
 
   try {
@@ -386,54 +409,61 @@ export async function runCronChecks(
       if (isCancelledTrip(ctx.trip)) continue;
       const section = String(ctx.trip.section || "");
 
-      for (const stop of ctx.stops) {
-        // NOT AT STOP — once, next stop, +15m, <6h, fresh sync
-        if (section === "IN_TRANSIT" || section === "UPCOMING") {
+      // NOT AT STOP — at most one next-stop per trip (earliest overdue eligible)
+      if (section === "IN_TRANSIT" || section === "UPCOMING") {
+        const candidates: OutgoingAlert[] = [];
+        for (const stop of ctx.stops) {
+          if (section === "UPCOMING") {
+            const firstPickup = ctx.stops.find(
+              (s) => /pick/i.test(String(s.stop_type || "")) || Number(s.seq) === 1,
+            );
+            if (firstPickup && String(firstPickup.stop_id) !== String(stop.stop_id)) {
+              continue;
+            }
+          }
           const notAt = buildNotAtStopAlert(ctx, stop, now, {
             dryRun: dryRun || !isEnabled(config),
             reason: "cron_not_at_stop",
             syncBasis: sync.lastAt || "cron",
           });
-          if (notAt) {
-            // For Upcoming: only first pickup due
-            if (section === "UPCOMING") {
-              const firstPickup = ctx.stops.find(
-                (s) => /pick/i.test(String(s.stop_type || "")) || Number(s.seq) === 1,
-              );
-              if (firstPickup && String(firstPickup.stop_id) !== String(stop.stop_id)) {
-                continue;
-              }
-            }
-            results.push({
-              ...(await dispatchAlert(sb, botToken, config, settings, notAt)),
-              alertType: "not_at_stop",
-              tripId: notAt.tripId,
-              stopId: notAt.stopId,
-            });
-          }
+          if (notAt) candidates.push(notAt);
         }
+        candidates.sort((a, b) => {
+          const pa = new Date(String(a.meta?.planned || 0)).getTime();
+          const pb = new Date(String(b.meta?.planned || 0)).getTime();
+          return pa - pb;
+        });
+        const nextOnly = candidates[0];
+        if (nextOnly) {
+          results.push({
+            ...(await dispatchAlert(sb, botToken, config, settings, nextOnly)),
+            alertType: "not_at_stop",
+            tripId: nextOnly.tripId,
+            stopId: nextOnly.stopId,
+          });
+        }
+      }
 
-        // Dry-run ARRIVED: stops whose actual_arrival appeared in the last ~1h window
-        if (dryRun && stop.actual_arrival) {
-          const updated = stop.updated_at ? new Date(String(stop.updated_at)).getTime() : NaN;
+      // Dry-run ARRIVED: actual_arrival timestamp within the last ~1h only
+      // (do not use updated_at — remaps/re-syncs would inflate the preview)
+      if (dryRun) {
+        for (const stop of ctx.stops) {
+          if (!stop.actual_arrival) continue;
           const actual = new Date(String(stop.actual_arrival)).getTime();
-          const recent =
-            (!Number.isNaN(updated) && now - updated <= windowMs) ||
-            (!Number.isNaN(actual) && now - actual <= windowMs);
-          if (recent) {
-            const arrived = buildArrivedAlert(ctx, stop, {
-              dryRun: true,
-              reason: "dry_run_recent_arrival",
-              syncBasis: `window_${opts?.windowHours ?? 1}h`,
+          const recent = !Number.isNaN(actual) && now - actual <= windowMs && actual <= now;
+          if (!recent) continue;
+          const arrived = buildArrivedAlert(ctx, stop, {
+            dryRun: true,
+            reason: "dry_run_recent_arrival",
+            syncBasis: `window_${opts?.windowHours ?? 1}h`,
+          });
+          if (arrived) {
+            results.push({
+              ...(await dispatchAlert(sb, botToken, config, settings, arrived)),
+              alertType: "arrived",
+              tripId: arrived.tripId,
+              stopId: arrived.stopId,
             });
-            if (arrived) {
-              results.push({
-                ...(await dispatchAlert(sb, botToken, config, settings, arrived)),
-                alertType: "arrived",
-                tripId: arrived.tripId,
-                stopId: arrived.stopId,
-              });
-            }
           }
         }
       }
@@ -441,7 +471,7 @@ export async function runCronChecks(
 
     return { results };
   } finally {
-    await sb.rpc("release_trip_alerts_lock");
+    if (holdLock) await sb.rpc("release_trip_alerts_lock");
   }
 }
 
