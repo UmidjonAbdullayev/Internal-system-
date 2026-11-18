@@ -367,10 +367,18 @@ export function PaymentsPage() {
 
             {!dataReady ? (
               <div className="p-8 text-sm text-text-secondary">Loading invoices…</div>
+            ) : dataError ? (
+              <div className="space-y-2 p-8 text-sm">
+                <p className="font-medium text-danger">Could not load invoices</p>
+                <p className="text-danger/90 break-words">{dataError}</p>
+                <p className="text-text-secondary">
+                  Check Supabase RLS SELECT on public.invoices / invoice_trips, then Refresh.
+                </p>
+              </div>
             ) : !sortedWeeks.length ? (
               <EmptyState
                 title="No Relay invoices yet"
-                description="Open Amazon Relay Payments while the extension is LIVE — settlements sync every 30 minutes. FIXTURE seeds never appear here."
+                description="Open Amazon Relay Payments while the extension is LIVE — settlements sync every 30 minutes. FIXTURE seeds never appear here. Popup Synced without AZNG rows usually means relay-sync is missing invoice upsert."
               />
             ) : (
               <div className="overflow-x-auto">

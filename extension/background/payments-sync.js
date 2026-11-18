@@ -286,9 +286,25 @@ export async function flushPendingInvoices({ allowEmpty = false } = {}) {
 
   try {
     const json = await postInvoices(invoices, summary, state.extensionApiKey);
-    const upserted = json.invoices_upserted ?? invoices.length;
+    // Deployed edge must return invoices_upserted. Missing/0 with a non-empty
+    // payload means the function ignored invoices (false Synced) — surface Error.
+    const upsertedRaw = json.invoices_upserted;
+    if (invoices.length > 0) {
+      if (typeof upsertedRaw !== 'number') {
+        throw new Error(
+          'relay-sync missing invoices_upserted — edge function likely outdated (no invoice upsert)',
+        );
+      }
+      if (upsertedRaw <= 0) {
+        const detail = Array.isArray(json.errors) && json.errors.length
+          ? json.errors.slice(0, 3).join('; ')
+          : 'invoices_upserted=0';
+        throw new Error(`Invoice upsert failed: ${detail}`);
+      }
+    }
+    const upserted = Number(upsertedRaw) || 0;
     const at = new Date().toISOString();
-    const count = upserted || invoices.length;
+    const count = invoices.length ? upserted : state.lastPaymentsInvoiceCount || 0;
     const prev = await getState();
     await setState({
       pendingInvoices: {},
@@ -297,8 +313,8 @@ export async function flushPendingInvoices({ allowEmpty = false } = {}) {
       lastPaymentsInvoiceCount: count,
       lastPaymentsAttemptAt: at,
       lastPaymentsError: null,
-      recordsCollected: (prev.recordsCollected || 0) + count,
-      recordsUpdated: (prev.recordsUpdated || 0) + (upserted || 0),
+      recordsCollected: (prev.recordsCollected || 0) + (invoices.length || (summary ? 1 : 0)),
+      recordsUpdated: (prev.recordsUpdated || 0) + upserted,
       paymentsScanInProgress: false,
       sections: {
         payments: {
