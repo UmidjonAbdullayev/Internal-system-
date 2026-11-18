@@ -74,6 +74,53 @@ export function isFullyCancelledTrip(
   return tourStateCancelled(tourState) || allLegsCancelledFromLegs(legs);
 }
 
+/**
+ * Latest live-tab membership from snapshots (Relay source of truth).
+ * If an ID appears on both tabs (template bug), prefer IN_TRANSIT.
+ */
+export async function loadLiveTripSections(
+  sb: SupabaseClient,
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const { data } = await sb
+    .from("relay_section_snapshots")
+    .select("section, trip_ids")
+    .in("section", ["IN_TRANSIT", "UPCOMING"]);
+  for (const snap of data || []) {
+    const section = String(snap.section || "");
+    if (!LIVE_SECTIONS.has(section)) continue;
+    for (const id of (snap.trip_ids as string[]) || []) {
+      const u = String(id || "").trim().toUpperCase();
+      if (!u) continue;
+      const prev = map.get(u);
+      if (!prev || (prev === "UPCOMING" && section === "IN_TRANSIT")) {
+        map.set(u, section);
+      }
+    }
+  }
+  return map;
+}
+
+/**
+ * Section membership for a trip body:
+ * - Live tab response wins (even when fully cancelled — CRM list can hide cancelled).
+ * - HISTORY / catch-up must not yank an ID still listed on a live snapshot.
+ * - Cancelled / catch-up / forceHistory → HISTORY only when not on a live board.
+ */
+export function resolveTripSection(opts: {
+  sourceTab: string | null;
+  cancelled: boolean;
+  forceHistory?: boolean;
+  catchUp?: boolean;
+  liveSection?: string | null;
+}): string | null {
+  const { sourceTab, cancelled, forceHistory, catchUp, liveSection } = opts;
+  if (sourceTab && LIVE_SECTIONS.has(sourceTab)) return sourceTab;
+  if (liveSection && LIVE_SECTIONS.has(liveSection)) return liveSection;
+  if (forceHistory || catchUp || cancelled) return "HISTORY";
+  return sourceTab;
+}
+
 /** @deprecated Prefer isFullyCancelledTrip — status/execution blob alone must not force History. */
 export function looksCancelled(
   status: unknown,

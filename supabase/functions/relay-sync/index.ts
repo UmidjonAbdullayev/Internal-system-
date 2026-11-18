@@ -145,6 +145,7 @@ type SnapshotIn = {
 };
 
 const SECTION_OK = new Set(["IN_TRANSIT", "UPCOMING", "HISTORY"]);
+const LIVE_SECTIONS = new Set(["IN_TRANSIT", "UPCOMING"]);
 const REMOVED_AFTER_MS = 10 * 60 * 1000;
 
 function normalizeSection(raw: unknown): string | null {
@@ -152,6 +153,42 @@ function normalizeSection(raw: unknown): string | null {
   if (s === "INTRANSIT") return "IN_TRANSIT";
   if (SECTION_OK.has(s)) return s;
   return null;
+}
+
+/** Latest live-tab IDs from snapshots — membership wins over cancelled→History. */
+async function loadLiveTripSections(
+  sb: ReturnType<typeof createClient>,
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const { data } = await sb
+    .from("relay_section_snapshots")
+    .select("section, trip_ids")
+    .in("section", ["IN_TRANSIT", "UPCOMING"]);
+  for (const snap of data || []) {
+    const section = String(snap.section || "");
+    if (!LIVE_SECTIONS.has(section)) continue;
+    for (const id of (snap.trip_ids as string[]) || []) {
+      const u = String(id || "").trim().toUpperCase();
+      if (!u) continue;
+      const prev = map.get(u);
+      if (!prev || (prev === "UPCOMING" && section === "IN_TRANSIT")) {
+        map.set(u, section);
+      }
+    }
+  }
+  return map;
+}
+
+function resolveTripSection(opts: {
+  sourceTab: string | null;
+  cancelled: boolean;
+  liveSection?: string | null;
+}): string | null {
+  const { sourceTab, cancelled, liveSection } = opts;
+  if (sourceTab && LIVE_SECTIONS.has(sourceTab)) return sourceTab;
+  if (liveSection && LIVE_SECTIONS.has(liveSection)) return liveSection;
+  if (cancelled) return "HISTORY";
+  return sourceTab;
 }
 
 function json(data: unknown, status = 200) {
@@ -529,6 +566,7 @@ Deno.serve(async (req: Request) => {
     const driversCache: DriverRow[] = (driverRows || []) as DriverRow[];
 
     // ---- New model: UPSERT relay_trips / relay_legs / relay_stops by tripId ----
+    const liveTripSections = tripsIn.length ? await loadLiveTripSections(sb) : new Map<string, string>();
     for (const trip of tripsIn) {
       const tripId = String(trip?.tripId || "").trim().toUpperCase();
       if (!tripId || !isValidRelayLoadId(tripId)) {
@@ -536,7 +574,6 @@ Deno.serve(async (req: Request) => {
         continue;
       }
       const sourceTab = normalizeSection(trip.tab || trip.section);
-      let section = sourceTab;
       const { data: prevTrip } = await sb
         .from("relay_trips")
         .select("trip_id, section, status, driver_name_raw, start_time, execution_status")
@@ -545,17 +582,25 @@ Deno.serve(async (req: Request) => {
 
       const nextDriver = sanitizeDriverName(trip.driver);
       let nextStatus = trip.status || trip.executionStatus || trip.tourState || null;
-      // Fully cancelled → History only when tourState cancelled OR every load cancelled.
-      // Derived Delivered/status cancel blob alone must not leave a live Relay tab.
+      // Fully cancelled → History only when Relay no longer lists the ID on a live tab.
+      // Membership = Relay's latest UPCOMING / IN_TRANSIT response (same as #44).
       const legs = (trip.legs as { executionStatus?: string; status?: string }[]) || [];
       const tourCancelled = /cancel/.test(String(trip.tourState || "").toLowerCase());
       const allLegsCancel =
         legs.length > 0 &&
         legs.every((leg) => /cancel/.test(String(leg.executionStatus || leg.status || "").toLowerCase()));
       const cancelled = tourCancelled || allLegsCancel;
-      if (cancelled) {
-        section = "HISTORY";
-        if (!nextStatus || !/cancel/i.test(String(nextStatus))) nextStatus = "CANCELLED";
+      const section = resolveTripSection({
+        sourceTab,
+        cancelled,
+        liveSection: liveTripSections.get(tripId) || null,
+      });
+      if (cancelled && (!nextStatus || !/cancel/i.test(String(nextStatus)))) {
+        nextStatus = "CANCELLED";
+      }
+      if (!section) {
+        errors.push(`Invalid section for trip ${tripId}`);
+        continue;
       }
       const tripRow = {
         trip_id: tripId,
@@ -594,7 +639,10 @@ Deno.serve(async (req: Request) => {
       if (prevTrip?.section && prevTrip.section !== section) {
         await sb.from("trip_events").insert({
           trip_id: tripId,
-          event_type: cancelled ? "cancelled_to_history" : "section_change",
+          event_type:
+            cancelled && section === "HISTORY"
+              ? "cancelled_to_history"
+              : "section_change",
           from_section: prevTrip.section,
           to_section: section,
           from_status: prevTrip.status,
