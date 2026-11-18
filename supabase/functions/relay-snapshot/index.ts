@@ -11,6 +11,7 @@ import {
   LIVE_SECTIONS,
   REMOVED_AFTER_MS,
   recordTripEvent,
+  isFullyCancelledTrip,
 } from "./shared.ts";
 import { upsertTrips } from "./upsert.ts";
 import { beginCatchUp, finalizeCatchUp } from "./catchup.ts";
@@ -100,6 +101,7 @@ Deno.serve(async (req: Request) => {
     const errors: string[] = [];
     let snapshotMoved = 0;
     let snapshotRemoved = 0;
+    let snapshotRestored = 0;
     const sectionCounts: Record<string, { relay: number; crm: number; mismatch: boolean }> = {};
 
     if (snapshot?.section) {
@@ -237,6 +239,107 @@ Deno.serve(async (req: Request) => {
             });
           }
 
+          // Membership = Relay's latest tab response: re-admit listed IDs even when
+          // change-only sync sends snapshot without trip bodies (stranded HISTORY /
+          // removed_from_relay after catch-up finalize).
+          if (LIVE_SECTIONS.has(section) && tripIds.length) {
+            const { data: listedRows } = await sb
+              .from("relay_trips")
+              .select("trip_id, section, status, tour_state, execution_status")
+              .in("trip_id", tripIds)
+              .eq("archived", false);
+
+            const listedIds = (listedRows || []).map((r: { trip_id: string }) => r.trip_id);
+            const { data: listedLegs } = listedIds.length
+              ? await sb
+                  .from("relay_legs")
+                  .select("trip_id, execution_status")
+                  .in("trip_id", listedIds)
+                  .eq("archived", false)
+              : { data: [] as { trip_id: string; execution_status: string | null }[] };
+
+            const legsByTrip = new Map<string, { executionStatus?: string }[]>();
+            for (const leg of listedLegs || []) {
+              const tid = String(leg.trip_id);
+              const arr = legsByTrip.get(tid) || [];
+              arr.push({ executionStatus: leg.execution_status ?? undefined });
+              legsByTrip.set(tid, arr);
+            }
+
+            for (const row of listedRows || []) {
+              const fullyCancelled = isFullyCancelledTrip(
+                row.tour_state,
+                legsByTrip.get(row.trip_id) || [],
+              );
+              // Exception: fully cancelled trips Relay returns on a live tab → History.
+              if (fullyCancelled) {
+                if (row.section !== "HISTORY" || row.status !== "CANCELLED") {
+                  const { error } = await sb
+                    .from("relay_trips")
+                    .update({
+                      section: "HISTORY",
+                      status: row.status && /cancel/i.test(String(row.status))
+                        ? row.status
+                        : "CANCELLED",
+                      updated_at: now,
+                    })
+                    .eq("trip_id", row.trip_id);
+                  if (error) {
+                    errors.push(`Snapshot cancel ${row.trip_id}: ${error.message}`);
+                  } else if (row.section !== "HISTORY") {
+                    await recordTripEvent(sb, {
+                      trip_id: row.trip_id,
+                      event_type: "cancelled_to_history",
+                      from_section: row.section,
+                      to_section: "HISTORY",
+                      from_status: row.status,
+                      to_status: "CANCELLED",
+                      detail: { source: "snapshot_membership", source_tab: section },
+                    });
+                  }
+                }
+                continue;
+              }
+
+              const needsRestore =
+                row.section !== section ||
+                row.status === "removed_from_relay" ||
+                row.status === "moved_awaiting_section";
+              if (!needsRestore) continue;
+
+              const restoredStatus =
+                row.status === "removed_from_relay" ||
+                row.status === "moved_awaiting_section"
+                  ? String(row.execution_status || row.tour_state || section)
+                  : row.status;
+              const { error } = await sb
+                .from("relay_trips")
+                .update({
+                  section,
+                  source_tab: section,
+                  status: restoredStatus,
+                  needs_review: false,
+                  last_seen_at: now,
+                  updated_at: now,
+                })
+                .eq("trip_id", row.trip_id);
+              if (error) {
+                errors.push(`Snapshot restore ${row.trip_id}: ${error.message}`);
+              } else {
+                snapshotRestored += 1;
+                await recordTripEvent(sb, {
+                  trip_id: row.trip_id,
+                  event_type: "section_change",
+                  from_section: row.section,
+                  to_section: section,
+                  from_status: row.status,
+                  to_status: restoredStatus != null ? String(restoredStatus) : null,
+                  detail: { source: "snapshot_membership_restore", source_tab: section },
+                });
+              }
+            }
+          }
+
           for (const row of sectionRows || []) {
             if (inSnapshot.has(row.trip_id)) continue;
             if (LIVE_SECTIONS.has(section)) {
@@ -353,6 +456,7 @@ Deno.serve(async (req: Request) => {
       stops_upserted: upserted.stopsUpserted,
       snapshot_moved: snapshotMoved,
       snapshot_removed: snapshotRemoved,
+      snapshot_restored: snapshotRestored,
       synced_trip_ids: upserted.syncedTripIds,
       live_missing: liveMissing,
       section_counts: sectionCounts,

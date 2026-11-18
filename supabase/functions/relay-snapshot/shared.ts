@@ -46,13 +46,42 @@ export function normalizeSection(raw: unknown): string | null {
   return null;
 }
 
-/** tour_state / status / execution cancelled → never stay on live tabs. */
+/** True when tourState itself is cancelled (not status / executionStatus alone). */
+export function tourStateCancelled(tourState?: unknown): boolean {
+  return /cancel/.test(String(tourState || "").toLowerCase());
+}
+
+/** True when every nested load/leg is cancelled. Empty legs → false. */
+export function allLegsCancelledFromLegs(
+  legs: { executionStatus?: unknown; status?: unknown }[] | null | undefined,
+): boolean {
+  if (!legs?.length) return false;
+  return legs.every((leg) => {
+    const st = String(leg.executionStatus || leg.status || "").toLowerCase();
+    return /cancel/.test(st);
+  });
+}
+
+/**
+ * Fully cancelled for History override:
+ * tourState cancelled OR every load CANCELLED.
+ * One cancelled leg does NOT cancel the trip. Derived status (Delivered) is ignored.
+ */
+export function isFullyCancelledTrip(
+  tourState: unknown,
+  legs?: { executionStatus?: unknown; status?: unknown }[] | null,
+): boolean {
+  return tourStateCancelled(tourState) || allLegsCancelledFromLegs(legs);
+}
+
+/** @deprecated Prefer isFullyCancelledTrip — status/execution blob alone must not force History. */
 export function looksCancelled(
   status: unknown,
   tourState?: unknown,
   executionStatus?: unknown,
 ): boolean {
-  const blob = `${status || ""} ${tourState || ""} ${executionStatus || ""}`.toLowerCase();
+  if (tourStateCancelled(tourState)) return true;
+  const blob = `${status || ""} ${executionStatus || ""}`.toLowerCase();
   return /cancel/.test(blob);
 }
 

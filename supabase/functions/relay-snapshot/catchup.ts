@@ -49,17 +49,40 @@ export async function finalizeCatchUp(sb: SupabaseClient) {
 
   const missing: string[] = Array.isArray(cu.missing_trip_ids) ? cu.missing_trip_ids : [];
   const found: string[] = Array.isArray(cu.found_trip_ids) ? cu.found_trip_ids : [];
+  const missingSet = new Set(missing.map((id) => String(id).toUpperCase()));
   const foundSet = new Set(found.map((id) => String(id).toUpperCase()));
-  const stillMissing = missing.filter((id) => !foundSet.has(String(id).toUpperCase()));
+
+  // Never touch trips Relay still lists on a live tab (IN_TRANSIT / UPCOMING snapshot).
+  const { data: liveSnaps } = await sb
+    .from("relay_section_snapshots")
+    .select("section, trip_ids")
+    .in("section", ["IN_TRANSIT", "UPCOMING"]);
+  const stillOnRelay = new Set<string>();
+  for (const snap of liveSnaps || []) {
+    for (const id of (snap.trip_ids as string[]) || []) {
+      const u = String(id || "").trim().toUpperCase();
+      if (u) stillOnRelay.add(u);
+    }
+  }
+
+  // History ONLY when catch-up actually found the trip in Relay's HISTORY response.
+  // Merely missing from live tabs is NOT enough — leave those alone (live sync /
+  // moved_awaiting owns them; snapshot restore will re-admit if Relay lists them).
+  const foundInHistory = [...foundSet].filter(
+    (id) => missingSet.has(id) && !stillOnRelay.has(id),
+  );
+  const stillMissing = missing.filter((id) => {
+    const u = String(id).toUpperCase();
+    return !foundSet.has(u) && !stillOnRelay.has(u);
+  });
   const removed: string[] = [];
 
-  for (const tripId of stillMissing) {
+  for (const tripId of foundInHistory) {
     const { error } = await sb
       .from("relay_trips")
       .update({
-        status: "removed_from_relay",
         section: "HISTORY",
-        needs_review: true,
+        needs_review: false,
         caught_up_at: now,
         updated_at: now,
       })
@@ -68,10 +91,9 @@ export async function finalizeCatchUp(sb: SupabaseClient) {
       removed.push(tripId);
       await recordTripEvent(sb, {
         trip_id: tripId,
-        event_type: "removed_from_relay",
+        event_type: "section_change",
         to_section: "HISTORY",
-        to_status: "removed_from_relay",
-        detail: { reason: "catch_up_finalize" },
+        detail: { reason: "catch_up_finalize", found_in_relay_history: true },
       });
     }
   }
@@ -79,7 +101,9 @@ export async function finalizeCatchUp(sb: SupabaseClient) {
   await sb.from("activity_logs").insert({
     type: "system",
     action: "catch_up",
-    description: `(caught up after pause) found ${found.length}, review ${removed.length}`,
+    description:
+      `(caught up after pause) found in HISTORY ${foundInHistory.length}, ` +
+      `still missing (left alone) ${stillMissing.length}`,
     entity_id: null,
     user_name: "relay-snapshot",
   });
@@ -120,6 +144,8 @@ export async function finalizeCatchUp(sb: SupabaseClient) {
 
   return {
     found: found.length,
+    found_in_history: foundInHistory.length,
+    still_missing_left_alone: stillMissing.length,
     removed: removed.length,
     removed_trip_ids: removed,
     telegram: tg,

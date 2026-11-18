@@ -1,20 +1,11 @@
 import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import {
   isValidRelayId,
-  looksCancelled,
+  isFullyCancelledTrip,
   normalizeSection,
   recordTripEvent,
   sanitizeDriverName,
 } from "./shared.ts";
-
-function allLegsCancelled(trip: Record<string, unknown>): boolean {
-  const legs = (trip.legs as Record<string, unknown>[]) || [];
-  if (!legs.length) return false;
-  return legs.every((leg) => {
-    const st = String(leg.executionStatus || leg.status || "").toLowerCase();
-    return /cancel/.test(st);
-  });
-}
 
 type TripRow = Record<string, unknown>;
 type LegRow = Record<string, unknown>;
@@ -61,8 +52,13 @@ export async function upsertTrips(
     if (opts.forceHistory || opts.catchUp) section = "HISTORY";
 
     const status = trip.status || trip.executionStatus || trip.tourState || null;
-    const cancelled =
-      looksCancelled(status, trip.tourState, trip.executionStatus) || allLegsCancelled(trip);
+    // Cancelled → History ONLY if tourState cancelled OR every load cancelled.
+    // Live-tab membership otherwise follows Relay's tab (sourceTab). Derived
+    // Delivered/complete must not leave UPCOMING/IN_TRANSIT while Relay lists it.
+    const cancelled = isFullyCancelledTrip(
+      trip.tourState,
+      (trip.legs as { executionStatus?: unknown; status?: unknown }[]) || [],
+    );
     if (cancelled) section = "HISTORY";
     if (!section) {
       errors.push(`Invalid section for trip ${tripId}`);

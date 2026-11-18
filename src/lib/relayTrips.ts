@@ -346,10 +346,43 @@ export function plainEnglishStatus(trip: RelayTrip, now = Date.now()): string {
   return trip.status || 'In progress';
 }
 
-/** Trip-level cancelled (status / tour_state / execution_status). */
-export function isTripCancelled(trip: Pick<RelayTrip, 'status' | 'tourState' | 'executionStatus'>): boolean {
-  const blob = `${trip.status || ''} ${trip.tourState || ''} ${trip.executionStatus || ''}`.toLowerCase();
-  return /cancel/.test(blob);
+/** Single leg cancelled (execution status). */
+export function isLegCancelled(leg: { executionStatus?: string | null }): boolean {
+  return /cancel/.test(String(leg.executionStatus || '').toLowerCase());
+}
+
+/**
+ * Fully cancelled trip: tourState cancelled OR every load cancelled.
+ * One cancelled leg does not cancel the trip. Status/executionStatus alone do not.
+ */
+export function isTripCancelled(
+  trip: Pick<RelayTrip, 'status' | 'tourState' | 'executionStatus'> & {
+    legs?: { executionStatus?: string | null }[];
+  },
+): boolean {
+  if (/cancel/.test(String(trip.tourState || '').toLowerCase())) return true;
+  const legs = trip.legs || [];
+  if (legs.length > 0 && legs.every(isLegCancelled)) return true;
+  return false;
+}
+
+/**
+ * Trip total pay = Relay tour payout.value.
+ * Exclude cancelled-leg pay from a summed total only when Relay's tour payout already
+ * excludes them (cancelled legs at $0 / tour matches active-leg sum). Never invent a cut.
+ */
+export function tripDisplayPayout(trip: RelayTrip): number | null {
+  if (trip.payout != null && Number.isFinite(Number(trip.payout))) return Number(trip.payout);
+  const legs = trip.legs || [];
+  if (!legs.length) return null;
+  const cancelPay = legs
+    .filter(isLegCancelled)
+    .reduce((s, l) => s + (Number(l.payout) || 0), 0);
+  const sumAll = legs.reduce((s, l) => s + (Number(l.payout) || 0), 0);
+  // Relay excluded cancelled → cancelled legs contribute $0; sum active (= sum all).
+  if (cancelPay === 0) return sumAll > 0 ? sumAll : null;
+  // Relay still priced cancelled legs — keep full sum (do not strip).
+  return sumAll > 0 ? sumAll : null;
 }
 
 export function displayStatusLabel(trip: RelayTrip): string {
