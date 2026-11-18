@@ -636,3 +636,71 @@ export async function runDryRunWindow(
   });
   return { results: out.results, count: out.results.length };
 }
+
+/**
+ * Manual TEST REPLAY of ARRIVED for specific stop_ids → one chat only.
+ * Uses exact buildArrivedAlert path; force + chatIds so real driver groups
+ * are never resolved and never claim their alerts_sent slots.
+ */
+export async function sendReplayArrivedAlerts(
+  sb: SupabaseClient,
+  botToken: string,
+  config: AlertConfig,
+  settings: Map<string, AlertSetting>,
+  opts: { chatId: string; stopIds: string[] },
+): Promise<unknown[]> {
+  const chatId = String(opts.chatId || "").trim();
+  const stopIds = [...new Set((opts.stopIds || []).map((x) => String(x || "").trim()).filter(Boolean))];
+  if (!chatId) return [{ status: "error", error: "chat_id required" }];
+  if (!stopIds.length) return [{ status: "error", error: "stop_ids required" }];
+
+  const trips = await loadActiveTrips(sb);
+  const results: unknown[] = [];
+
+  for (const stopId of stopIds) {
+    let found: { ctx: TripCtx; stop: Record<string, unknown> } | null = null;
+    for (const ctx of trips.values()) {
+      const stop = ctx.stops.find((s) => String(s.stop_id) === stopId);
+      if (stop) {
+        found = { ctx, stop };
+        break;
+      }
+    }
+    if (!found) {
+      results.push({ stopId, status: "stop_not_found_in_active" });
+      continue;
+    }
+    if (isCancelledLoadStop(found.stop, found.ctx.cancelledLoadIds)) {
+      results.push({ stopId, status: "skipped_cancelled_load" });
+      continue;
+    }
+    const alert = buildArrivedAlert(found.ctx, found.stop, {
+      test: true,
+      force: true,
+      reason: "test_replay",
+      syncBasis: "manual_replay",
+    });
+    if (!alert) {
+      results.push({ stopId, status: "no_alert", tripId: found.ctx.trip.trip_id });
+      continue;
+    }
+    // Exact ARRIVED HTML, but mark as TEST REPLAY (not a live driver send).
+    if (alert.html.startsWith("[TEST] ")) {
+      alert.html = `[TEST REPLAY] ${alert.html.slice("[TEST] ".length)}`;
+    } else if (!alert.html.startsWith("[TEST REPLAY]")) {
+      alert.html = `[TEST REPLAY] ${alert.html}`;
+    }
+    alert.force = true;
+    alert.chatIds = [chatId];
+    alert.dryRun = false;
+    alert.meta = { ...(alert.meta || {}), test_replay: true, replay_chat_only: chatId };
+    results.push({
+      ...(await dispatchAlert(sb, botToken, config, settings, alert)),
+      alertType: "arrived",
+      tripId: alert.tripId,
+      stopId: alert.stopId,
+      replay: true,
+    });
+  }
+  return results;
+}
