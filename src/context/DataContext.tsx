@@ -216,157 +216,203 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   /** Hydrate from Supabase iiyqkdjwxlnfqvlidbqr — live Relay extension data. */
   const hydrate = useCallback(async () => {
-    let relayTripsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
-    let relayLegsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
-    let relayStopsRes: { data: Record<string, unknown>[]; error: { message: string } | null };
+    let relayTripsRes: { data: Record<string, unknown>[]; error: { message: string } | null } = {
+      data: [],
+      error: null,
+    };
+    let relayLegsRes: { data: Record<string, unknown>[]; error: { message: string } | null } = {
+      data: [],
+      error: null,
+    };
+    let relayStopsRes: { data: Record<string, unknown>[]; error: { message: string } | null } = {
+      data: [],
+      error: null,
+    };
     let heartbeatEarly: {
       data: Record<string, unknown> | null;
       error: { message: string } | null;
     } | null = null;
     try {
-      [relayTripsRes, relayLegsRes, relayStopsRes, heartbeatEarly] = await Promise.all([
-        fetchAllPages<Record<string, unknown>>((from, to) =>
-          supabase
-            .from('relay_trips')
-            .select(RELAY_TRIP_LIST_COLUMNS)
-            .eq('archived', false)
-            .order('last_seen_at', { ascending: false })
-            .range(from, to),
-        ),
-        fetchAllPages<Record<string, unknown>>((from, to) =>
-          supabase
-            .from('relay_legs')
-            .select(RELAY_LEG_LIST_COLUMNS)
-            .eq('archived', false)
-            .range(from, to),
-        ),
-        fetchAllPages<Record<string, unknown>>((from, to) =>
-          supabase
-            .from('relay_stops')
-            .select(RELAY_STOP_LIST_COLUMNS)
-            .eq('archived', false)
-            .order('seq', { ascending: true })
-            .range(from, to),
-        ),
-        supabase.from('extension_heartbeat').select('*').eq('id', 1).maybeSingle(),
+      try {
+        [relayTripsRes, relayLegsRes, relayStopsRes, heartbeatEarly] = await Promise.all([
+          fetchAllPages<Record<string, unknown>>((from, to) =>
+            supabase
+              .from('relay_trips')
+              .select(RELAY_TRIP_LIST_COLUMNS)
+              .eq('archived', false)
+              .order('last_seen_at', { ascending: false })
+              .range(from, to),
+          ),
+          fetchAllPages<Record<string, unknown>>((from, to) =>
+            supabase
+              .from('relay_legs')
+              .select(RELAY_LEG_LIST_COLUMNS)
+              .eq('archived', false)
+              .range(from, to),
+          ),
+          fetchAllPages<Record<string, unknown>>((from, to) =>
+            supabase
+              .from('relay_stops')
+              .select(RELAY_STOP_LIST_COLUMNS)
+              .eq('archived', false)
+              .order('seq', { ascending: true })
+              .range(from, to),
+          ),
+          supabase.from('extension_heartbeat').select('*').eq('id', 1).maybeSingle(),
+        ]);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : 'Relay hydrate failed';
+        console.error('Relay trips hydrate threw', message);
+        setDataError(message);
+        // Keep previous relayTrips — never blank the Trips page on error.
+        // Still refresh liveness so offline chip stays honest during hydrate failures.
+        void supabase
+          .from('extension_heartbeat')
+          .select('*')
+          .eq('id', 1)
+          .maybeSingle()
+          .then(({ data, error }) => {
+            if (error) return;
+            setExtensionHeartbeat(data ? mapExtensionHeartbeat(data as Record<string, unknown>) : null);
+          });
+        return;
+      }
+
+      const [
+        driversRes,
+        loadsRes,
+        relaySnapshotsRes,
+        syncRunsRes,
+        loadReportsRes,
+        feesRes,
+        chargesRes,
+        settlementsRes,
+        settlementLoadsRes,
+        settlementChargesRes,
+        paymentsRes,
+        invoicesRes,
+        invoiceTripsRes,
+        paymentsSummaryRes,
+        activityRes,
+        syncStateRes,
+        summariesRes,
+        retentionRes,
+      ] = await Promise.all([
+        supabase.from('drivers').select('*').order('created_at', { ascending: true }),
+        supabase.from('loads').select('*').order('created_at', { ascending: false }),
+        supabase.from('relay_section_snapshots').select('*'),
+        supabase
+          .from('relay_sync_runs')
+          .select('finished_at, status, error_count')
+          .order('started_at', { ascending: false })
+          .limit(5),
+        supabase.from('load_reports').select('*').order('pickup_date', { ascending: true }),
+        supabase.from('driver_fees').select('*'),
+        supabase.from('one_time_charges').select('*'),
+        supabase.from('settlements').select('*'),
+        supabase.from('settlement_loads').select('*'),
+        supabase.from('settlement_charges').select('*'),
+        supabase.from('payments').select('*').order('payment_date', { ascending: false }),
+        // FIXTURE-* verification seeds never hydrate into CRM totals/reports
+        supabase
+          .from('invoices')
+          .select('*')
+          .not('invoice_id', 'like', 'FIXTURE-%')
+          .order('week_start', { ascending: false }),
+        supabase
+          .from('invoice_trips')
+          .select('*')
+          .not('invoice_id', 'like', 'FIXTURE-%'),
+        supabase.from('payments_summary').select('*').eq('id', 1).maybeSingle(),
+        supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
+        supabase.from('sync_state').select('*'),
+        supabase.from('trip_summaries').select('*').order('end_time', { ascending: false }).limit(500),
+        supabase.from('retention_settings').select('*').eq('id', 1).maybeSingle(),
       ]);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : 'Relay hydrate failed';
-      console.error('Relay trips hydrate threw', message);
-      setDataError(message);
-      setDataReady(true);
-      // Keep previous relayTrips — never blank the Trips page on error.
-      // Still refresh liveness so offline chip stays honest during hydrate failures.
-      void supabase
-        .from('extension_heartbeat')
-        .select('*')
-        .eq('id', 1)
-        .maybeSingle()
-        .then(({ data, error }) => {
-          if (error) return;
-          setExtensionHeartbeat(data ? mapExtensionHeartbeat(data as Record<string, unknown>) : null);
-        });
-      return;
-    }
+      const heartbeatRes = heartbeatEarly;
 
-    const [
-      driversRes,
-      loadsRes,
-      relaySnapshotsRes,
-      syncRunsRes,
-      loadReportsRes,
-      feesRes,
-      chargesRes,
-      settlementsRes,
-      settlementLoadsRes,
-      settlementChargesRes,
-      paymentsRes,
-      invoicesRes,
-      invoiceTripsRes,
-      paymentsSummaryRes,
-      activityRes,
-      syncStateRes,
-      summariesRes,
-      retentionRes,
-    ] = await Promise.all([
-      supabase.from('drivers').select('*').order('created_at', { ascending: true }),
-      supabase.from('loads').select('*').order('created_at', { ascending: false }),
-      supabase.from('relay_section_snapshots').select('*'),
-      supabase
-        .from('relay_sync_runs')
-        .select('finished_at, status, error_count')
-        .order('started_at', { ascending: false })
-        .limit(5),
-      supabase.from('load_reports').select('*').order('pickup_date', { ascending: true }),
-      supabase.from('driver_fees').select('*'),
-      supabase.from('one_time_charges').select('*'),
-      supabase.from('settlements').select('*'),
-      supabase.from('settlement_loads').select('*'),
-      supabase.from('settlement_charges').select('*'),
-      supabase.from('payments').select('*').order('payment_date', { ascending: false }),
-      // FIXTURE-* verification seeds never hydrate into CRM totals/reports
-      supabase
-        .from('invoices')
-        .select('*')
-        .not('invoice_id', 'like', 'FIXTURE-%')
-        .order('week_start', { ascending: false }),
-      supabase
-        .from('invoice_trips')
-        .select('*')
-        .not('invoice_id', 'like', 'FIXTURE-%'),
-      supabase.from('payments_summary').select('*').eq('id', 1).maybeSingle(),
-      supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
-      supabase.from('sync_state').select('*'),
-      supabase.from('trip_summaries').select('*').order('end_time', { ascending: false }).limit(500),
-      supabase.from('retention_settings').select('*').eq('id', 1).maybeSingle(),
-    ]);
-    const heartbeatRes = heartbeatEarly;
-
-    const err =
-      driversRes.error ||
-      loadsRes.error ||
-      loadReportsRes.error ||
-      feesRes.error ||
-      chargesRes.error ||
-      settlementsRes.error ||
-      settlementLoadsRes.error ||
-      settlementChargesRes.error ||
-      paymentsRes.error ||
-      invoicesRes.error ||
-      invoiceTripsRes.error ||
-      activityRes.error;
-    const relayErr =
-      relayTripsRes.error ||
-      relayLegsRes.error ||
-      relayStopsRes.error ||
-      relaySnapshotsRes.error ||
-      syncRunsRes.error;
-    if (err) {
-      console.error('Supabase CRM hydrate failed', err.message);
-      setDataError(err.message);
-      setDataReady(true);
-      return;
-    }
-    if (relayErr) {
-      console.error('Relay trips hydrate failed', relayErr.message);
-      setDataError(relayErr.message);
-      setDataReady(true);
-      // Keep previous relayTrips / snapshots — never replace with [] on error.
-      // Still apply heartbeat + sync_state so offline/delayed banners stay accurate.
-      if (heartbeatRes && !heartbeatRes.error) {
-        setExtensionHeartbeat(
-          heartbeatRes.data
-            ? mapExtensionHeartbeat(heartbeatRes.data as Record<string, unknown>)
+      const err =
+        driversRes.error ||
+        loadsRes.error ||
+        loadReportsRes.error ||
+        feesRes.error ||
+        chargesRes.error ||
+        settlementsRes.error ||
+        settlementLoadsRes.error ||
+        settlementChargesRes.error ||
+        paymentsRes.error ||
+        invoicesRes.error ||
+        invoiceTripsRes.error ||
+        paymentsSummaryRes.error ||
+        activityRes.error;
+      const relayErr =
+        relayTripsRes.error ||
+        relayLegsRes.error ||
+        relayStopsRes.error ||
+        relaySnapshotsRes.error ||
+        syncRunsRes.error;
+      if (err) {
+        console.error('Supabase CRM hydrate failed', err.message);
+        setDataError(err.message);
+        // Still apply whatever invoice rows we can so Payments leaves Loading…
+        if (!invoicesRes.error) {
+          setInvoices(
+            excludeFixtureInvoices(
+              (invoicesRes.data || []).map((r) => mapInvoice(r as Record<string, unknown>)),
+            ),
+          );
+        }
+        if (!invoiceTripsRes.error) {
+          setInvoiceTrips(
+            excludeFixtureInvoices(
+              (invoiceTripsRes.data || []).map((r) => mapInvoiceTrip(r as Record<string, unknown>)),
+            ),
+          );
+        }
+        if (!paymentsSummaryRes.error) {
+          setPaymentsSummary(
+            paymentsSummaryRes.data
+              ? mapPaymentsSummary(paymentsSummaryRes.data as Record<string, unknown>)
+              : null,
+          );
+        }
+        return;
+      }
+      if (relayErr) {
+        console.error('Relay trips hydrate failed', relayErr.message);
+        setDataError(relayErr.message);
+        // Keep previous relayTrips / snapshots — never replace with [] on error.
+        // Still apply heartbeat + sync_state so offline/delayed banners stay accurate.
+        if (heartbeatRes && !heartbeatRes.error) {
+          setExtensionHeartbeat(
+            heartbeatRes.data
+              ? mapExtensionHeartbeat(heartbeatRes.data as Record<string, unknown>)
+              : null,
+          );
+        }
+        if (!syncStateRes.error) {
+          setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
+        }
+        // CRM invoice tables are independent of relay trip assemble — hydrate them anyway
+        setInvoices(
+          excludeFixtureInvoices(
+            (invoicesRes.data || []).map((r) => mapInvoice(r as Record<string, unknown>)),
+          ),
+        );
+        setInvoiceTrips(
+          excludeFixtureInvoices(
+            (invoiceTripsRes.data || []).map((r) => mapInvoiceTrip(r as Record<string, unknown>)),
+          ),
+        );
+        setPaymentsSummary(
+          paymentsSummaryRes.data
+            ? mapPaymentsSummary(paymentsSummaryRes.data as Record<string, unknown>)
             : null,
         );
+        return;
       }
-      if (!syncStateRes.error) {
-        setSyncState((syncStateRes.data || []).map((r) => mapSyncState(r as Record<string, unknown>)));
-      }
-      return;
-    }
 
-    setDataError(null);
+      setDataError(null);
 
     const loadIdsBySettlement = new Map<string, string[]>();
     for (const row of settlementLoadsRes.data || []) {
@@ -491,8 +537,15 @@ export function DataProvider({ children }: { children: ReactNode }) {
         );
       }),
     );
-    setActivityLogs((activityRes.data || []).map((r) => mapActivity(r as Record<string, unknown>)));
-    setDataReady(true);
+      setActivityLogs((activityRes.data || []).map((r) => mapActivity(r as Record<string, unknown>)));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'CRM hydrate failed';
+      console.error('Supabase hydrate threw', message);
+      setDataError(message);
+    } finally {
+      // Never leave Payments stuck on "Loading invoices…"
+      setDataReady(true);
+    }
   }, []);
 
   useEffect(() => {
