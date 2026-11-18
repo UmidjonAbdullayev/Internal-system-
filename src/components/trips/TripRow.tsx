@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { memo, useMemo } from 'react';
 import { ChevronDown, Copy, ExternalLink } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -39,7 +39,7 @@ function matchDriver(drivers: Driver[], name: string): Driver | null {
   );
 }
 
-export function TripRow({
+export const TripRow = memo(function TripRow({
   trip,
   expanded,
   selected,
@@ -353,7 +353,7 @@ export function TripRow({
       </div>
     </div>
   );
-}
+});
 
 function SummaryStat({ label, value }: { label: string; value: string }) {
   return (

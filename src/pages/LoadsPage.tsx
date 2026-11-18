@@ -9,6 +9,8 @@ import { Select, Input, Field, Textarea } from '@/components/ui/Input';
 import { Card } from '@/components/ui/Card';
 import { Modal } from '@/components/ui/Modal';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { TableSkeleton } from '@/components/ui/Skeleton';
+import { VirtualList } from '@/components/ui/VirtualList';
 import { SyncStatusLine } from '@/components/trips/SyncStatusLine';
 import { LiveMirrorBanner } from '@/components/trips/LiveMirrorBanner';
 import { TripLegend } from '@/components/trips/TripLegend';
@@ -18,7 +20,6 @@ import {
   displayStatusLabel,
   filterTrips,
   historySummary,
-  tabCountsFromTrips,
   tripDriverName,
   type TripTab,
 } from '@/lib/relayTrips';
@@ -113,6 +114,10 @@ export function LoadsPage() {
     refreshData,
     dataReady,
     dataError,
+    dataFetching,
+    tripSectionCounts,
+    ensureHistoryTrips,
+    ensureTripStops,
   } = useData();
   const [params, setParams] = useSearchParams();
   // History end-time filter TZ — default Asia/Tashkent (configurable via Settings timezone).
@@ -210,7 +215,15 @@ export function LoadsPage() {
     [relayTrips, historyRange, tripEndYmd, showRecentlyCancelled],
   );
 
-  const tabCounts = useMemo(() => tabCountsFromTrips(relayTrips), [relayTrips]);
+  const tabCounts = useMemo(
+    () => ({
+      in_transit: tripSectionCounts.in_transit,
+      upcoming: tripSectionCounts.upcoming,
+      history: tripSectionCounts.history,
+      all: tripSectionCounts.all || relayTrips.length,
+    }),
+    [tripSectionCounts, relayTrips.length],
+  );
 
   const relayTileHint = useMemo(() => {
     const it = snapshots.find((s) => s.section === 'IN_TRANSIT');
@@ -219,11 +232,20 @@ export function LoadsPage() {
     return `Relay total incl. cancelled: Upcoming ${up?.totalRecords ?? '—'} · In Transit ${it?.totalRecords ?? '—'}`;
   }, [snapshots]);
 
+  // History is loaded on demand (paged 100) — keeps initial hydrate under ~1s.
   useEffect(() => {
-    if (tabAutoPicked || !relayTrips.length) return;
+    if (tab !== 'history' && tab !== 'all') return;
+    void ensureHistoryTrips({
+      endFrom: tab === 'history' ? historyRange.start : undefined,
+      endTo: tab === 'history' ? historyRange.end : undefined,
+    });
+  }, [tab, historyRange.start, historyRange.end, ensureHistoryTrips]);
+
+  useEffect(() => {
+    if (tabAutoPicked || (!relayTrips.length && !tripSectionCounts.all)) return;
     const preferred: TripTab[] = ['in_transit', 'upcoming', 'history', 'all'];
     const next =
-      preferred.find((t) => (t === 'all' ? relayTrips.length > 0 : tabCounts[t] > 0)) || 'all';
+      preferred.find((t) => (t === 'all' ? tripSectionCounts.all > 0 : tabCounts[t] > 0)) || 'all';
     if (next !== tab) {
       setTab(next);
       const nextParams = new URLSearchParams(params);
@@ -231,7 +253,7 @@ export function LoadsPage() {
       setParams(nextParams, { replace: true });
     }
     setTabAutoPicked(true);
-  }, [relayTrips.length, tabCounts, tabAutoPicked, tab, params, setParams]);
+  }, [relayTrips.length, tabCounts, tabAutoPicked, tab, params, setParams, tripSectionCounts.all]);
 
   const statusOptions = useMemo(() => {
     const set = new Set<string>();
@@ -634,28 +656,46 @@ export function LoadsPage() {
           <div />
         </div>
 
-        <div
-          ref={listRef}
-          tabIndex={0}
-          onKeyDown={onListKeyDown}
-          className="outline-none focus-visible:ring-2 focus-visible:ring-secondary/30 focus-visible:ring-inset"
-          aria-label="Trips list"
-        >
-          {filtered.map((trip, index) => (
-            <TripRow
-              key={trip.id || trip.tripId}
-              trip={trip}
-              expanded={expandedId === trip.tripId}
-              selected={focusedIndex === index}
-              onToggle={() => {
-                setFocusedIndex(index);
-                setExpandedId((id) => (id === trip.tripId ? null : trip.tripId));
-              }}
-              drivers={drivers}
-              activityLogs={activityLogs}
+        {!dataReady ? (
+          <TableSkeleton rows={10} cols={5} />
+        ) : (
+          <div
+            ref={listRef}
+            tabIndex={0}
+            onKeyDown={onListKeyDown}
+            className="outline-none focus-visible:ring-2 focus-visible:ring-secondary/30 focus-visible:ring-inset"
+            aria-label="Trips list"
+          >
+            <VirtualList
+              items={filtered}
+              height={Math.min(720, Math.max(320, filtered.length * 72))}
+              estimateSize={() => (expandedId ? 220 : 72)}
+              getKey={(trip) => trip.id || trip.tripId}
+              renderRow={(trip, index) => (
+                <TripRow
+                  trip={trip}
+                  expanded={expandedId === trip.tripId}
+                  selected={focusedIndex === index}
+                  onToggle={() => {
+                    setFocusedIndex(index);
+                    setExpandedId((id) => {
+                      const next = id === trip.tripId ? null : trip.tripId;
+                      if (next) void ensureTripStops([trip.tripId]);
+                      return next;
+                    });
+                  }}
+                  drivers={drivers}
+                  activityLogs={activityLogs}
+                />
+              )}
             />
-          ))}
-        </div>
+            {dataFetching && (
+              <p className="border-t border-border px-3 py-2 text-xs text-text-secondary">
+                Loading more trips…
+              </p>
+            )}
+          </div>
+        )}
 
         {filtered.length === 0 && dataReady && (
           <EmptyState

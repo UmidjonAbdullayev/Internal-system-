@@ -45,7 +45,8 @@ type ViewMode = 'daily' | 'weekly' | 'monthly' | 'custom';
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export function GrossBoardPage() {
-  const { drivers, loads, reportLoads, grossAdjustments } = useData();
+  const { drivers, loads, reportLoads, grossAdjustments, dataReady, dataError, refreshData } =
+    useData();
   const [view, setView] = useState<ViewMode>('weekly');
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
@@ -277,6 +278,9 @@ export function GrossBoardPage() {
         }
         actions={
           <>
+            <Button variant="outline" size="sm" onClick={() => void refreshData()}>
+              Retry
+            </Button>
             <Button variant="outline" size="sm" onClick={exportWeekLoads}>
               <Download className="h-4 w-4" /> Week loads
             </Button>
@@ -286,6 +290,18 @@ export function GrossBoardPage() {
           </>
         }
       />
+
+      {!dataReady && (
+        <p className="mb-3 text-sm text-text-secondary">Loading gross board…</p>
+      )}
+      {dataReady && dataError && (
+        <div className="mb-3 flex items-center justify-between rounded-lg border border-danger/30 bg-danger-bg px-3 py-2 text-sm">
+          <span>{dataError}</span>
+          <Button size="sm" variant="outline" onClick={() => void refreshData()}>
+            Retry
+          </Button>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-7 mb-5">
         <KpiCard title="Total Fleet Gross" value={kpis.fleetGross} icon={DollarSign} highlight />
