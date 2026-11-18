@@ -777,10 +777,23 @@ Deno.serve(async (req: Request) => {
             .lt("last_seen_at", cutoff);
           for (const row of stale || []) {
             if (inSnapshot.has(row.trip_id)) continue;
+            // Preserve CANCELLED for TONU (payout > 0) — do not wipe to removed_from_relay.
+            const { data: staleFull } = await sb
+              .from("relay_trips")
+              .select("status, execution_status, tour_state, payout")
+              .eq("trip_id", row.trip_id)
+              .maybeSingle();
+            const cancelBlob = `${staleFull?.status || ""} ${staleFull?.execution_status || ""} ${staleFull?.tour_state || ""}`.toLowerCase();
+            const keepCancel = /cancel/.test(cancelBlob);
+            const nextStatus = keepCancel
+              ? staleFull?.status && /cancel/i.test(String(staleFull.status))
+                ? staleFull.status
+                : "CANCELLED"
+              : "removed_from_relay";
             const { error } = await sb
               .from("relay_trips")
               .update({
-                status: "removed_from_relay",
+                status: nextStatus,
                 section: "HISTORY",
                 updated_at: now,
               })

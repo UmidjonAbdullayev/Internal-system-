@@ -137,7 +137,7 @@ function deriveMoneyBucketFallback(row: Record<string, unknown>): MoneyBucket {
     status.includes('TONU') ||
     exec.includes('TONU') ||
     mile.includes('TONU') ||
-    (status === 'CANCELLED' && paid > 0);
+    (paid > 0 && (status.includes('CANCEL') || exec.includes('CANCEL')));
   const isIncome = status === 'COMPLETED' || isTonu;
   if (!isIncome) return 'expected';
   const weekSource = String(row.week_source || '');
