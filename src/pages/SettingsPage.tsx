@@ -1,20 +1,94 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input, Field, Select } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/Badge';
+import { supabase } from '@/lib/supabase';
+
+type BotUser = {
+  id: string;
+  telegram_user_id: number;
+  display_name: string | null;
+  role: string;
+  authorized_at: string;
+  last_active_at: string;
+  revoked_at: string | null;
+};
 
 export function SettingsPage() {
   const { companySettings, updateSettings, currentUser, drivers, loads, settlements } = useData();
   const [form, setForm] = useState({ ...companySettings });
+  const [botPassword, setBotPassword] = useState('');
+  const [botMsg, setBotMsg] = useState<string | null>(null);
+  const [botUsers, setBotUsers] = useState<BotUser[]>([]);
+  const [passwordSet, setPasswordSet] = useState(false);
+
+  const loadBot = useCallback(async () => {
+    const [{ data: cfg }, { data: users }] = await Promise.all([
+      supabase.from('telegram_bot_config').select('password_hash, password_updated_at').eq('id', 1).maybeSingle(),
+      supabase
+        .from('bot_users')
+        .select('id, telegram_user_id, display_name, role, authorized_at, last_active_at, revoked_at')
+        .order('last_active_at', { ascending: false })
+        .limit(50),
+    ]);
+    setPasswordSet(Boolean(cfg?.password_hash));
+    setBotUsers((users as BotUser[]) || []);
+  }, []);
+
+  useEffect(() => {
+    void loadBot();
+  }, [loadBot]);
+
+  const saveBotPassword = async () => {
+    setBotMsg(null);
+    const { data, error } = await supabase.rpc('set_telegram_bot_password', {
+      p_password: botPassword,
+    });
+    if (error) {
+      setBotMsg(error.message);
+      return;
+    }
+    if (data && typeof data === 'object' && 'ok' in data && !(data as { ok: boolean }).ok) {
+      setBotMsg(String((data as { error?: string }).error || 'Failed'));
+      return;
+    }
+    setBotPassword('');
+    setBotMsg('Password updated (bcrypt hash stored). Existing sessions stay until “Log out everyone”.');
+    await loadBot();
+  };
+
+  const logoutEveryone = async () => {
+    setBotMsg(null);
+    const { error } = await supabase.rpc('telegram_bot_logout_everyone');
+    if (error) {
+      setBotMsg(error.message);
+      return;
+    }
+    setBotMsg('All bot users revoked.');
+    await loadBot();
+  };
+
+  const revokeUser = async (id: string) => {
+    await supabase
+      .from('bot_users')
+      .update({ revoked_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', id);
+    await loadBot();
+  };
+
+  const setRole = async (id: string, role: 'viewer' | 'admin') => {
+    await supabase.from('bot_users').update({ role, updated_at: new Date().toISOString() }).eq('id', id);
+    await loadBot();
+  };
 
   return (
     <div>
       <PageHeader
         title="Settings"
-        subtitle="Company configuration and system preferences"
+        subtitle="Company configuration and Telegram bot access"
       />
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -94,6 +168,76 @@ export function SettingsPage() {
         <div className="space-y-4">
           <Card>
             <CardHeader>
+              <CardTitle>Telegram bot password</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <p className="text-text-secondary">
+                Private DM unlock for @inter_sysbot. Stored as bcrypt only.
+                {passwordSet ? ' Password is set.' : ' No password set yet.'}
+              </p>
+              <Field label="New password">
+                <Input
+                  type="password"
+                  value={botPassword}
+                  onChange={(e) => setBotPassword(e.target.value)}
+                  placeholder="Min 6 characters"
+                />
+              </Field>
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => void saveBotPassword()} disabled={botPassword.length < 6}>
+                  Save password
+                </Button>
+                <Button variant="danger" onClick={() => void logoutEveryone()}>
+                  Log out everyone
+                </Button>
+              </div>
+              {botMsg && <p className="text-xs text-text-secondary">{botMsg}</p>}
+              <p className="text-xs text-text-secondary">
+                Alerts stay OFF until TELEGRAM_ALERTS_ENABLED is approved. See Alert preview.
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Bot users</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm">
+              {botUsers.length === 0 && (
+                <p className="text-text-secondary">No authorized Telegram users yet.</p>
+              )}
+              {botUsers.map((u) => (
+                <div
+                  key={u.id}
+                  className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-bg px-3 py-2"
+                >
+                  <span className="font-mono text-xs">{u.telegram_user_id}</span>
+                  <Badge status={u.revoked_at ? 'revoked' : u.role} />
+                  <span className="text-xs text-text-secondary">
+                    last {new Date(u.last_active_at).toLocaleString()}
+                  </span>
+                  <div className="ml-auto flex gap-1">
+                    {!u.revoked_at && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          onClick={() => void setRole(u.id, u.role === 'admin' ? 'viewer' : 'admin')}
+                        >
+                          {u.role === 'admin' ? 'Make viewer' : 'Make admin'}
+                        </Button>
+                        <Button variant="danger" onClick={() => void revokeUser(u.id)}>
+                          Revoke
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
               <CardTitle>Current User</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2 text-sm">
@@ -129,22 +273,6 @@ export function SettingsPage() {
                 <p className="text-2xl font-bold font-display text-primary">{settlements.length}</p>
                 <p className="text-xs text-text-secondary">Settlements</p>
               </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Data Layer</CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-text-secondary space-y-2">
-              <p>
-                Live data from Supabase project <code className="text-xs bg-bg px-1 rounded">iiyqkdjwxlnfqvlidbqr</code>
-                (empty until Relay sync / you add drivers). Telegram: <code className="text-xs bg-bg px-1 rounded">/link DRV-xxxx</code>.
-              </p>
-              <p>
-                Financial totals are always derived from underlying load, fee, and charge records —
-                never hardcoded in the UI.
-              </p>
             </CardContent>
           </Card>
         </div>

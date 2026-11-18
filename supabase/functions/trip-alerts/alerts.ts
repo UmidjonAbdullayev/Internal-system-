@@ -5,39 +5,22 @@ import {
   type OutgoingAlert,
   dispatchAlert,
 } from "./send.ts";
+import { formatArrivedHtml, formatNotAtStopHtml } from "./format.ts";
 
 const MS_MIN = 60_000;
 const LATE_GRACE_MS = 15 * MS_MIN;
-const NO_DRIVER_HORIZON_MS = 12 * 60 * MS_MIN;
-const CPT_RISK_MS = 20 * MS_MIN;
-const LATE_REASON_WAIT_MS = 30 * MS_MIN;
-const ETA_RESLIP_MS = 30 * MS_MIN;
-const SYNC_STALE_MS = 5 * MS_MIN;
+const MAX_STOP_AGE_MS = 6 * 60 * MS_MIN;
+const SYNC_FRESH_MS = 5 * MS_MIN;
+const ALLOWED = new Set(["arrived", "not_at_stop"]);
 
 export type StatusEvent = {
-  kind:
-    | "trip_booked"
-    | "arrived"
-    | "departed"
-    | "delivered"
-    | "cancelled"
-    | "driver_changed"
-    | "no_driver"
-    | "late_reason";
+  kind: "arrived" | "not_at_stop" | string;
   tripId: string;
   stopId?: string;
   section?: string | null;
-  driver?: string | null;
-  prevDriver?: string | null;
-  scheduledAt?: string | null;
-  actualAt?: string | null;
-  nextStopLabel?: string | null;
-  nextStopDue?: string | null;
-  lateReason?: string | null;
-  facility?: string | null;
-  startTime?: string | null;
-  timing?: "late" | "early" | "on_time" | null;
-  /** Relay driverList[].id / entity.drivers[].id */
+  live?: boolean;
+  source?: string | null;
+  crmDriverIds?: string[];
   relayDriverIds?: string[];
 };
 
@@ -68,134 +51,256 @@ export function extractRelayDriverIds(raw: unknown): string[] {
   return [...new Set(ids)];
 }
 
-function esc(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function boldTrip(tripId: string): string {
-  return `<b>${esc(tripId)}</b>`;
-}
-
-export function formatLocal(
-  iso: string | null | undefined,
-  timeZone: string,
-): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return esc(String(iso)).slice(0, 32);
-  try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      timeZoneName: "short",
-    }).formatToParts(d);
-    const get = (t: string) => parts.find((p) => p.type === t)?.value || "";
-    return `${get("month")} ${get("day")} ${get("hour")}:${get("minute")} ${get("timeZoneName")}`;
-  } catch {
-    return d.toISOString();
-  }
-}
-
-function minutesDelta(actualIso: string, scheduledIso: string): number | null {
-  const a = new Date(actualIso).getTime();
-  const s = new Date(scheduledIso).getTime();
-  if (Number.isNaN(a) || Number.isNaN(s)) return null;
-  return Math.round((a - s) / MS_MIN);
-}
-
-export function timingLabel(
-  actualIso?: string | null,
-  scheduledIso?: string | null,
-): "late" | "early" | "on_time" | null {
-  if (!actualIso || !scheduledIso) return null;
-  const mins = minutesDelta(actualIso, scheduledIso);
-  if (mins == null) return null;
-  if (mins > 15) return "late";
-  if (mins < -15) return "early";
-  return "on_time";
-}
-
-export function buildStatusHtml(ev: StatusEvent, tz: string): { html: string; level: string } {
-  const trip = boldTrip(ev.tripId);
-  switch (ev.kind) {
-    case "trip_booked":
-      return {
-        level: "0",
-        html: `📦 New trip ${trip}\n${esc(ev.driver || "No driver")} · Upcoming\nBooked just now`,
-      };
-    case "arrived": {
-      const t = ev.timing || timingLabel(ev.actualAt, ev.scheduledAt) || "on_time";
-      const word = t === "late" ? "late" : t === "early" ? "early" : "on time";
-      return {
-        level: t,
-        html: `📍 Arrived ${trip} (${word})\n${esc(ev.facility || "Stop")} · ${formatLocal(ev.actualAt, tz)}\nSch ${formatLocal(ev.scheduledAt, tz)}`,
-      };
+function trailerFromStopRaw(raw: unknown, loadTrailer?: string | null): string | null {
+  if (raw && typeof raw === "object") {
+    const details = (raw as Record<string, unknown>).trailerDetails;
+    if (Array.isArray(details) && details[0] && typeof details[0] === "object") {
+      const id = (details[0] as Record<string, unknown>).assetId;
+      if (id) return String(id);
     }
-    case "departed":
-      return {
-        level: "0",
-        html: `🚚 Departed ${trip}\nNext: ${esc(ev.nextStopLabel || "—")}\nDue ${formatLocal(ev.nextStopDue, tz)}`,
-      };
-    case "delivered":
-      return {
-        level: "0",
-        html: `✅ Delivered ${trip}\n${esc(ev.driver || "—")}\nCompleted`,
-      };
-    case "cancelled":
-      return {
-        level: "0",
-        html: `❌ Cancelled ${trip}\n${esc(ev.driver || "—")}\nTrip/leg cancelled`,
-      };
-    case "driver_changed":
-      return {
-        level: "0",
-        html: `🔄 Driver change ${trip}\n${esc(ev.prevDriver || "—")} → ${esc(ev.driver || "—")}\nLive update`,
-      };
-    case "no_driver":
-      return {
-        level: "12h",
-        html: `⚠️ No driver ${trip}\nStarts ${formatLocal(ev.startTime, tz)}\nAssign within 12h window`,
-      };
-    case "late_reason":
-      return {
-        level: "0",
-        html: `📝 Late reason ${trip}\n${esc((ev.lateReason || "").slice(0, 120))}\nLogged`,
-      };
-    default:
-      return { level: "0", html: `ℹ️ ${trip}` };
   }
+  return loadTrailer || null;
 }
 
-export function buildTimeHtml(
-  kind: "not_at_stop" | "running_late" | "cpt_risk" | "late_no_reason",
-  tripId: string,
-  line2: string,
-  line3: string,
-): string {
-  const trip = boldTrip(tripId);
-  const emoji =
-    kind === "not_at_stop"
-      ? "🚨"
-      : kind === "running_late"
-      ? "⏰"
-      : kind === "cpt_risk"
-      ? "⚡"
-      : "❓";
-  const title =
-    kind === "not_at_stop"
-      ? "Not at stop"
-      : kind === "running_late"
-      ? "Running late"
-      : kind === "cpt_risk"
-      ? "CPT risk"
-      : "Late · no reason";
-  return `${emoji} ${title} ${trip}\n${esc(line2)}\n${esc(line3)}`;
+function tractorFromTripRaw(raw: unknown): string | null {
+  if (!raw || typeof raw !== "object") return null;
+  const loads = (raw as Record<string, unknown>).loads;
+  if (Array.isArray(loads)) {
+    for (const load of loads) {
+      if (!load || typeof load !== "object") continue;
+      const td = (load as Record<string, unknown>).tractorDetail;
+      if (td && typeof td === "object") {
+        const id = (td as Record<string, unknown>).assetId;
+        if (id) return String(id);
+      }
+      const list = (load as Record<string, unknown>).trailerDetails;
+      // also sometimes tractor at load level
+      const tractor = (load as Record<string, unknown>).tractorId;
+      if (tractor) return String(tractor);
+    }
+  }
+  return null;
+}
+
+async function matchCrmDriverIds(
+  sb: SupabaseClient,
+  driverNameRaw: string | null | undefined,
+): Promise<string[]> {
+  const name = String(driverNameRaw || "").trim().toLowerCase();
+  if (!name) return [];
+  const { data } = await sb
+    .from("drivers")
+    .select("driver_id, first_name, last_name")
+    .limit(200);
+  const hits: string[] = [];
+  for (const d of data || []) {
+    const full = `${d.first_name || ""} ${d.last_name || ""}`.trim().toLowerCase();
+    if (full && (full === name || name.includes(full) || full.includes(name))) {
+      hits.push(String(d.driver_id));
+    }
+  }
+  return [...new Set(hits)];
+}
+
+async function inTransitSyncFresh(sb: SupabaseClient): Promise<{ fresh: boolean; lastAt: string | null }> {
+  const { data } = await sb
+    .from("sync_state")
+    .select("section, last_successful_sync_at, updated_at")
+    .eq("section", "IN_TRANSIT")
+    .maybeSingle();
+  const ts = data?.last_successful_sync_at || data?.updated_at || null;
+  if (!ts) {
+    // fallback relay_sync_runs
+    const { data: run } = await sb
+      .from("relay_sync_runs")
+      .select("finished_at, started_at, status")
+      .in("status", ["completed", "completed_with_errors"])
+      .order("finished_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const t = run?.finished_at || run?.started_at || null;
+    if (!t) return { fresh: false, lastAt: null };
+    return { fresh: Date.now() - new Date(t).getTime() <= SYNC_FRESH_MS, lastAt: t };
+  }
+  return { fresh: Date.now() - new Date(ts).getTime() <= SYNC_FRESH_MS, lastAt: String(ts) };
+}
+
+function isCancelledTrip(trip: Record<string, unknown>): boolean {
+  const status = String(trip.status || trip.execution_status || trip.tour_state || "").toUpperCase();
+  return /CANCEL/.test(status);
+}
+
+function stopIsNext(
+  stop: Record<string, unknown>,
+  allStops: Array<Record<string, unknown>>,
+): boolean {
+  const tripId = String(stop.trip_id);
+  const seq = Number(stop.seq ?? 0);
+  const later = allStops.filter(
+    (s) =>
+      String(s.trip_id) === tripId &&
+      Number(s.seq ?? 0) > seq &&
+      (s.actual_arrival || s.actual_departure),
+  );
+  return later.length === 0;
+}
+
+type TripCtx = {
+  trip: Record<string, unknown>;
+  stops: Array<Record<string, unknown>>;
+  crmDriverIds: string[];
+  relayDriverIds: string[];
+  tractor: string | null;
+};
+
+async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>> {
+  const { data: trips } = await sb
+    .from("relay_trips")
+    .select(
+      "trip_id, section, status, driver_name_raw, execution_status, tour_state, raw",
+    )
+    .eq("archived", false)
+    .in("section", ["UPCOMING", "IN_TRANSIT"]);
+
+  const map = new Map<string, TripCtx>();
+  const tripIds = (trips || []).map((t) => t.trip_id);
+  let stops: Array<Record<string, unknown>> = [];
+  if (tripIds.length) {
+    const { data: stopRows } = await sb
+      .from("relay_stops")
+      .select(
+        "stop_id, trip_id, load_id, seq, stop_type, facility_code, city, state, time_zone, scheduled_arrival, actual_arrival, actual_departure, eta, arrival_time_source, raw, updated_at",
+      )
+      .in("trip_id", tripIds)
+      .eq("archived", false);
+    stops = stopRows || [];
+  }
+
+  for (const trip of trips || []) {
+    const tripStops = stops
+      .filter((s) => String(s.trip_id) === trip.trip_id)
+      .sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
+    const crmDriverIds = await matchCrmDriverIds(sb, trip.driver_name_raw);
+    const relayDriverIds = extractRelayDriverIds(trip.raw);
+    const tractor = tractorFromTripRaw(trip.raw);
+    map.set(trip.trip_id, {
+      trip: trip as Record<string, unknown>,
+      stops: tripStops,
+      crmDriverIds,
+      relayDriverIds,
+      tractor,
+    });
+  }
+  return map;
+}
+
+function buildArrivedAlert(
+  ctx: TripCtx,
+  stop: Record<string, unknown>,
+  opts: { test?: boolean; dryRun?: boolean; reason?: string; syncBasis?: string; force?: boolean },
+): OutgoingAlert | null {
+  const actual = stop.actual_arrival ? String(stop.actual_arrival) : null;
+  if (!actual) return null;
+  const planned = stop.scheduled_arrival ? String(stop.scheduled_arrival) : null;
+  const tz = String(stop.time_zone || "America/Los_Angeles");
+  const facility = String(stop.facility_code || stop.stop_type || "Stop");
+  const loadId = String(stop.load_id || stop.trip_id);
+  const stopCount = Math.max(1, ctx.stops.length);
+  const seq = Number(stop.seq ?? 1);
+  const trailer = trailerFromStopRaw(stop.raw, null);
+  const html = formatArrivedHtml({
+    facility,
+    city: stop.city ? String(stop.city) : null,
+    state: stop.state ? String(stop.state) : null,
+    tripId: String(stop.trip_id),
+    loadId,
+    stopSeq: seq,
+    stopCount,
+    stopType: stop.stop_type ? String(stop.stop_type) : null,
+    actualAt: actual,
+    plannedAt: planned,
+    timeZone: tz,
+    tractor: ctx.tractor,
+    trailer,
+    timeSource: stop.arrival_time_source ? String(stop.arrival_time_source) : null,
+    test: opts.test,
+  });
+  return {
+    tripId: String(stop.trip_id),
+    stopId: String(stop.stop_id),
+    alertType: "arrived",
+    html,
+    meta: {
+      facility,
+      actual,
+      planned,
+      source: stop.arrival_time_source,
+    },
+    dryRun: opts.dryRun,
+    force: opts.force,
+    reason: opts.reason,
+    syncBasis: opts.syncBasis,
+    crmDriverIds: ctx.crmDriverIds,
+    relayDriverIds: ctx.relayDriverIds,
+    replyToStopAlert: true,
+  };
+}
+
+function buildNotAtStopAlert(
+  ctx: TripCtx,
+  stop: Record<string, unknown>,
+  now: number,
+  opts: { test?: boolean; dryRun?: boolean; reason?: string; syncBasis?: string; force?: boolean },
+): OutgoingAlert | null {
+  if (stop.actual_arrival) return null;
+  const planned = stop.scheduled_arrival ? new Date(String(stop.scheduled_arrival)).getTime() : NaN;
+  if (Number.isNaN(planned)) return null;
+  const overdue = now - planned;
+  if (overdue < LATE_GRACE_MS) return null;
+  if (overdue > MAX_STOP_AGE_MS) return null;
+  if (!stopIsNext(stop, ctx.stops)) return null;
+  if (isCancelledTrip(ctx.trip)) return null;
+
+  const tz = String(stop.time_zone || "America/Los_Angeles");
+  const facility = String(stop.facility_code || stop.stop_type || "Stop");
+  const loadId = String(stop.load_id || stop.trip_id);
+  const stopCount = Math.max(1, ctx.stops.length);
+  const seq = Number(stop.seq ?? 1);
+  const trailer = trailerFromStopRaw(stop.raw, null);
+  const html = formatNotAtStopHtml({
+    facility,
+    city: stop.city ? String(stop.city) : null,
+    state: stop.state ? String(stop.state) : null,
+    tripId: String(stop.trip_id),
+    loadId,
+    stopSeq: seq,
+    stopCount,
+    stopType: stop.stop_type ? String(stop.stop_type) : null,
+    plannedAt: String(stop.scheduled_arrival),
+    overdueMinutes: Math.round(overdue / MS_MIN),
+    timeZone: tz,
+    eta: stop.eta ? String(stop.eta) : null,
+    tractor: ctx.tractor,
+    trailer,
+    test: opts.test,
+  });
+  return {
+    tripId: String(stop.trip_id),
+    stopId: String(stop.stop_id),
+    alertType: "not_at_stop",
+    html,
+    meta: {
+      facility,
+      overdue_ms: overdue,
+      planned: stop.scheduled_arrival,
+    },
+    dryRun: opts.dryRun,
+    force: opts.force,
+    reason: opts.reason,
+    syncBasis: opts.syncBasis,
+    crmDriverIds: ctx.crmDriverIds,
+    relayDriverIds: ctx.relayDriverIds,
+  };
 }
 
 export async function processStatusEvents(
@@ -204,35 +309,53 @@ export async function processStatusEvents(
   config: AlertConfig,
   settings: Map<string, AlertSetting>,
   events: StatusEvent[],
-): Promise<Array<Record<string, unknown>>> {
-  const results: Array<Record<string, unknown>> = [];
-  if (!config.bootstrapped) {
-    return [{ status: "bootstrap_pending", skipped: events.length }];
-  }
+  opts?: { dryRun?: boolean },
+): Promise<unknown[]> {
+  const results: unknown[] = [];
+  const dryRun = Boolean(opts?.dryRun) || !config.alerts_enabled;
+  // Only live arrived edges from consecutive syncs
   for (const ev of events) {
-    const section = String(ev.section || "").toUpperCase();
-    if (section === "HISTORY" || section === "history") {
-      results.push({ tripId: ev.tripId, status: "skipped_history" });
+    if (!ALLOWED.has(ev.kind)) {
+      results.push({ alertType: ev.kind, status: "removed_alert_type" });
       continue;
     }
-    const built = buildStatusHtml(ev, config.timezone);
-    const out: OutgoingAlert = {
+    if (ev.kind !== "arrived") continue;
+    if (!ev.live) {
+      results.push({ alertType: "arrived", tripId: ev.tripId, status: "skipped_not_live" });
+      continue;
+    }
+    if (ev.source && /backfill|catchup|force|history|migrate|test/i.test(ev.source)) {
+      results.push({ alertType: "arrived", tripId: ev.tripId, status: "skipped_source", source: ev.source });
+      continue;
+    }
+    const trips = await loadActiveTrips(sb);
+    const ctx = trips.get(ev.tripId);
+    if (!ctx) {
+      results.push({ alertType: "arrived", tripId: ev.tripId, status: "trip_not_active" });
+      continue;
+    }
+    const stop = ctx.stops.find((s) => String(s.stop_id) === String(ev.stopId || "")) ||
+      ctx.stops.find((s) => s.actual_arrival);
+    if (!stop?.actual_arrival) {
+      results.push({ alertType: "arrived", tripId: ev.tripId, status: "no_actual" });
+      continue;
+    }
+    const alert = buildArrivedAlert(ctx, stop, {
+      dryRun,
+      reason: "live_checkin_edge",
+      syncBasis: "status_event",
+    });
+    if (!alert) continue;
+    if (ev.crmDriverIds?.length) alert.crmDriverIds = ev.crmDriverIds;
+    if (ev.relayDriverIds?.length) alert.relayDriverIds = ev.relayDriverIds;
+    results.push({
+      ...(await dispatchAlert(sb, botToken, config, settings, alert)),
+      alertType: "arrived",
       tripId: ev.tripId,
-      stopId: ev.stopId,
-      alertType: ev.kind,
-      level: built.level,
-      html: built.html,
-      meta: { kind: ev.kind },
-      relayDriverIds: ev.relayDriverIds || [],
-    };
-    results.push({ tripId: ev.tripId, alertType: ev.kind, ...(await dispatchAlert(sb, botToken, config, settings, out)) });
+      stopId: stop.stop_id,
+    });
   }
   return results;
-}
-
-function isActiveSection(section: string | null | undefined): boolean {
-  const s = String(section || "").toUpperCase().replace(/-/g, "_");
-  return s === "UPCOMING" || s === "IN_TRANSIT" || s === "INTRANSIT";
 }
 
 export async function runCronChecks(
@@ -240,294 +363,91 @@ export async function runCronChecks(
   botToken: string,
   config: AlertConfig,
   settings: Map<string, AlertSetting>,
-): Promise<Record<string, unknown>> {
-  const now = Date.now();
-  const results: Array<Record<string, unknown>> = [];
+  opts?: { dryRun?: boolean; windowHours?: number },
+): Promise<{ paused?: boolean; reason?: string; results: unknown[] }> {
+  const results: unknown[] = [];
+  const dryRun = Boolean(opts?.dryRun);
+  const { data: locked } = await sb.rpc("try_trip_alerts_lock");
+  if (locked === false) {
+    return { paused: true, reason: "advisory_lock", results: [{ status: "locked" }] };
+  }
 
-  // Sync health gate
-  const { data: lastRun } = await sb
-    .from("relay_sync_runs")
-    .select("finished_at, status, started_at")
-    .in("status", ["completed", "completed_with_errors"])
-    .order("finished_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const lastOk = lastRun?.finished_at
-    ? new Date(lastRun.finished_at).getTime()
-    : lastRun?.started_at
-    ? new Date(lastRun.started_at).getTime()
-    : 0;
-  const stale = !lastOk || now - lastOk > SYNC_STALE_MS;
-
-  // Spec: NO automatic system messages (sync lost/restored). Still pause time-based alerts.
-  if (stale) {
-    if (!config.sync_stale_notified) {
-      await sb
-        .from("telegram_alert_config")
-        .update({ sync_stale_notified: true, updated_at: new Date().toISOString() })
-        .eq("id", 1);
-      results.push({ alertType: "sync_stopped", status: "suppressed_no_system_msgs" });
+  try {
+    const sync = await inTransitSyncFresh(sb);
+    if (!sync.fresh && !dryRun) {
+      return { paused: true, reason: "sync_stale", results: [{ status: "sync_stale", lastAt: sync.lastAt }] };
     }
-    return { paused: true, reason: "sync_stale", results };
-  }
 
-  if (config.sync_stale_notified) {
-    await sb
-      .from("telegram_alert_config")
-      .update({ sync_stale_notified: false, updated_at: new Date().toISOString() })
-      .eq("id", 1);
-    results.push({ alertType: "sync_restored", status: "suppressed_no_system_msgs" });
-  }
+    const trips = await loadActiveTrips(sb);
+    const now = Date.now();
+    const windowMs = (opts?.windowHours ?? 1) * 3600_000;
 
-  // Prefer relay_trips / relay_stops when present
-  const { data: trips } = await sb
-    .from("relay_trips")
-    .select(
-      "trip_id, section, status, driver_name_raw, start_time, execution_status, tour_state, raw",
-    )
-    .eq("archived", false)
-    .in("section", ["UPCOMING", "IN_TRANSIT"]);
+    for (const ctx of trips.values()) {
+      if (isCancelledTrip(ctx.trip)) continue;
+      const section = String(ctx.trip.section || "");
 
-  const tripIds = (trips || []).map((t) => t.trip_id);
-  const tripById = new Map((trips || []).map((t) => [t.trip_id, t]));
-  const driverIdsFor = (tripId: string) =>
-    extractRelayDriverIds(tripById.get(tripId)?.raw ?? null);
-  const dispatch = (alert: OutgoingAlert) =>
-    dispatchAlert(sb, botToken, config, settings, {
-      ...alert,
-      relayDriverIds: alert.relayDriverIds?.length
-        ? alert.relayDriverIds
-        : driverIdsFor(alert.tripId),
-    });
-  let stops: Array<Record<string, unknown>> = [];
-  let legs: Array<Record<string, unknown>> = [];
-  if (tripIds.length) {
-    const { data: stopRows } = await sb
-      .from("relay_stops")
-      .select(
-        "stop_id, trip_id, load_id, seq, stop_type, facility_code, scheduled_arrival, actual_arrival, scheduled_departure, actual_departure, eta, time_zone, late_reason, late_reason_at",
-      )
-      .in("trip_id", tripIds)
-      .eq("archived", false);
-    stops = stopRows || [];
-    const { data: legRows } = await sb
-      .from("relay_legs")
-      .select("load_id, trip_id, cpt, driver_name_raw, execution_status")
-      .in("trip_id", tripIds)
-      .eq("archived", false);
-    legs = legRows || [];
-  }
-
-  // Fallback: loads upcoming/in_transit when no relay_trips yet
-  if (!trips?.length) {
-    const { data: loads } = await sb
-      .from("loads")
-      .select(
-        "load_id, parent_trip_id, trip_bucket, load_status, driver_name_raw, pickup_date, delivery_date, arrival_actual, arrival_scheduled, arrival_address, late_reason, late_reason_at, status_bar_state",
-      )
-      .eq("archived", false)
-      .in("trip_bucket", ["upcoming", "in_transit"]);
-
-    for (const load of loads || []) {
-      const tripId = String(load.parent_trip_id || load.load_id);
-      // no_driver within 12h using pickup_date as coarse start
-      if (!load.driver_name_raw && load.pickup_date) {
-        const start = new Date(`${load.pickup_date}T12:00:00Z`).getTime();
-        if (!Number.isNaN(start) && start - now <= NO_DRIVER_HORIZON_MS && start >= now - MS_MIN) {
-          const built = buildStatusHtml(
-            {
-              kind: "no_driver",
-              tripId,
-              section: load.trip_bucket,
-              startTime: `${load.pickup_date}T12:00:00Z`,
-            },
-            config.timezone,
-          );
-          results.push({
-            ...(await dispatch( {
-              tripId,
-              alertType: "no_driver",
-              level: built.level,
-              html: built.html,
-            })),
+      for (const stop of ctx.stops) {
+        // NOT AT STOP — once, next stop, +15m, <6h, fresh sync
+        if (section === "IN_TRANSIT" || section === "UPCOMING") {
+          const notAt = buildNotAtStopAlert(ctx, stop, now, {
+            dryRun: dryRun || !isEnabled(config),
+            reason: "cron_not_at_stop",
+            syncBasis: sync.lastAt || "cron",
           });
-        }
-      }
-    }
-  }
-
-  for (const stop of stops) {
-    const tripId = String(stop.trip_id);
-    const trip = tripById.get(tripId);
-    if (!trip || !isActiveSection(trip.section)) continue;
-    const stopId = String(stop.stop_id);
-    const facility = String(stop.facility_code || stop.stop_type || "Stop");
-    const sched = stop.scheduled_arrival ? new Date(String(stop.scheduled_arrival)).getTime() : NaN;
-    const actual = stop.actual_arrival ? new Date(String(stop.actual_arrival)).getTime() : NaN;
-    const eta = stop.eta ? new Date(String(stop.eta)).getTime() : NaN;
-    const tz = String(stop.time_zone || config.timezone);
-
-    // 8) NOT AT STOP
-    if (!Number.isNaN(sched) && Number.isNaN(actual)) {
-      const overdue = now - sched;
-      for (const level of [
-        { key: "15", after: LATE_GRACE_MS },
-        { key: "60", after: 60 * MS_MIN },
-        { key: "120", after: 120 * MS_MIN },
-      ]) {
-        if (overdue >= level.after) {
-          const html = buildTimeHtml(
-            "not_at_stop",
-            tripId,
-            `${facility} · +${Math.round(overdue / MS_MIN)}m`,
-            `Sch ${formatLocal(String(stop.scheduled_arrival), tz)}`,
-          );
-          results.push({
-            ...(await dispatch( {
-              tripId,
-              stopId,
+          if (notAt) {
+            // For Upcoming: only first pickup due
+            if (section === "UPCOMING") {
+              const firstPickup = ctx.stops.find(
+                (s) => /pick/i.test(String(s.stop_type || "")) || Number(s.seq) === 1,
+              );
+              if (firstPickup && String(firstPickup.stop_id) !== String(stop.stop_id)) {
+                continue;
+              }
+            }
+            results.push({
+              ...(await dispatchAlert(sb, botToken, config, settings, notAt)),
               alertType: "not_at_stop",
-              level: level.key,
-              html,
-              meta: { facility, overdue_ms: overdue },
-            })),
-          });
+              tripId: notAt.tripId,
+              stopId: notAt.stopId,
+            });
+          }
+        }
+
+        // Dry-run ARRIVED: stops whose actual_arrival appeared in the last ~1h window
+        if (dryRun && stop.actual_arrival) {
+          const updated = stop.updated_at ? new Date(String(stop.updated_at)).getTime() : NaN;
+          const actual = new Date(String(stop.actual_arrival)).getTime();
+          const recent =
+            (!Number.isNaN(updated) && now - updated <= windowMs) ||
+            (!Number.isNaN(actual) && now - actual <= windowMs);
+          if (recent) {
+            const arrived = buildArrivedAlert(ctx, stop, {
+              dryRun: true,
+              reason: "dry_run_recent_arrival",
+              syncBasis: `window_${opts?.windowHours ?? 1}h`,
+            });
+            if (arrived) {
+              results.push({
+                ...(await dispatchAlert(sb, botToken, config, settings, arrived)),
+                alertType: "arrived",
+                tripId: arrived.tripId,
+                stopId: arrived.stopId,
+              });
+            }
+          }
         }
       }
     }
 
-    // 9) Running late (ETA)
-    if (!Number.isNaN(eta) && !Number.isNaN(sched) && Number.isNaN(actual)) {
-      const slip = eta - sched;
-      if (slip > LATE_GRACE_MS) {
-        const baseLevel = "15";
-        results.push({
-          ...(await dispatch( {
-            tripId,
-            stopId,
-            alertType: "running_late",
-            level: baseLevel,
-            html: buildTimeHtml(
-              "running_late",
-              tripId,
-              `${facility} · ETA +${Math.round(slip / MS_MIN)}m`,
-              `ETA ${formatLocal(String(stop.eta), tz)}`,
-            ),
-            meta: { slip_ms: slip },
-          })),
-        });
-        // Reslip buckets every +30m beyond first 15
-        const extra = slip - LATE_GRACE_MS;
-        const buckets = Math.floor(extra / ETA_RESLIP_MS);
-        if (buckets >= 1) {
-          results.push({
-            ...(await dispatch( {
-              tripId,
-              stopId,
-              alertType: "running_late",
-              level: `slip:${buckets}`,
-              html: buildTimeHtml(
-                "running_late",
-                tripId,
-                `${facility} · ETA slipped +${Math.round(slip / MS_MIN)}m`,
-                `ETA ${formatLocal(String(stop.eta), tz)}`,
-              ),
-              meta: { slip_ms: slip, bucket: buckets },
-            })),
-          });
-        }
-      }
-    }
-
-    // 11) Late no reason
-    if (!Number.isNaN(actual) && !Number.isNaN(sched) && actual - sched > LATE_GRACE_MS) {
-      const waited = now - actual;
-      if (waited >= LATE_REASON_WAIT_MS && !stop.late_reason) {
-        results.push({
-          ...(await dispatch( {
-            tripId,
-            stopId,
-            alertType: "late_no_reason",
-            level: "30",
-            html: buildTimeHtml(
-              "late_no_reason",
-              tripId,
-              `${facility} arrived late`,
-              `No reason after 30m`,
-            ),
-          })),
-        });
-      }
-    }
+    return { results };
+  } finally {
+    await sb.rpc("release_trip_alerts_lock");
   }
+}
 
-  // 10) CPT risk — at pickup (PUP), arrived, not departed, CPT soon/passed
-  for (const leg of legs) {
-    const tripId = String(leg.trip_id);
-    const trip = tripById.get(tripId);
-    if (!trip || !isActiveSection(trip.section)) continue;
-    if (!leg.cpt) continue;
-    const cpt = new Date(String(leg.cpt)).getTime();
-    if (Number.isNaN(cpt)) continue;
-    const legStops = stops
-      .filter((s) => s.load_id === leg.load_id)
-      .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
-    const pickup = legStops.find((s) =>
-      /PUP|PICK/i.test(String(s.stop_type || ""))
-    ) || legStops[0];
-    if (!pickup) continue;
-    const atFacility = pickup.actual_arrival && !pickup.actual_departure;
-    if (!atFacility) continue;
-    const untilCpt = cpt - now;
-    if (untilCpt <= CPT_RISK_MS) {
-      const level = untilCpt <= 0 ? "passed" : "20";
-      results.push({
-        ...(await dispatch( {
-          tripId,
-          stopId: String(pickup.stop_id),
-          alertType: "cpt_risk",
-          level,
-          html: buildTimeHtml(
-            "cpt_risk",
-            tripId,
-            `${pickup.facility_code || "PU"} still at facility`,
-            untilCpt <= 0
-              ? `CPT passed ${formatLocal(String(leg.cpt), config.timezone)}`
-              : `CPT in ${Math.round(untilCpt / MS_MIN)}m`,
-          ),
-        })),
-      });
-    }
-  }
-
-  // no_driver for relay_trips
-  for (const trip of trips || []) {
-    if (trip.driver_name_raw) continue;
-    if (!trip.start_time) continue;
-    const start = new Date(trip.start_time).getTime();
-    if (Number.isNaN(start)) continue;
-    if (start - now > NO_DRIVER_HORIZON_MS || start < now - 60 * MS_MIN) continue;
-    const built = buildStatusHtml(
-      {
-        kind: "no_driver",
-        tripId: trip.trip_id,
-        section: trip.section,
-        startTime: trip.start_time,
-      },
-      config.timezone,
-    );
-    results.push({
-      ...(await dispatch({
-        tripId: trip.trip_id,
-        alertType: "no_driver",
-        level: built.level,
-        html: built.html,
-      })),
-    });
-  }
-
-  return { paused: false, results, trips: tripIds.length, stops: stops.length };
+function isEnabled(config: AlertConfig): boolean {
+  const v = (Deno.env.get("TELEGRAM_ALERTS_ENABLED") || "").trim().toLowerCase();
+  return (v === "1" || v === "true" || v === "yes" || v === "on") && config.alerts_enabled !== false;
 }
 
 export async function sendAllTestAlerts(
@@ -536,92 +456,80 @@ export async function sendAllTestAlerts(
   config: AlertConfig,
   settings: Map<string, AlertSetting>,
   opts?: { chatIds?: string[] },
-): Promise<Array<Record<string, unknown>>> {
-  const tripId = "TEST-TRIP";
+): Promise<unknown[]> {
   const chatIds = opts?.chatIds;
-  const tz = config.timezone;
-  const samples: StatusEvent[] = [
-    { kind: "trip_booked", tripId, driver: "Test Driver", section: "UPCOMING" },
-    {
-      kind: "arrived",
-      tripId,
-      facility: "TEST1",
-      actualAt: new Date().toISOString(),
-      scheduledAt: new Date(Date.now() - 20 * MS_MIN).toISOString(),
-      timing: "late",
-      section: "IN_TRANSIT",
-    },
-    {
-      kind: "departed",
-      tripId,
-      nextStopLabel: "TEST2",
-      nextStopDue: new Date(Date.now() + 3 * 3600_000).toISOString(),
-      section: "IN_TRANSIT",
-    },
-    { kind: "delivered", tripId, driver: "Test Driver", section: "IN_TRANSIT" },
-    { kind: "cancelled", tripId, driver: "Test Driver", section: "UPCOMING" },
-    {
-      kind: "driver_changed",
-      tripId,
-      prevDriver: "Old Driver",
-      driver: "New Driver",
-      section: "IN_TRANSIT",
-    },
-    {
-      kind: "no_driver",
-      tripId,
-      startTime: new Date(Date.now() + 2 * 3600_000).toISOString(),
-      section: "UPCOMING",
-    },
-    { kind: "late_reason", tripId, lateReason: "Traffic delay on I-80", section: "IN_TRANSIT" },
-  ];
+  const sampleArrived = formatArrivedHtml({
+    facility: "KRB1",
+    city: "San Bernardino",
+    state: "CA",
+    tripId: "T-TESTARRIVE",
+    loadId: "TESTLOAD1",
+    stopSeq: 2,
+    stopCount: 3,
+    stopType: "Pickup",
+    actualAt: new Date().toISOString(),
+    plannedAt: new Date(Date.now() - 37 * MS_MIN).toISOString(),
+    timeZone: "America/Los_Angeles",
+    tractor: "PXG8590",
+    trailer: "ST510031",
+    timeSource: "YMS",
+    test: true,
+  });
+  const sampleNotAt = formatNotAtStopHtml({
+    facility: "LAX5",
+    city: "Buena Park",
+    state: "CA",
+    tripId: "T-TESTNOTAT",
+    loadId: "TESTLOAD2",
+    stopSeq: 2,
+    stopCount: 2,
+    stopType: "Drop",
+    plannedAt: new Date(Date.now() - 25 * MS_MIN).toISOString(),
+    overdueMinutes: 25,
+    timeZone: "America/Los_Angeles",
+    eta: new Date(Date.now() + 20 * MS_MIN).toISOString(),
+    tractor: "PXG7943",
+    trailer: "SV2200891",
+    test: true,
+  });
 
-  const out: Array<Record<string, unknown>> = [];
-  for (const ev of samples) {
-    const built = buildStatusHtml(ev, tz);
-    out.push({
-      alertType: ev.kind,
-      ...(await dispatchAlert(sb, botToken, config, settings, {
-        tripId,
-        alertType: ev.kind,
-        level: built.level,
-        html: `[TEST] ${built.html}`,
-        force: true,
-        meta: { test: true },
-        chatIds,
-      })),
-    });
+  const results = [];
+  for (const alert of [
+    {
+      tripId: "T-TESTARRIVE",
+      stopId: "test:arrived",
+      alertType: "arrived",
+      html: sampleArrived,
+      force: true,
+      chatIds,
+      meta: { test: true },
+    },
+    {
+      tripId: "T-TESTNOTAT",
+      stopId: "test:not_at_stop",
+      alertType: "not_at_stop",
+      html: sampleNotAt,
+      force: true,
+      chatIds,
+      meta: { test: true },
+    },
+  ] as OutgoingAlert[]) {
+    results.push(await dispatchAlert(sb, botToken, config, settings, alert));
   }
+  return results;
+}
 
-  const timeKinds: Array<{
-    kind: "not_at_stop" | "running_late" | "cpt_risk" | "late_no_reason";
-    level: string;
-    l2: string;
-    l3: string;
-  }> = [
-    { kind: "not_at_stop", level: "15", l2: "TEST1 · +18m", l3: "Sch demo" },
-    { kind: "running_late", level: "15", l2: "TEST1 · ETA +22m", l3: "ETA demo" },
-    { kind: "cpt_risk", level: "20", l2: "PU still at facility", l3: "CPT in 12m" },
-    { kind: "late_no_reason", level: "30", l2: "TEST1 arrived late", l3: "No reason after 30m" },
-    // sync alerts
-  ];
-  for (const t of timeKinds) {
-    out.push({
-      alertType: t.kind,
-      ...(await dispatchAlert(sb, botToken, config, settings, {
-        tripId,
-        stopId: "TEST-STOP",
-        alertType: t.kind,
-        level: t.level,
-        html: `[TEST] ${buildTimeHtml(t.kind, tripId, t.l2, t.l3)}`,
-        force: true,
-        meta: { test: true },
-        chatIds,
-      })),
-    });
-  }
-
-  // No sync_stopped / sync_restored — system autos removed from product.
-
-  return out;
+/** Evaluate ~1h of would-send logic into dry_run_alerts (never sends). */
+export async function runDryRunWindow(
+  sb: SupabaseClient,
+  botToken: string,
+  config: AlertConfig,
+  settings: Map<string, AlertSetting>,
+  windowHours = 1,
+): Promise<{ results: unknown[]; count: number }> {
+  const out = await runCronChecks(sb, botToken, config, settings, {
+    dryRun: true,
+    windowHours,
+  });
+  return { results: out.results, count: out.results.length };
 }

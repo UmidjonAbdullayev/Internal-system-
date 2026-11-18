@@ -20,14 +20,12 @@ import {
   buildTourText,
   handleCallback,
   buildTripStatusById,
-  setLateReason,
-  muteTrip,
-  setDispatchChat,
   crmBaseUrl,
   openCrmMarkup,
-  listRelayDriversForLink,
+  listCrmDriversForLink,
   linkDriverKeyboard,
   linkDriverGroup,
+  deleteMessage,
 } from "./helpers.ts";
 
 Deno.serve(async (req: Request) => {
@@ -71,46 +69,35 @@ Deno.serve(async (req: Request) => {
     const cmdBase = cmd.replace(/@\w+$/i, "").toLowerCase();
 
     if (isGroupChat(chat)) {
-      // /link — admins: show Relay driver buttons (or link by Relay id / DRV code)
+      // /link — CRM driver buttons (name + DRV id)
       if (cmdBase === "/link") {
         const arg = text.replace(/^\/link(?:@\w+)?\s*/i, "").trim();
         if (arg) {
-          // Prefer Relay id; fall back to CRM DRV-xxxx → match name into recent Relay drivers
-          let relayId = arg;
-          let driverName: string | null = null;
-          if (/^DRV-/i.test(arg)) {
-            const { data: crm } = await sb
-              .from("drivers")
-              .select("first_name, last_name, driver_id")
-              .eq("driver_id", arg.toUpperCase())
-              .maybeSingle();
-            if (!crm) {
-              await reply(botToken, chatId, `No CRM driver for ${arg}. Use /link and pick from the list.`);
-              return json({ success: true, linked: false });
-            }
-            const drivers = await listRelayDriversForLink(sb, 80);
-            const needle = `${crm.first_name} ${crm.last_name}`.trim().toLowerCase();
-            const hit = drivers.find((d) => d.name.toLowerCase() === needle) ||
-              drivers.find((d) => d.name.toLowerCase().includes(String(crm.last_name || "").toLowerCase()));
-            if (!hit) {
-              await reply(
-                botToken,
-                chatId,
-                `CRM ${crm.driver_id} found but no matching Relay driver id yet. Pick from the list:`,
-                linkDriverKeyboard(drivers),
-              );
-              return json({ success: true, linked: false, need_pick: true });
-            }
-            relayId = hit.id;
-            driverName = hit.name;
+          const code = /^DRV-/i.test(arg) ? arg.toUpperCase() : arg;
+          const { data: crm } = await sb
+            .from("drivers")
+            .select("first_name, last_name, driver_id")
+            .eq("driver_id", code)
+            .maybeSingle();
+          if (!crm) {
+            const drivers = await listCrmDriversForLink(sb, { limit: 20, search: arg });
+            await reply(
+              botToken,
+              chatId,
+              `No exact match for ${arg}. Pick from the list:`,
+              linkDriverKeyboard(drivers, { page: 0 }),
+            );
+            return json({ success: true, linked: false, need_pick: true });
           }
+          const driverName = `${crm.first_name} ${crm.last_name}`.trim();
           const { error } = await linkDriverGroup(
             sb,
             chatId,
-            relayId,
+            crm.driver_id,
             chatTitle,
             userId != null ? String(userId) : null,
             driverName,
+            null,
           );
           if (error) {
             await reply(botToken, chatId, `Link failed: ${error.message}`);
@@ -119,16 +106,16 @@ Deno.serve(async (req: Request) => {
           await reply(
             botToken,
             chatId,
-            `Linked to Relay driver ${driverName || relayId}.\n/whoami · /test · /unlink`,
+            `Linked to ${driverName} (${crm.driver_id}).\n/whoami · /test · /unlink · /mute`,
           );
-          return json({ success: true, linked: true, relay_driver_id: relayId });
+          return json({ success: true, linked: true, driver_id: crm.driver_id });
         }
-        const drivers = await listRelayDriversForLink(sb, 24);
+        const drivers = await listCrmDriversForLink(sb, { limit: 20, offset: 0 });
         await reply(
           botToken,
           chatId,
-          "Pick a Relay driver to link this group (admins). Trip alerts for that driver go here.",
-          linkDriverKeyboard(drivers),
+          "Pick a CRM driver to link this group. Only that driver's ARRIVED / NOT AT STOP alerts go here.",
+          linkDriverKeyboard(drivers, { page: 0 }),
         );
         return json({ success: true, link_menu: true });
       }
@@ -148,21 +135,21 @@ Deno.serve(async (req: Request) => {
       if (cmdBase === "/whoami") {
         const { data: g } = await sb
           .from("driver_groups")
-          .select("relay_driver_id, driver_name, active, group_title")
+          .select("driver_id, relay_driver_id, driver_name, active, group_title, alerts_enabled, quiet")
           .eq("chat_id", chatId)
           .maybeSingle();
         if (!g || !g.active) {
-          await reply(botToken, chatId, "Not linked. Use /link to choose a Relay driver.");
+          await reply(botToken, chatId, "Not linked. Use /link to choose a CRM driver.");
           return json({ success: true, whoami: false });
         }
         await reply(
           botToken,
           chatId,
-          `This group → ${g.driver_name || "Relay driver"}\n<code>${g.relay_driver_id}</code>`,
+          `This group → <b>${g.driver_name || "driver"}</b>\n<code>${g.driver_id || g.relay_driver_id}</code>\nGroup alerts: ${g.alerts_enabled ? "enabled" : "OFF (pilot)"}${g.quiet ? " · muted" : ""}`,
           undefined,
           "HTML",
         );
-        return json({ success: true, whoami: true, relay_driver_id: g.relay_driver_id });
+        return json({ success: true, whoami: true, driver_id: g.driver_id });
       }
       if (cmdBase === "/test") {
         const { data: g } = await sb
@@ -195,35 +182,22 @@ Deno.serve(async (req: Request) => {
         );
         return json({ success: res.ok, test: true, body });
       }
-      // Dispatch trip alert commands (typed; no group slash menu)
-      if (cmdBase === "/setdispatch") {
-        await setDispatchChat(sb, chatId);
-        await reply(
-          botToken,
-          chatId,
-          "This group is now the default dispatch alert chat (telegram_alert_config.default_chat_id).",
-        );
-        return json({ success: true, setdispatch: true, chat_id: chatId });
+      // Per-group quiet toggle (rebuild)
+      if (cmdBase === "/mute") {
+        await sb
+          .from("driver_groups")
+          .update({ quiet: true, updated_at: new Date().toISOString() })
+          .eq("chat_id", chatId);
+        await reply(botToken, chatId, "This group is muted. /unmute to resume alerts.");
+        return json({ success: true, mute: true });
       }
-      if (cmdBase === "/late") {
-        const m = text.match(/^\/late(?:@\w+)?\s+(\S+)\s+(.+)$/i);
-        if (!m) {
-          await reply(botToken, chatId, "Usage: /late <tripId> <reason>");
-          return json({ success: true, late: false });
-        }
-        const result = await setLateReason(sb, m[1], m[2]);
-        if (!result.ok) {
-          await reply(botToken, chatId, result.error || "Failed");
-          return json({ success: false, late: false });
-        }
-        const base = await crmBaseUrl(sb);
-        await reply(
-          botToken,
-          chatId,
-          `Late reason saved for ${result.tripId}.`,
-          openCrmMarkup(base, result.tripId),
-        );
-        return json({ success: true, late: true, trip_id: result.tripId });
+      if (cmdBase === "/unmute") {
+        await sb
+          .from("driver_groups")
+          .update({ quiet: false, updated_at: new Date().toISOString() })
+          .eq("chat_id", chatId);
+        await reply(botToken, chatId, "Group unmuted.");
+        return json({ success: true, unmute: true });
       }
       if (cmdBase === "/status") {
         const m = text.match(/^\/status(?:@\w+)?\s+(\S+)/i);
@@ -231,7 +205,7 @@ Deno.serve(async (req: Request) => {
           await reply(
             botToken,
             chatId,
-            "In groups use /status <tripId>. Full driver menus are DM-only with @inter_sysbot.",
+            "In groups use /status <tripId>. Full menus are DM-only with @inter_sysbot.",
           );
           return json({ success: true, redirected: "need_trip" });
         }
@@ -240,28 +214,11 @@ Deno.serve(async (req: Request) => {
         await reply(botToken, chatId, body, openCrmMarkup(base, m[1].trim().toUpperCase()));
         return json({ success: true, status: true, trip: true });
       }
-      if (cmdBase === "/mute") {
-        const m = text.match(/^\/mute(?:@\w+)?\s+(\S+)(?:\s+(\d+))?/i);
-        if (!m) {
-          await reply(botToken, chatId, "Usage: /mute <tripId> [hours]");
-          return json({ success: true, mute: false });
-        }
-        const hours = m[2] ? Number(m[2]) : 24;
-        const msg = await muteTrip(
-          sb,
-          m[1],
-          chatId,
-          hours,
-          userId != null ? String(userId) : null,
-        );
-        await reply(botToken, chatId, msg);
-        return json({ success: true, mute: true });
-      }
-      if (["/menu", "/start", "/updates", "/tour", "/loads", "/help"].includes(cmdBase)) {
+      if (["/menu", "/start", "/updates", "/tour", "/loads", "/help", "/late", "/setdispatch"].includes(cmdBase)) {
         await reply(
           botToken,
           chatId,
-          "Menus are disabled in groups. Open a private chat with @inter_sysbot, unlock with the admin password, then send DRV-xxxx.\nGroup alert cmds: /late /status <tripId> /mute <tripId> /setdispatch",
+          "Menus are disabled in groups. Open a private chat with @inter_sysbot, unlock with the CRM bot password.\nGroup cmds: /link /unlink /whoami /test /mute /unmute /status <tripId>",
         );
         return json({ success: true, redirected: "dm_only" });
       }
@@ -272,7 +229,11 @@ Deno.serve(async (req: Request) => {
 
     if (cmdBase === "/logout") {
       await sb.from("telegram_admin_sessions").delete().eq("telegram_user_id", userId);
-      await reply(botToken, chatId, "Session cleared. Send the admin password to unlock again.");
+      await sb
+        .from("bot_users")
+        .update({ revoked_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq("telegram_user_id", userId);
+      await reply(botToken, chatId, "Access revoked. Send the bot password to unlock again.");
       return json({ success: true, logout: true });
     }
     if (cmdBase === "/help") {
@@ -306,16 +267,20 @@ Deno.serve(async (req: Request) => {
     }
 
     const authAttempt = await tryAuthPassword(botToken, sb, chatId, userId, text);
-    if (authAttempt === "ok") return json({ success: true, authenticated: true });
+    if (authAttempt === "ok") {
+      if (msg.message_id != null) await deleteMessage(botToken, chatId, Number(msg.message_id));
+      return json({ success: true, authenticated: true });
+    }
     if (authAttempt === "unset") {
       await reply(
         botToken,
         chatId,
-        "TELEGRAM_ADMIN_PASSWORD is not set on Edge secrets. Ask an admin to configure it in the Supabase Dashboard.",
+        "Bot password is not set. Set it in CRM Settings (Telegram bot password).",
       );
       return json({ success: true, authenticated: false, reason: "password_unset" });
     }
     if (authAttempt === "wrong") {
+      if (msg.message_id != null) await deleteMessage(botToken, chatId, Number(msg.message_id));
       await reply(botToken, chatId, "Wrong password, try again.");
       return json({ success: true, authenticated: false });
     }

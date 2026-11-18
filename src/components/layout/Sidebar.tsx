@@ -9,6 +9,7 @@ import {
   Receipt,
   BarChart3,
   ClipboardCheck,
+  Bell,
   Settings,
   Truck,
   ChevronLeft,
@@ -27,6 +28,7 @@ const NAV = [
   { to: '/settlements', label: 'Settlements & Charges', icon: Receipt },
   { to: '/reports', label: 'Reports', icon: BarChart3 },
   { to: '/data-checks', label: 'Data checks', icon: ClipboardCheck },
+  { to: '/alert-preview', label: 'Alert preview', icon: Bell },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 

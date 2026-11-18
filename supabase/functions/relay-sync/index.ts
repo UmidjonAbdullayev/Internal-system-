@@ -161,20 +161,17 @@ function json(data: unknown, status = 200) {
   });
 }
 
+/** Rebuild: only live ARRIVED edges (NOT AT STOP is cron). */
 type TripAlertEvent = {
-  kind: string;
+  kind: "arrived";
   tripId: string;
   stopId?: string;
   section?: string | null;
-  driver?: string | null;
-  prevDriver?: string | null;
-  scheduledAt?: string | null;
-  actualAt?: string | null;
-  nextStopLabel?: string | null;
-  nextStopDue?: string | null;
-  lateReason?: string | null;
+  live?: boolean;
+  source?: string | null;
   facility?: string | null;
-  startTime?: string | null;
+  actualAt?: string | null;
+  scheduledAt?: string | null;
   timing?: "late" | "early" | "on_time" | null;
 };
 
@@ -604,56 +601,7 @@ Deno.serve(async (req: Request) => {
       }
 
       const liveSection = section === "UPCOMING" || section === "IN_TRANSIT";
-      if (liveSection) {
-        if (!prevTrip && section === "UPCOMING") {
-          tripAlertEvents.push({
-            kind: "trip_booked",
-            tripId,
-            section,
-            driver: nextDriver,
-          });
-        }
-        if (
-          prevTrip &&
-          String(prevTrip.driver_name_raw || "") !== String(nextDriver || "") &&
-          (prevTrip.driver_name_raw || nextDriver)
-        ) {
-          tripAlertEvents.push({
-            kind: "driver_changed",
-            tripId,
-            section,
-            prevDriver: prevTrip.driver_name_raw,
-            driver: nextDriver,
-          });
-        }
-        const prevSt = String(prevTrip?.status || prevTrip?.execution_status || "").toLowerCase();
-        const nextSt = String(nextStatus || "").toLowerCase();
-        if (
-          /cancel/.test(nextSt) &&
-          !/cancel/.test(prevSt)
-        ) {
-          tripAlertEvents.push({
-            kind: "cancelled",
-            tripId,
-            section,
-            driver: nextDriver,
-          });
-        }
-        if (
-          (/deliver|complete/.test(nextSt) && !/deliver|complete/.test(prevSt)) ||
-          (String(section) === "IN_TRANSIT" && /deliver|complete/.test(nextSt) && !prevTrip)
-        ) {
-          // delivered handled below with stronger signals too
-        }
-        if (/deliver|complete/.test(nextSt) && !/deliver|complete/.test(prevSt)) {
-          tripAlertEvents.push({
-            kind: "delivered",
-            tripId,
-            section,
-            driver: nextDriver,
-          });
-        }
-      }
+      // Old multi-type status alerts removed (rebuild: ARRIVED + NOT AT STOP only).
 
       const orderedStops: Array<{
         stopId: string;
@@ -738,12 +686,15 @@ Deno.serve(async (req: Request) => {
           else stopsUpserted += 1;
 
           if (!liveSection) continue;
+          // Live ARRIVED edge only (CHECKIN actualTime appeared between syncs)
           if (stop.actualArrival && !prevStop?.actual_arrival) {
             tripAlertEvents.push({
               kind: "arrived",
               tripId,
               stopId,
               section,
+              live: true,
+              source: "live_sync",
               facility: stop.facilityCode || stop.stopType || "Stop",
               actualAt: stop.actualArrival,
               scheduledAt: stop.scheduledArrival || prevStop?.scheduled_arrival,
@@ -752,34 +703,6 @@ Deno.serve(async (req: Request) => {
                 stop.scheduledArrival || prevStop?.scheduled_arrival,
               ),
             });
-          }
-          if (stop.actualDeparture && !prevStop?.actual_departure) {
-            // next stop due = next in ordered list (filled after loop) — placeholder, refined below
-            tripAlertEvents.push({
-              kind: "departed",
-              tripId,
-              stopId,
-              section,
-              facility: stop.facilityCode || stop.stopType || "Stop",
-              nextStopLabel: null,
-              nextStopDue: null,
-            });
-          }
-        }
-      }
-
-      // Fill next-stop info on departed events for this trip
-      if (liveSection && orderedStops.length) {
-        for (let i = 0; i < orderedStops.length; i += 1) {
-          const cur = orderedStops[i];
-          const next = orderedStops[i + 1];
-          for (const ev of tripAlertEvents) {
-            if (ev.kind === "departed" && ev.stopId === cur.stopId && ev.tripId === tripId) {
-              ev.nextStopLabel = next
-                ? String(next.stop.facilityCode || next.stop.stopType || `Stop ${next.stop.seq}`)
-                : "—";
-              ev.nextStopDue = next?.stop.scheduledArrival || null;
-            }
           }
         }
       }
@@ -951,110 +874,7 @@ Deno.serve(async (req: Request) => {
 
       // Trailer changes are synced to CRM but not pushed to Telegram groups.
 
-      const nextBar = load.status_bar_state || null;
-      const prevBar = existing?.status_bar_state || null;
-      if (nextBar && nextBar !== prevBar && nextBar === "arrived") {
-        const stop = load.status_stop_index ?? existing?.status_stop_index ?? 1;
-        const trip = load.parent_trip_id || existing?.parent_trip_id || load.load_id;
-        const driverLabel = driverName || existing?.driver_name_raw || "driver";
-        const trailer = load.trailer_id ?? existing?.trailer_id ?? "—";
-        const tractor = load.tractor_id ?? existing?.tractor_id ?? "—";
-        const arrivedAt =
-          load.arrival_actual || existing?.arrival_actual || "—";
-        const scheduledAt =
-          load.arrival_scheduled || existing?.arrival_scheduled || "—";
-        const address =
-          load.arrival_address ||
-          existing?.arrival_address ||
-          load.pickup_location ||
-          existing?.pickup_location ||
-          load.delivery_location ||
-          existing?.delivery_location ||
-          "—";
-        const route =
-          `${load.pickup_location || existing?.pickup_location || "?"} → ${load.delivery_location || existing?.delivery_location || "?"}`;
-        notifications.push({
-          event_type: "facility_arrived",
-          dedupe_key: `arrived:${load.load_id}:stop:${stop}`,
-          message:
-            `Facility arrival (stop ${stop})\n` +
-            `Trip ${trip} · Load ${load.load_id}\n` +
-            `Driver: ${driverLabel}\n` +
-            `Trailer: ${trailer}\n` +
-            `Tractor: ${tractor}\n` +
-            `Address: ${address}\n` +
-            `Arrived: ${arrivedAt}\n` +
-            `Sch.: ${scheduledAt}\n` +
-            `Route: ${route}`,
-          driver_id: driverId || existing?.driver_id,
-          trailer_id: load.trailer_id ?? existing?.trailer_id,
-          tractor_id: load.tractor_id ?? existing?.tractor_id,
-          load_id: load.load_id,
-        });
-      }
-
-      // Dispatch trip alerts from load-level live changes (Upcoming / In Transit only)
-      const bucket = String(load.trip_bucket || existing?.trip_bucket || "").toLowerCase();
-      const liveBucket = bucket === "upcoming" || bucket === "in_transit";
-      const tripKey = String(load.parent_trip_id || existing?.parent_trip_id || load.load_id);
-      if (liveBucket) {
-        if (!existing && bucket === "upcoming") {
-          tripAlertEvents.push({
-            kind: "trip_booked",
-            tripId: tripKey,
-            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
-            driver: driverName,
-          });
-        }
-        if (
-          existing &&
-          existing.load_status !== load.load_status &&
-          /cancel/i.test(String(load.load_status))
-        ) {
-          tripAlertEvents.push({
-            kind: "cancelled",
-            tripId: tripKey,
-            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
-            driver: driverName,
-          });
-        }
-        if (
-          existing &&
-          existing.load_status !== load.load_status &&
-          /deliver|complete/i.test(String(load.load_status))
-        ) {
-          tripAlertEvents.push({
-            kind: "delivered",
-            tripId: tripKey,
-            section: "IN_TRANSIT",
-            driver: driverName,
-          });
-        }
-        if (
-          existing &&
-          String(existing.driver_name_raw || "") !== String(driverName || "") &&
-          (existing.driver_name_raw || driverName)
-        ) {
-          tripAlertEvents.push({
-            kind: "driver_changed",
-            tripId: tripKey,
-            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
-            prevDriver: existing.driver_name_raw,
-            driver: driverName,
-          });
-        }
-        // Late reason from notes pattern "Late: …" when newly appearing
-        const notesText = String(load.notes || "");
-        const lateMatch = notesText.match(/late\s*:\s*(.+)$/i);
-        if (lateMatch && !existing?.late_reason) {
-          tripAlertEvents.push({
-            kind: "late_reason",
-            tripId: tripKey,
-            section: bucket === "upcoming" ? "UPCOMING" : "IN_TRANSIT",
-            lateReason: lateMatch[1].trim().slice(0, 200),
-          });
-        }
-      }
+      // facility_arrived → relay-telegram removed (rebuild: trip-alerts ARRIVED only)
 
       const row = {
         load_id: load.load_id,

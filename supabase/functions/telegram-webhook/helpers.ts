@@ -8,19 +8,12 @@ export const corsHeaders = {
     "Content-Type, Authorization, X-Telegram-Bot-Api-Secret-Token",
 };
 export const BOT_COMMANDS_PRIVATE = [
-  { command: "menu", description: "Admin menu (sync / late / stats / groups)" },
-  { command: "status", description: "Driver status + active loads" },
-  { command: "updates", description: "Recent facility arrivals" },
-  { command: "tour", description: "Tour / load info" },
-  { command: "driver", description: "Select driver: /driver DRV-xxxx" },
-  { command: "logout", description: "Clear admin session" },
+  { command: "menu", description: "Menu (drivers / late / sync / groups)" },
+  { command: "driver", description: "/driver DRV-xxxx or name" },
+  { command: "drivers", description: "List drivers with status" },
+  { command: "late", description: "Overdue / arrived late today" },
+  { command: "logout", description: "Revoke your bot access" },
   { command: "help", description: "List commands" },
-  { command: "late", description: "/late <tripId> <reason>" },
-  { command: "mute", description: "/mute <tripId> [hours]" },
-  { command: "link", description: "Link this group to a Relay driver (admins)" },
-  { command: "unlink", description: "Unlink this group" },
-  { command: "whoami", description: "Show linked driver for this group" },
-  { command: "test", description: "Send [TEST] alerts to this linked group" },
 ];
 export const ACTIVE_LOAD_EXCLUDE = '("Completed","Cancelled","Rejected","Delivered")';
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -39,6 +32,7 @@ export async function tg(botToken: string, method: string, body: Record<string, 
     body: JSON.stringify(body),
   });
 }
+/** Command UX replies only — not alert sends (alerts use trip-alerts sendTelegram). */
 export async function reply(
   botToken: string,
   chatId: number | string,
@@ -54,6 +48,18 @@ export async function reply(
   if (replyMarkup) payload.reply_markup = replyMarkup;
   if (parseMode) payload.parse_mode = parseMode;
   await tg(botToken, "sendMessage", payload);
+}
+
+export async function deleteMessage(
+  botToken: string,
+  chatId: number | string,
+  messageId: number,
+) {
+  try {
+    await tg(botToken, "deleteMessage", { chat_id: chatId, message_id: messageId });
+  } catch {
+    /* ignore */
+  }
 }
 
 export async function crmBaseUrl(sb: SupabaseClient): Promise<string> {
@@ -252,41 +258,52 @@ export function mainMenuKeyboard() {
   };
 }
 
-/** Distinct Relay drivers from recent trip raw payloads for /link buttons. */
-export async function listRelayDriversForLink(sb: SupabaseClient, limit = 24) {
-  const { data } = await sb
-    .from("relay_trips")
-    .select("raw, driver_name_raw, last_seen_at")
-    .eq("archived", false)
-    .order("last_seen_at", { ascending: false })
-    .limit(80);
-  const map = new Map<string, string>();
-  for (const row of data || []) {
-    const raw = row.raw as Record<string, unknown> | null;
-    const drivers = Array.isArray(raw?.drivers) ? raw!.drivers : [];
-    for (const d of drivers) {
-      if (!d || typeof d !== "object") continue;
-      const id = String((d as Record<string, unknown>).id || "").trim();
-      if (!id || map.has(id)) continue;
-      const first = String((d as Record<string, unknown>).firstName || "").trim();
-      const last = String((d as Record<string, unknown>).lastName || "").trim();
-      const name = [first, last].filter(Boolean).join(" ") || row.driver_name_raw || id.slice(-8);
-      map.set(id, name);
-      if (map.size >= limit) break;
-    }
-    if (map.size >= limit) break;
+/** CRM drivers for /link buttons (name + DRV id). */
+export async function listCrmDriversForLink(
+  sb: SupabaseClient,
+  opts?: { limit?: number; offset?: number; search?: string },
+) {
+  const limit = opts?.limit ?? 20;
+  const offset = opts?.offset ?? 0;
+  let q = sb
+    .from("drivers")
+    .select("driver_id, first_name, last_name")
+    .order("first_name", { ascending: true })
+    .range(offset, offset + limit - 1);
+  const search = String(opts?.search || "").trim();
+  if (search) {
+    q = q.or(
+      `first_name.ilike.%${search}%,last_name.ilike.%${search}%,driver_id.ilike.%${search}%`,
+    );
   }
-  return [...map.entries()].map(([id, name]) => ({ id, name }));
+  const { data } = await q;
+  return (data || []).map((d) => ({
+    id: String(d.driver_id),
+    name: `${d.first_name || ""} ${d.last_name || ""}`.trim() || String(d.driver_id),
+  }));
 }
 
-export function linkDriverKeyboard(drivers: Array<{ id: string; name: string }>) {
+/** @deprecated alias — CRM drivers */
+export async function listRelayDriversForLink(sb: SupabaseClient, limit = 24) {
+  return listCrmDriversForLink(sb, { limit });
+}
+
+export function linkDriverKeyboard(
+  drivers: Array<{ id: string; name: string }>,
+  opts?: { page?: number },
+) {
+  const page = opts?.page ?? 0;
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   for (const d of drivers) {
-    const label = d.name.slice(0, 40);
-    rows.push([{ text: label, callback_data: `linkdrv:${d.id}` }]);
+    const label = `${d.name} · ${d.id}`.slice(0, 56);
+    rows.push([{ text: label, callback_data: `linkcrm:${d.id}` }]);
   }
-  if (!rows.length) {
-    rows.push([{ text: "No Relay drivers found yet", callback_data: "linkdrv:none" }]);
+  const nav: Array<{ text: string; callback_data: string }> = [];
+  if (page > 0) nav.push({ text: "◀ Prev", callback_data: `linkpage:${page - 1}` });
+  nav.push({ text: "Next ▶", callback_data: `linkpage:${page + 1}` });
+  rows.push(nav);
+  if (!drivers.length) {
+    rows.unshift([{ text: "No drivers found", callback_data: "linkcrm:none" }]);
   }
   return { inline_keyboard: rows };
 }
@@ -294,20 +311,26 @@ export function linkDriverKeyboard(drivers: Array<{ id: string; name: string }>)
 export async function linkDriverGroup(
   sb: SupabaseClient,
   chatId: string,
-  relayDriverId: string,
+  crmDriverId: string,
   groupTitle: string | null,
   linkedBy: string | null,
   driverName?: string | null,
+  relayDriverId?: string | null,
 ) {
+  const now = new Date().toISOString();
   return await sb.from("driver_groups").upsert(
     {
       chat_id: chatId,
-      relay_driver_id: relayDriverId,
+      driver_id: crmDriverId,
+      relay_driver_id: relayDriverId || crmDriverId,
       driver_name: driverName || null,
       group_title: groupTitle,
       active: true,
+      alerts_enabled: false,
+      quiet: false,
       linked_by: linkedBy,
-      updated_at: new Date().toISOString(),
+      linked_at: now,
+      updated_at: now,
     },
     { onConflict: "chat_id" },
   );
@@ -329,14 +352,22 @@ export function askPasswordOnceText() {
   return [
     "Welcome to Amazon Relay Intelligence.",
     "",
-    "Send the admin password once to unlock this chat.",
+    "Send the bot password once to unlock this chat (set in CRM Settings).",
     "After that you stay unlocked — no password on every command.",
-    "When you look up a driver, send DRV-xxxx (or /driver DRV-xxxx).",
+    "When you look up a driver, send /driver DRV-xxxx or a name.",
   ].join("\n");
 }
 export function adminPasswordConfigured() {
   const p = Deno.env.get("TELEGRAM_ADMIN_PASSWORD");
   return p && p.length > 0 ? p : null;
+}
+export async function crmPasswordConfigured(sb: SupabaseClient): Promise<boolean> {
+  const { data } = await sb
+    .from("telegram_bot_config")
+    .select("password_hash")
+    .eq("id", 1)
+    .maybeSingle();
+  return Boolean(data?.password_hash);
 }
 export function timingSafeEqual(a: string, b: string) {
   if (a.length !== b.length) return false;
@@ -344,7 +375,52 @@ export function timingSafeEqual(a: string, b: string) {
   for (let i = 0; i < a.length; i += 1) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return out === 0;
 }
+export async function getBotUser(sb: SupabaseClient, userId: number) {
+  const { data } = await sb
+    .from("bot_users")
+    .select("*")
+    .eq("telegram_user_id", userId)
+    .maybeSingle();
+  return data;
+}
+
 export async function getSession(sb: SupabaseClient, userId: number): Promise<AdminSession | null> {
+  // Prefer bot_users (CRM password rebuild); fall back to legacy sessions
+  const botUser = await getBotUser(sb, userId);
+  if (botUser) {
+    if (botUser.revoked_at) return null;
+    if (botUser.locked_until && new Date(botUser.locked_until).getTime() > Date.now()) {
+      return null;
+    }
+    const { data: cfg } = await sb
+      .from("telegram_bot_config")
+      .select("logout_everyone_at")
+      .eq("id", 1)
+      .maybeSingle();
+    if (
+      cfg?.logout_everyone_at &&
+      botUser.authorized_at &&
+      new Date(botUser.authorized_at).getTime() < new Date(cfg.logout_everyone_at).getTime()
+    ) {
+      return null;
+    }
+    const { data: sess } = await sb
+      .from("telegram_admin_sessions")
+      .select("telegram_user_id, selected_driver_id, selected_driver_code, expires_at")
+      .eq("telegram_user_id", userId)
+      .maybeSingle();
+    await sb
+      .from("bot_users")
+      .update({ last_active_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq("telegram_user_id", userId);
+    return {
+      telegram_user_id: userId,
+      selected_driver_id: sess?.selected_driver_id ?? null,
+      selected_driver_code: sess?.selected_driver_code ?? null,
+      expires_at: sess?.expires_at || new Date(Date.now() + SESSION_TTL_MS).toISOString(),
+    };
+  }
+
   const { data } = await sb
     .from("telegram_admin_sessions")
     .select("telegram_user_id, selected_driver_id, selected_driver_code, expires_at")
@@ -503,12 +579,13 @@ export async function requirePrivateAdmin(
   userId: number | null,
   needDriver: boolean,
 ): Promise<AdminSession | null> {
-  const password = adminPasswordConfigured();
-  if (!password) {
+  const hasCrm = await crmPasswordConfigured(sb);
+  const hasEnv = Boolean(adminPasswordConfigured());
+  if (!hasCrm && !hasEnv) {
     await reply(
       botToken,
       chatId,
-      "TELEGRAM_ADMIN_PASSWORD is not set on Edge secrets. Ask an admin to configure it in the Supabase Dashboard.",
+      "Bot password is not set. Set it in CRM Settings (or TELEGRAM_ADMIN_PASSWORD Edge secret).",
     );
     return null;
   }
@@ -541,13 +618,63 @@ export async function tryAuthPassword(
   const locked = !prior;
   const looksLikePassword = isAuthCmd || (locked && !text.startsWith("/"));
   if (!looksLikePassword) return "skip";
-  const password = adminPasswordConfigured();
-  if (!password) return "unset";
+
   const candidate = isAuthCmd
     ? text.replace(/^\/auth(?:@\w+)?\s*/i, "").trim()
     : text.trim();
   if (!candidate) return isAuthCmd ? "wrong" : "skip";
-  if (!timingSafeEqual(candidate, password)) return "wrong";
+
+  const hasCrm = await crmPasswordConfigured(sb);
+  const envPassword = adminPasswordConfigured();
+  if (!hasCrm && !envPassword) return "unset";
+
+  // Lockout check
+  const existingUser = await getBotUser(sb, userId);
+  if (existingUser?.locked_until && new Date(existingUser.locked_until).getTime() > Date.now()) {
+    await reply(botToken, chatId, "Too many wrong attempts. Try again in 30 minutes.");
+    return "wrong";
+  }
+
+  let ok = false;
+  if (hasCrm) {
+    const { data: verified } = await sb.rpc("verify_telegram_bot_password", {
+      p_password: candidate,
+    });
+    ok = Boolean(verified);
+  }
+  if (!ok && envPassword) {
+    ok = timingSafeEqual(candidate, envPassword);
+  }
+
+  if (!ok) {
+    const attempts = Number(existingUser?.failed_attempts || 0) + 1;
+    const patch: Record<string, unknown> = {
+      telegram_user_id: userId,
+      failed_attempts: attempts,
+      updated_at: new Date().toISOString(),
+    };
+    if (attempts >= 5) {
+      patch.locked_until = new Date(Date.now() + 30 * 60_000).toISOString();
+      patch.failed_attempts = 0;
+    }
+    await sb.from("bot_users").upsert(patch, { onConflict: "telegram_user_id" });
+    return "wrong";
+  }
+
+  const now = new Date().toISOString();
+  await sb.from("bot_users").upsert(
+    {
+      telegram_user_id: userId,
+      role: existingUser?.role || "viewer",
+      authorized_at: now,
+      last_active_at: now,
+      revoked_at: null,
+      failed_attempts: 0,
+      locked_until: null,
+      updated_at: now,
+    },
+    { onConflict: "telegram_user_id" },
+  );
   await upsertAuthSession(sb, userId);
   const after = await getSession(sb, userId);
   if (prior && after?.selected_driver_id) {
@@ -563,7 +690,7 @@ export async function tryAuthPassword(
       chatId,
       [
         "Unlocked. You stay unlocked — no password on every command.",
-        "Send DRV-xxxx (or /driver DRV-xxxx) when you want driver data, then /menu.",
+        "Send /driver DRV-xxxx or a name when you want driver data, then /menu.",
       ].join("\n"),
       mainMenuKeyboard(),
     );
@@ -625,22 +752,42 @@ export async function handleCallback(
   }
   await answerCallback(botToken, cq.id);
 
-  // Group: /link driver button
-  if (data.startsWith("linkdrv:")) {
-    const relayId = data.slice("linkdrv:".length);
-    if (!relayId || relayId === "none") {
-      await reply(botToken, chatId, "No Relay driver to link.");
+  // Group: /link CRM driver button
+  if (data.startsWith("linkpage:")) {
+    const page = Math.max(0, Number(data.slice("linkpage:".length)) || 0);
+    const drivers = await listCrmDriversForLink(sb, { limit: 20, offset: page * 20 });
+    await reply(
+      botToken,
+      chatId,
+      `Pick a CRM driver (page ${page + 1}):`,
+      linkDriverKeyboard(drivers, { page }),
+    );
+    return;
+  }
+  if (data.startsWith("linkcrm:") || data.startsWith("linkdrv:")) {
+    const crmId = data.startsWith("linkcrm:")
+      ? data.slice("linkcrm:".length)
+      : data.slice("linkdrv:".length);
+    if (!crmId || crmId === "none") {
+      await reply(botToken, chatId, "No driver to link.");
       return;
     }
-    const drivers = await listRelayDriversForLink(sb, 80);
-    const name = drivers.find((d) => d.id === relayId)?.name || null;
+    const { data: crm } = await sb
+      .from("drivers")
+      .select("driver_id, first_name, last_name")
+      .eq("driver_id", crmId)
+      .maybeSingle();
+    const name = crm
+      ? `${crm.first_name || ""} ${crm.last_name || ""}`.trim()
+      : crmId;
     const { error } = await linkDriverGroup(
       sb,
       chatId,
-      relayId,
+      crmId,
       chat?.title || null,
       userId != null ? String(userId) : null,
       name,
+      null,
     );
     if (error) {
       await reply(botToken, chatId, `Link failed: ${error.message}`);
@@ -649,7 +796,7 @@ export async function handleCallback(
     await reply(
       botToken,
       chatId,
-      `Linked to Relay driver <b>${name || relayId}</b>\n<code>${relayId}</code>\nAlerts for this driver go here. /whoami · /test · /unlink`,
+      `Linked to <b>${name}</b> (<code>${crmId}</code>)\nAlerts for this driver go here. /whoami · /test · /unlink · /mute`,
       undefined,
       "HTML",
     );
