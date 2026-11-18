@@ -1073,9 +1073,6 @@ export async function syncHistoryOneStep(tabId, { shouldYield = null, forceResyn
             crmTrips: nextCrm,
             label: `Backfill done · ${tripsAccum} trips`,
           },
-          sectionCounts: {
-            HISTORY: { relay: tripsAccum, crm: nextCrm, mismatch: false },
-          },
         });
         return { ok: true, backfill: true, done: true, trips: tripsAccum };
       }
@@ -1098,6 +1095,9 @@ export async function syncHistoryOneStep(tabId, { shouldYield = null, forceResyn
       });
     }
 
+    // Keep backfill progress for week label only. Do NOT overwrite HISTORY
+    // sectionCounts with cumulative scrape totals — popup/CRM History tab both
+    // use CRM section=HISTORY row count from the latest snapshot response.
     await setState({
       historyBackfillProgress: {
         week: idx + 1,
@@ -1105,9 +1105,6 @@ export async function syncHistoryOneStep(tabId, { shouldYield = null, forceResyn
         trips: tripsAccum,
         crmTrips: nextCrm,
         label: weekLabel,
-      },
-      sectionCounts: {
-        HISTORY: { relay: tripsAccum, crm: nextCrm, mismatch: false },
       },
     });
 

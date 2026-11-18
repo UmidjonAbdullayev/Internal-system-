@@ -110,15 +110,14 @@ function render(state) {
             `At: ${fe.at || '—'}`,
           ].join('\n')
         : errFull;
+      // Live tabs: sectionCounts.relay/crm are ACTIVE-only (cancelled → History).
+      // HISTORY: CRM History = all section=HISTORY rows (same as CRM History tab badge).
+      // Do NOT use cumulative backfill totals here — those counted scraped Relay pages,
+      // not CRM History membership (that mismatch was ~1084 vs ~888).
       let relayN = c.relay ?? s.trips ?? 0;
       let crmN = c.crm ?? '—';
       let histExtra = '';
       if (tab === 'HISTORY') {
-        // Cumulative across backfill weeks (not current window only)
-        const cumRelay = Number(histProg.trips) || Number(relayN) || 0;
-        const cumCrm = Number(histProg.crmTrips) || (crmN === '—' ? cumRelay : Number(crmN)) || 0;
-        relayN = cumRelay;
-        crmN = cumCrm;
         if (histProg.week && histProg.totalWeeks) {
           histExtra = ` · backfill week ${histProg.week}/${histProg.totalWeeks}`;
         } else if (histProg.label) {
@@ -131,7 +130,7 @@ function render(state) {
       const badgeCls = s.lastError || wrong || s.paused ? 'error' : 'collecting';
       const countLabel =
         tab === 'HISTORY'
-          ? `Relay: ${relayN} | CRM: ${crmN}`
+          ? `Relay page: ${relayN} | CRM History: ${crmN}`
           : `Relay active: ${relayN} | CRM: ${crmN}`;
       return `<li><span>${tab}</span><span class="badge ${badgeCls}" title="${escapeAttr(
         title,

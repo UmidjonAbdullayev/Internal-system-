@@ -542,8 +542,9 @@ Deno.serve(async (req: Request) => {
 
       const nextDriver = sanitizeDriverName(trip.driver);
       let nextStatus = trip.status || trip.executionStatus || trip.tourState || null;
-      // Fully cancelled → History only when tourState cancelled OR every load cancelled.
-      // Derived Delivered/status cancel blob alone must not leave a live Relay tab.
+      // RULE: fully cancelled (tourState cancelled OR every load CANCELLED) ALWAYS
+      // → HISTORY with Cancelled status, whatever Relay tab the body came from.
+      // Partial cancels and non-cancelled live membership still follow sourceTab (#44).
       const legs = (trip.legs as { executionStatus?: string; status?: string }[]) || [];
       const tourCancelled = /cancel/.test(String(trip.tourState || "").toLowerCase());
       const allLegsCancel =
@@ -798,15 +799,42 @@ Deno.serve(async (req: Request) => {
             }
           }
 
-          const { count: crmCount } = await sb
+          const live = section === "UPCOMING" || section === "IN_TRANSIT";
+          const { data: crmRows } = await sb
             .from("relay_trips")
-            .select("trip_id", { count: "exact", head: true })
+            .select("trip_id, status, tour_state")
             .eq("section", section)
             .eq("archived", false)
             .neq("status", "removed_from_relay");
 
-          const crm = crmCount ?? 0;
-          const mismatch = crm !== tripIds.length;
+          const crmActive = (crmRows || []).filter((r: {
+            status?: string | null;
+            tour_state?: string | null;
+          }) => {
+            if (!live) return true;
+            const blob = `${r.tour_state || ""} ${r.status || ""}`.toLowerCase();
+            return !/cancel/.test(blob);
+          }).length;
+
+          let relayActive = tripIds.length;
+          if (live && tripIds.length) {
+            const { data: snapRows } = await sb
+              .from("relay_trips")
+              .select("trip_id, status, tour_state")
+              .in("trip_id", tripIds)
+              .eq("archived", false);
+            const cancelledIds = new Set(
+              (snapRows || [])
+                .filter((r: { status?: string | null; tour_state?: string | null }) =>
+                  /cancel/.test(`${r.tour_state || ""} ${r.status || ""}`.toLowerCase()),
+                )
+                .map((r: { trip_id: string }) => r.trip_id),
+            );
+            relayActive = tripIds.filter((id) => !cancelledIds.has(id)).length;
+          }
+
+          const crm = crmActive;
+          const mismatch = crm !== relayActive;
           await sb.from("relay_section_snapshots").upsert(
             {
               section,
@@ -820,7 +848,7 @@ Deno.serve(async (req: Request) => {
             { onConflict: "section" },
           );
           sectionCounts[section] = {
-            relay: tripIds.length,
+            relay: relayActive,
             crm,
             mismatch,
           };

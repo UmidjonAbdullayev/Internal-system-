@@ -52,9 +52,10 @@ export async function upsertTrips(
     if (opts.forceHistory || opts.catchUp) section = "HISTORY";
 
     const status = trip.status || trip.executionStatus || trip.tourState || null;
-    // Cancelled → History ONLY if tourState cancelled OR every load cancelled.
-    // Live-tab membership otherwise follows Relay's tab (sourceTab). Derived
-    // Delivered/complete must not leave UPCOMING/IN_TRANSIT while Relay lists it.
+    // RULE: fully cancelled (tourState cancelled OR every load CANCELLED) ALWAYS
+    // lands in HISTORY with Cancelled status — regardless of which Relay response
+    // (UPCOMING/IN_TRANSIT/HISTORY) the body arrived on. Partial cancels stay live.
+    // Non-cancelled live-tab membership still follows Relay's tab (sourceTab / #44).
     const cancelled = isFullyCancelledTrip(
       trip.tourState,
       (trip.legs as { executionStatus?: unknown; status?: unknown }[]) || [],
@@ -65,7 +66,11 @@ export async function upsertTrips(
       continue;
     }
 
-    const nextStatus = cancelled ? String(status || "CANCELLED") : status;
+    const nextStatus = cancelled
+      ? status && /cancel/i.test(String(status))
+        ? status
+        : "CANCELLED"
+      : status;
 
     tripRows.push({
       trip_id: tripId,
