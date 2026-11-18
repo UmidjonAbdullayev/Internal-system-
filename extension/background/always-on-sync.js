@@ -1466,6 +1466,16 @@ export async function alwaysOnTick({ force = false, forceResync = false } = {}) 
     }
 
     await setState({ nextDueAt: due, scheduleMs: schedule });
+
+    // P4 PAYMENTS — never preempt live IN_TRANSIT / UPCOMING; HISTORY may continue separately
+    const stillLiveDue = isLiveDue('IN_TRANSIT') || isLiveDue('UPCOMING');
+    if (!stillLiveDue && typeof hooks.onIdleTick === 'function') {
+      try {
+        await hooks.onIdleTick();
+      } catch (err) {
+        log('onIdleTick (payments) error', err?.message || err);
+      }
+    }
   } finally {
     tickRunning = false;
   }

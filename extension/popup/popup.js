@@ -140,12 +140,18 @@ function render(state) {
     .join('');
 
   $('sections').innerHTML = SECTIONS.map((section) => {
-    const st = state.sections?.[section.id]?.state || 'Not checked';
-    const note =
-      st === 'Synced'
-        ? ' <span class="hint-inline" title="CRM upsert OK.">· OK</span>'
-        : '';
-    return `<li><span>${section.label}</span><span class="badge ${badgeClass(st)}">${st}</span>${note}</li>`;
+    const sec = state.sections?.[section.id] || {};
+    let st = sec.state || 'Not checked';
+    // Payments: surface real error or Synced · HH:MM · N invoices
+    if (section.id === 'payments' && sec.lastError && st === 'Error') {
+      st = `Error · ${sec.lastError}`;
+    }
+    const syncedOk = /^Synced/i.test(String(st));
+    const errOk = /^Error/i.test(String(st));
+    const cls = errOk ? 'error' : syncedOk ? 'synced' : badgeClass(st);
+    return `<li><span>${section.label}</span><span class="badge ${cls}" title="${escapeAttr(
+      sec.lastError || st,
+    )}">${st}</span></li>`;
   }).join('');
 
   const prompts = state.prompts || [];

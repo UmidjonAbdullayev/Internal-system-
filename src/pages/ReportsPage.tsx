@@ -28,6 +28,7 @@ import {
   weekLabelFromDate,
 } from '@/lib/reportRows';
 import type { DatePreset, DateRange, LoadReport } from '@/types';
+import { invoicePaidStatusForTour } from '@/lib/invoiceMoney';
 import { toast } from 'sonner';
 
 const REPORT_HEADERS = [
@@ -43,6 +44,8 @@ const REPORT_HEADERS = [
   'Amazon Paid',
   'Driver Paid',
   'RPM',
+  'Paid status',
+  'Invoice week',
   'Comment',
   'Dispatch',
 ] as const;
@@ -131,11 +134,13 @@ function GroupRows({
   rows,
   onEdit,
   onDelete,
+  paidLookup,
 }: {
   week: string;
   rows: LoadReport[];
   onEdit: (r: LoadReport) => void;
   onDelete: (id: string) => void;
+  paidLookup: (r: LoadReport) => { paidStatus: string; invoiceWeek: string | null };
 }) {
   return (
     <>
@@ -147,7 +152,9 @@ function GroupRows({
           {week}
         </td>
       </tr>
-      {rows.map((r) => (
+      {rows.map((r) => {
+        const paid = paidLookup(r);
+        return (
         <tr
           key={r.id}
           className="border-b border-border/80 hover:bg-bg/80 odd:bg-white even:bg-slate-50/60"
@@ -180,6 +187,10 @@ function GroupRows({
           <td className="border border-border/60 px-2 py-1.5 text-right tabular-nums whitespace-nowrap">
             {formatCurrency(r.rpm)}
           </td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{paid.paidStatus}</td>
+          <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">
+            {paid.invoiceWeek || 'estimated week'}
+          </td>
           <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.comment}</td>
           <td className="border border-border/60 px-2 py-1.5 whitespace-nowrap">{r.dispatch}</td>
           <td className="border border-border/60 px-1.5 py-1">
@@ -205,7 +216,8 @@ function GroupRows({
             </div>
           </td>
         </tr>
-      ))}
+        );
+      })}
     </>
   );
 }
@@ -229,11 +241,26 @@ export function ReportsPage() {
     drivers,
     companySettings,
     dataReady,
+    invoices,
+    invoiceTrips,
     addLoadReport,
     updateLoadReport,
     deleteLoadReport,
     syncLoadReportsForRange,
   } = useData();
+
+  const paidLookup = useMemo(() => {
+    return (r: LoadReport) =>
+      invoicePaidStatusForTour(
+        r.trip,
+        String(r.loadIds || '')
+          .split(/[,/]/)
+          .map((x) => x.trim())
+          .filter(Boolean),
+        invoices,
+        invoiceTrips,
+      );
+  }, [invoices, invoiceTrips]);
 
   const tz = companySettings.timezone || 'America/Chicago';
   const today = todayISO(tz);
@@ -374,6 +401,8 @@ export function ReportsPage() {
         r.amazonPaid,
         r.driverPaid,
         r.rpm,
+        paidLookup(r).paidStatus,
+        paidLookup(r).invoiceWeek || 'estimated week',
         r.comment,
         r.dispatch,
       ]),
@@ -524,6 +553,7 @@ export function ReportsPage() {
                   rows={group.rows}
                   onEdit={openEdit}
                   onDelete={setDeleteId}
+                  paidLookup={paidLookup}
                 />
               ))}
             </tbody>

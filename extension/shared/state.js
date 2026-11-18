@@ -32,6 +32,12 @@ const DEFAULT_STATE = {
   openTabs: [],
   pendingLoads: {},
   pendingPayments: {},
+  /** Mapped Relay invoices awaiting CRM flush (keyed by invoice_id). */
+  pendingInvoices: {},
+  pendingPaymentsSummary: null,
+  financialHeaders: null,
+  settlementsNextPageToken: null,
+  lastPaymentsInvoiceCount: 0,
   collectionLocks: {},
   detailScraped: {},
   extensionApiKey: '',

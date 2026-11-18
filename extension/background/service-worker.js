@@ -29,6 +29,7 @@ import {
   HISTORY_SKIP_TTL_MS,
   SECTION_SNAPSHOT_KEY,
   HISTORY_BACKFILL_KEY,
+  PAYMENTS_ALARM,
 } from '../shared/config.js';
 import { getState, setState, updateSection, ensureClientId } from '../shared/state.js';
 import {
@@ -53,6 +54,14 @@ import {
   alwaysOnTick,
   stopHeartbeat,
 } from './always-on-sync.js';
+import {
+  configurePaymentsSync,
+  ensurePaymentsAlarm,
+  handleFinancialCapture,
+  syncPaymentsNow,
+  paymentsDue,
+  flushPendingInvoices,
+} from './payments-sync.js';
 
 const RELAY_HOST_RE = /^https:\/\/([a-z0-9-]+\.)?relay\.amazon\.com\//i;
 
@@ -183,6 +192,25 @@ configureAlwaysOn({
   onFinalizeCatchUp: async () => {
     await finalizeCatchUpOnEdge();
   },
+  /** P4 — payments only when no trip work is due */
+  onIdleTick: async () => {
+    const state = await getState();
+    if (!paymentsDue(state)) return;
+    log('[Queue] next=PAYMENTS (low priority)');
+    await syncPaymentsNow({ force: false });
+  },
+});
+
+configurePaymentsSync({
+  getSyncTabId: async () => {
+    const state = await getState();
+    if (state.alwaysOnTabId) return state.alwaysOnTabId;
+    const tabs = await chrome.tabs.query({ url: ['https://relay.amazon.com/*', 'https://*.relay.amazon.com/*'] });
+    return tabs[0]?.id || null;
+  },
+  sendToTab: async (tabId, message) => {
+    return chrome.tabs.sendMessage(tabId, message);
+  },
 });
 
 async function pushExtensionAlive(authStatus = 'ok', detail = null) {
@@ -239,6 +267,7 @@ async function ensureAlarms() {
   await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_FLUSH_MINUTES });
   await chrome.alarms.create(EXTENSION_ALIVE_ALARM, { periodInMinutes: 1 });
   await ensureAlarmsAlwaysOn();
+  await ensurePaymentsAlarm();
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -272,6 +301,17 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === EXTENSION_ALIVE_ALARM) {
     const auth = state.health?.status === 'auth' ? 'auth_required' : 'ok';
     void pushExtensionAlive(auth);
+  }
+  if (alarm.name === PAYMENTS_ALARM) {
+    // Low priority: only when trip queue is idle (no live due soon)
+    const due = state.nextDueAt || {};
+    const now = Date.now();
+    const liveBusy =
+      (due.IN_TRANSIT && due.IN_TRANSIT <= now + 5000) ||
+      (due.UPCOMING && due.UPCOMING <= now + 5000);
+    if (!liveBusy && paymentsDue(state, now)) {
+      void syncPaymentsNow({ force: false });
+    }
   }
 });
 
@@ -370,6 +410,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await updateBadge();
         void alwaysOnTick({ force: true });
         void flushToEdge();
+        // Kick payments once after live (low priority vs trip tick)
+        setTimeout(() => void syncPaymentsNow({ force: true }), 8000);
         return;
       }
       if (msg?.type === 'STOP') {
@@ -394,6 +436,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await refreshOpenTabs();
         void alwaysOnTick({ force: true });
         void flushToEdge();
+        void syncPaymentsNow({ force: true });
         sendResponse({ ok: true, state: await getState() });
         return;
       }
@@ -492,6 +535,15 @@ async function handleCapture(msg) {
     const state = await getState();
     // Seed template even before LIVE so GO LIVE can start immediately
     const url = String(msg.url || '');
+    const isFinancial =
+      msg.captureKind === 'settlements' ||
+      msg.captureKind === 'payments-summary' ||
+      url.includes('/api/financials/v1/settlements') ||
+      url.includes('/api/financials/v1/payments-summary');
+    if (isFinancial) {
+      await handleFinancialCapture(msg);
+      return;
+    }
     if (!url.includes('/api/tours/entitiesV2')) return;
 
     const requestBody = msg.requestBody || null;

@@ -1,7 +1,15 @@
-import { useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Fragment, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
-  Download, DollarSign, Wallet, Clock, AlertTriangle, Eye, CheckCircle, RefreshCw,
+  ChevronDown,
+  ChevronRight,
+  Download,
+  DollarSign,
+  Wallet,
+  Clock,
+  AlertTriangle,
+  Eye,
+  RefreshCw,
 } from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
@@ -21,7 +29,13 @@ import {
   downloadCSV,
   getWeekRange,
   getDriverFullName,
+  roundMoney,
 } from '@/lib/utils';
+import {
+  excludeFixtureInvoices,
+  groupInvoicesByWeek,
+  normalizeTourId,
+} from '@/lib/invoiceMoney';
 import { format, subWeeks, parseISO } from 'date-fns';
 import type { Settlement } from '@/types';
 
@@ -29,7 +43,10 @@ export function PaymentsPage() {
   const {
     drivers,
     settlements,
-    payments,
+    invoices,
+    invoiceTrips,
+    paymentsSummary,
+    relayTrips,
     dataReady,
     dataError,
     refreshData,
@@ -37,13 +54,19 @@ export function PaymentsPage() {
     getOrCreateSettlement,
   } = useData();
   const navigate = useNavigate();
-  const [tab, setTab] = useState<'relay' | 'settlements'>('relay');
+  const [tab, setTab] = useState<'invoices' | 'settlements'>('invoices');
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
-  const [driverFilter, setDriverFilter] = useState('');
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [weekStart, setWeekStart] = useState(getWeekRange(new Date()).start);
-  const [sortKey, setSortKey] = useState('paymentDate');
+  const [sortKey, setSortKey] = useState('week');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const handleSort = (key: string) => {
+    if (key === sortKey) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSortKey(key);
+      setSortDir('desc');
+    }
+  };
   const [payModal, setPayModal] = useState<Settlement | null>(null);
   const [payForm, setPayForm] = useState({
     date: format(new Date(), 'yyyy-MM-dd'),
@@ -56,7 +79,7 @@ export function PaymentsPage() {
 
   const driverMap = useMemo(
     () => Object.fromEntries(drivers.map((d) => [d.id, d])),
-    [drivers]
+    [drivers],
   );
 
   const weekOptions = useMemo(() => {
@@ -70,66 +93,124 @@ export function PaymentsPage() {
     });
   }, []);
 
-  const filteredPayments = useMemo(() => {
-    const q = search.toLowerCase();
-    return payments.filter((p) => {
-      if (!q) return true;
-      return (
-        p.referenceId.toLowerCase().includes(q) ||
-        p.amazonRefId.toLowerCase().includes(q) ||
-        p.method.toLowerCase().includes(q) ||
-        String(p.amount).includes(q)
-      );
-    });
-  }, [payments, search]);
-
-  const sortedPayments = useSort(filteredPayments, sortKey, sortDir, {
-    paymentDate: (p) => p.paymentDate,
-    amount: (p) => p.amount,
-    method: (p) => p.method,
-    referenceId: (p) => p.referenceId,
-    source: (p) => p.source,
-  });
-
-  const paymentKpis = useMemo(() => {
-    const total = payments.reduce((s, p) => s + p.amount, 0);
-    const linked = payments.filter((p) => p.settlementId).length;
-    return {
-      count: payments.length,
-      total,
-      linked,
-      unlinked: payments.length - linked,
-    };
-  }, [payments]);
-
-  const allWeek = useMemo(
-    () => settlements.filter((s) => s.weekStart === weekStart),
-    [settlements, weekStart]
+  const liveInvoices = useMemo(() => excludeFixtureInvoices(invoices), [invoices]);
+  const liveInvoiceTrips = useMemo(
+    () => excludeFixtureInvoices(invoiceTrips),
+    [invoiceTrips],
   );
 
-  const filteredSettlements = useMemo(() => {
-    const q = search.toLowerCase();
-    return allWeek.filter((s) => {
-      if (statusFilter && s.status !== statusFilter) return false;
-      if (driverFilter && s.driverId !== driverFilter) return false;
-      const d = driverMap[s.driverId];
-      if (q && d) {
-        const name = getDriverFullName(d.firstName, d.lastName).toLowerCase();
-        if (!name.includes(q) && !d.driverId.toLowerCase().includes(q)) return false;
-      }
-      return true;
-    });
-  }, [allWeek, search, statusFilter, driverFilter, driverMap]);
+  const weekGroups = useMemo(() => {
+    const groups = groupInvoicesByWeek(liveInvoices);
+    const q = search.toLowerCase().trim();
+    if (!q) return groups;
+    return groups.filter(
+      (g) =>
+        g.weekLabel.toLowerCase().includes(q) ||
+        g.invoices.some(
+          (i) =>
+            i.invoiceId.toLowerCase().includes(q) ||
+            i.status.toLowerCase().includes(q) ||
+            String(i.amount).includes(q),
+        ),
+    );
+  }, [liveInvoices, search]);
 
-  const enriched = filteredSettlements.map((s) => {
+  const sortedWeeks = useSort(weekGroups, sortKey, sortDir, {
+    week: (g) => g.year * 100 + g.week,
+    total: (g) => g.total,
+    status: (g) => g.status,
+    invoices: (g) => g.invoices.length,
+  });
+
+  const invoiceKpis = useMemo(() => {
+    const total = roundMoney(liveInvoices.reduce((s, i) => s + i.amount, 0));
+    const pending = liveInvoices.filter((i) => i.status === 'Pending').length;
+    const paid = liveInvoices.filter((i) => i.status === 'Paid').length;
+    return {
+      weeks: weekGroups.length,
+      invoices: liveInvoices.length,
+      total,
+      pending,
+      paid,
+      pendingAmt: paymentsSummary?.pendingInvoicePaymentAmt ?? null,
+    };
+  }, [liveInvoices, weekGroups.length, paymentsSummary]);
+
+  /** Reconciliation helpers vs report_loads-equivalent: relay trip payouts for invoiced tours. */
+  const reconcileWeek = (year: number, week: number) => {
+    const weekInvoices = liveInvoices.filter(
+      (i) => i.amazonWeekYear === year && i.amazonWeek === week,
+    );
+    const tourIds = new Set<string>();
+    const loadIds = new Set<string>();
+    for (const inv of weekInvoices) {
+      for (const t of inv.tourIds) tourIds.add(normalizeTourId(t));
+      for (const l of inv.loadIds) loadIds.add(l.toUpperCase());
+    }
+    for (const it of liveInvoiceTrips) {
+      if (it.amazonWeekYear !== year || it.amazonWeek !== week) continue;
+      if (it.tourId) tourIds.add(normalizeTourId(it.tourId));
+      if (it.loadId) loadIds.add(it.loadId.toUpperCase());
+    }
+
+    const ourByTour = new Map<string, { payout: number; status: string }>();
+    for (const t of relayTrips) {
+      const id = normalizeTourId(t.tripId);
+      if (!id) continue;
+      ourByTour.set(id, {
+        payout: Number(t.payout) || 0,
+        status: String(t.status || t.executionStatus || ''),
+      });
+    }
+
+    const missingInCrm: string[] = [];
+    let amazonFromInvoices = roundMoney(weekInvoices.reduce((s, i) => s + i.amount, 0));
+    let ourPayout = 0;
+    for (const tid of tourIds) {
+      const row = ourByTour.get(tid);
+      if (!row) missingInCrm.push(tid);
+      else ourPayout += row.payout;
+    }
+    // Loads without a matching tour id in our map
+    for (const lid of loadIds) {
+      if (tourIds.has(normalizeTourId(lid))) continue;
+      if (!ourByTour.has(normalizeTourId(lid))) {
+        // may still be a load-only id — flag if no trip matches
+        const hit = [...ourByTour.keys()].some((k) => k === normalizeTourId(lid));
+        if (!hit) missingInCrm.push(`load:${lid}`);
+      }
+    }
+
+    const completedNotInvoiced = [...ourByTour.entries()]
+      .filter(([tid, row]) => {
+        if (tourIds.has(tid)) return false;
+        return /complete|deliver/i.test(row.status);
+      })
+      .map(([tid]) => tid);
+
+    return {
+      amazonTotal: amazonFromInvoices,
+      ourPayout: roundMoney(ourPayout),
+      delta: roundMoney(ourPayout - amazonFromInvoices),
+      missingInCrm: [...new Set(missingInCrm)].slice(0, 40),
+      completedNotInvoiced: completedNotInvoiced.slice(0, 40),
+    };
+  };
+
+  const weekSettlements = useMemo(
+    () => settlements.filter((s) => s.weekStart === weekStart),
+    [settlements, weekStart],
+  );
+
+  const settlementRows = weekSettlements.map((s) => {
     const cats = categorizeCharges(s.charges);
     return { settlement: s, ...cats, remaining: remainingBalance(s) };
   });
 
-  const sortedSettlements = useSort(enriched, sortKey, sortDir, {
-    name: (r) => {
+  const sortedSettlements = useSort(settlementRows, 'netPayable', 'desc', {
+    driver: (r) => {
       const d = driverMap[r.settlement.driverId];
-      return d ? getDriverFullName(d.firstName, d.lastName) : '';
+      return d ? getDriverFullName(d.firstName, d.lastName) : r.settlement.driverId;
     },
     weeklyGross: (r) => r.settlement.weeklyGross,
     netPayable: (r) => r.settlement.netPayable,
@@ -138,266 +219,392 @@ export function PaymentsPage() {
   });
 
   const settlementKpis = useMemo(() => {
-    const list = allWeek;
-    return {
-      fleetGross: list.reduce((s, x) => s + x.weeklyGross, 0),
-      charges: list.reduce((s, x) => s + x.totalDeductions, 0),
-      net: list.reduce((s, x) => s + x.netPayable, 0),
-      paid: list.filter((x) => x.status === 'Paid').reduce((s, x) => s + x.amountPaid, 0),
-      pending: list.filter((x) =>
-        ['Draft', 'Under Review', 'Approved', 'Processing'].includes(x.status)
-      ).length,
-      overdue: list.filter((x) =>
-        ['Partially Paid', 'On Hold'].includes(x.status)
-      ).length,
-    };
-  }, [allWeek]);
-
-  const handleSort = (key: string) => {
-    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-    else {
-      setSortKey(key);
-      setSortDir(key === 'name' || key === 'method' || key === 'referenceId' ? 'asc' : 'desc');
-    }
-  };
+    const fleetGross = weekSettlements.reduce((s, x) => s + x.weeklyGross, 0);
+    const charges = weekSettlements.reduce((s, x) => s + x.totalDeductions, 0);
+    const net = weekSettlements.reduce((s, x) => s + x.netPayable, 0);
+    const paid = weekSettlements
+      .filter((x) => x.status === 'Paid')
+      .reduce((s, x) => s + x.amountPaid, 0);
+    const pending = weekSettlements.filter((x) =>
+      ['Pending', 'Ready'].includes(x.status),
+    ).length;
+    const overdue = weekSettlements.filter((x) =>
+      ['Overdue', 'Partially Paid'].includes(x.status),
+    ).length;
+    return { fleetGross, charges, net, paid, pending, overdue };
+  }, [weekSettlements]);
 
   const openPay = (s: Settlement) => {
     setPayModal(s);
     setPayForm({
       date: format(new Date(), 'yyyy-MM-dd'),
       method: 'ACH Direct Deposit',
-      referenceId: `TXN-${Date.now().toString(36).toUpperCase()}`,
+      referenceId: '',
       amount: String(remainingBalance(s)),
       notes: '',
     });
   };
 
   const submitPay = () => {
-    if (!payModal || !payForm.amount) return;
+    if (!payModal) return;
     markSettlementPaid(payModal.id, {
       date: payForm.date,
       method: payForm.method,
       referenceId: payForm.referenceId,
-      amount: Number(payForm.amount),
+      amount: Number(payForm.amount) || 0,
       notes: payForm.notes,
     });
     setPayModal(null);
   };
 
-  const onRefresh = async () => {
-    setRefreshing(true);
-    try {
-      await refreshData();
-    } finally {
-      setRefreshing(false);
-    }
-  };
-
-  const exportCSV = () => {
-    if (tab === 'relay') {
-      downloadCSV(
-        'relay-payments.csv',
-        ['Payment Date', 'Amount', 'Method', 'Reference', 'Amazon Ref', 'Source', 'Settlement', 'Synced'],
-        sortedPayments.map((p) => [
-          p.paymentDate,
-          p.amount,
-          p.method,
-          p.referenceId,
-          p.amazonRefId,
-          p.source,
-          p.settlementId || '',
-          p.lastSynchronized || '',
-        ]),
-      );
-      return;
-    }
+  const exportWeeks = () => {
     downloadCSV(
-      'settlements.csv',
-      ['Driver', 'ID', 'Weekly Gross', 'Deductions', 'Net', 'Status', 'Paid'],
-      sortedSettlements.map((r) => {
-        const d = driverMap[r.settlement.driverId];
-        return [
-          d ? getDriverFullName(d.firstName, d.lastName) : '',
-          d?.driverId ?? '',
-          r.settlement.weeklyGross,
-          r.settlement.totalDeductions,
-          r.settlement.netPayable,
-          r.settlement.status,
-          r.settlement.amountPaid,
-        ];
-      }),
+      'relay-invoice-weeks.csv',
+      ['Week', 'Start', 'End', 'Invoices', 'Total', 'Status', 'Date'],
+      sortedWeeks.map((g) => [
+        g.weekLabel,
+        g.weekStart,
+        g.weekEnd,
+        g.invoices.length,
+        g.total,
+        g.status,
+        g.expectedOrPaidDate || '',
+      ]),
     );
   };
 
   return (
-    <div>
+    <div className="space-y-6">
       <PageHeader
         title="Payments"
-        subtitle="Live Amazon Relay payments from Supabase + weekly driver settlements"
-        badge={
-          <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800">
-            Live · iiyqkdjwxlnfqvlidbqr
-          </span>
-        }
+        subtitle="Amazon Relay invoices by week + driver settlements"
         actions={
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={() => void onRefresh()} disabled={refreshing}>
-              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> Refresh
-            </Button>
-            <Button variant="outline" size="sm" onClick={exportCSV}>
-              <Download className="h-4 w-4" /> Export
-            </Button>
-          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={refreshing}
+            onClick={async () => {
+              setRefreshing(true);
+              try {
+                await refreshData();
+              } finally {
+                setRefreshing(false);
+              }
+            }}
+          >
+            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+            Refresh
+          </Button>
         }
       />
 
       {dataError && (
-        <Card className="mb-4 border-danger/40 bg-danger/5 p-3 text-sm text-danger">
-          Failed to load Supabase data: {dataError}
-        </Card>
+        <div className="rounded-lg border border-danger/30 bg-danger/5 px-4 py-3 text-sm text-danger">
+          {dataError}
+        </div>
       )}
 
-      <div className="mb-4 flex gap-2">
+      <div className="flex flex-wrap gap-2">
         <Button
-          variant={tab === 'relay' ? 'primary' : 'outline'}
+          variant={tab === 'invoices' ? 'primary' : 'outline'}
           size="sm"
-          onClick={() => {
-            setTab('relay');
-            setSortKey('paymentDate');
-            setSortDir('desc');
-          }}
+          onClick={() => setTab('invoices')}
         >
-          Relay payments ({payments.length})
+          Relay invoices ({liveInvoices.length})
         </Button>
         <Button
           variant={tab === 'settlements' ? 'primary' : 'outline'}
           size="sm"
-          onClick={() => {
-            setTab('settlements');
-            setSortKey('weeklyGross');
-            setSortDir('desc');
-          }}
+          onClick={() => setTab('settlements')}
         >
           Settlements ({settlements.length})
         </Button>
       </div>
 
-      {tab === 'relay' ? (
+      {tab === 'invoices' && (
         <>
-          <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-4">
-            <KpiCard title="Payment rows" value={paymentKpis.count} format="number" icon={Clock} />
-            <KpiCard title="Total amount" value={paymentKpis.total} icon={DollarSign} highlight />
-            <KpiCard title="Linked to settlement" value={paymentKpis.linked} format="number" accent="success" />
-            <KpiCard title="Unlinked (Relay)" value={paymentKpis.unlinked} format="number" icon={Wallet} accent="warning" />
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <KpiCard title="Weeks" value={invoiceKpis.weeks} format="number" icon={Wallet} />
+            <KpiCard
+              title="Invoices"
+              value={invoiceKpis.invoices}
+              format="number"
+              icon={DollarSign}
+            />
+            <KpiCard title="Invoice total" value={invoiceKpis.total} accent="success" />
+            <KpiCard
+              title="Pending (summary)"
+              value={invoiceKpis.pendingAmt ?? invoiceKpis.pending}
+              format={invoiceKpis.pendingAmt != null ? 'currency' : 'number'}
+              accent="warning"
+              icon={Clock}
+            />
           </div>
 
-          <Card className="mb-4 p-3">
-            <SearchInput
-              value={search}
-              onChange={setSearch}
-              placeholder="Search reference, amount, method..."
-              className="w-72"
-            />
-          </Card>
+          {paymentsSummary?.lastSyncedAt && (
+            <p className="text-xs text-text-secondary">
+              payments-summary synced{' '}
+              {format(parseISO(paymentsSummary.lastSyncedAt), 'MMM d, HH:mm')}
+              {paymentsSummary.timeZone ? ` · ${paymentsSummary.timeZone}` : ''}
+              {paymentsSummary.pendingInvoicePaymentAmt != null
+                ? ` · pending ${formatCurrency(paymentsSummary.pendingInvoicePaymentAmt)}`
+                : ''}
+            </p>
+          )}
 
           <Card className="overflow-hidden">
+            <div className="flex flex-wrap items-center gap-3 border-b border-border/60 px-4 py-3">
+              <SearchInput
+                value={search}
+                onChange={setSearch}
+                placeholder="Search week or invoice…"
+              />
+              <Button variant="outline" size="sm" onClick={exportWeeks}>
+                <Download className="h-4 w-4" />
+                Export
+              </Button>
+            </div>
+
             {!dataReady ? (
-              <div className="p-8 text-sm text-text-secondary">Loading live payments…</div>
-            ) : sortedPayments.length === 0 ? (
+              <div className="p-8 text-sm text-text-secondary">Loading invoices…</div>
+            ) : !sortedWeeks.length ? (
               <EmptyState
-                title="No Relay payments yet"
-                description="Run the Chrome extension GO LIVE on Amazon Relay Payments to sync rows into Supabase."
+                title="No Relay invoices yet"
+                description="Open Amazon Relay Payments while the extension is LIVE — settlements sync every 30 minutes. FIXTURE seeds never appear here."
               />
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[900px] text-sm">
+                <table className="w-full text-sm">
                   <thead>
-                    <tr className="border-b border-border bg-bg/80">
-                      <SortHeader label="Payment date" sortKey="paymentDate" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                      <SortHeader label="Amount" sortKey="amount" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                      <SortHeader label="Method" sortKey="method" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                      <SortHeader label="Reference" sortKey="referenceId" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                      <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Amazon ref</th>
-                      <SortHeader label="Source" sortKey="source" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                      <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Synced</th>
+                    <tr className="border-b border-border/60 text-left text-xs text-text-secondary">
+                      <th className="w-8 px-3 py-2" />
+                      <SortHeader
+                        label="Week"
+                        sortKey="week"
+                        currentKey={sortKey}
+                        direction={sortDir}
+                        onSort={handleSort}
+                      />
+                      <th className="px-3 py-2">Window</th>
+                      <SortHeader
+                        label="Invoices"
+                        sortKey="invoices"
+                        currentKey={sortKey}
+                        direction={sortDir}
+                        onSort={handleSort}
+                      />
+                      <SortHeader
+                        label="Total"
+                        sortKey="total"
+                        currentKey={sortKey}
+                        direction={sortDir}
+                        onSort={handleSort}
+                        align="right"
+                      />
+                      <SortHeader
+                        label="Status"
+                        sortKey="status"
+                        currentKey={sortKey}
+                        direction={sortDir}
+                        onSort={handleSort}
+                      />
+                      <th className="px-3 py-2">Expected / Paid</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {sortedPayments.map((p) => (
-                      <tr key={p.id} className="border-b border-border/60 table-row-hover">
-                        <td className="px-3 py-2.5 tabular-nums">{formatDate(p.paymentDate)}</td>
-                        <td className="px-3 py-2.5 text-right font-semibold tabular-nums text-primary">
-                          {formatCurrency(p.amount)}
-                        </td>
-                        <td className="px-3 py-2.5">{p.method || '—'}</td>
-                        <td className="px-3 py-2.5 text-text-secondary">{p.referenceId || '—'}</td>
-                        <td className="px-3 py-2.5 text-text-secondary">{p.amazonRefId || '—'}</td>
-                        <td className="px-3 py-2.5">
-                          <Badge status={p.source || 'manual'} />
-                        </td>
-                        <td className="px-3 py-2.5 text-xs text-text-secondary">
-                          {p.lastSynchronized ? formatDate(p.lastSynchronized) : '—'}
-                        </td>
-                      </tr>
-                    ))}
+                    {sortedWeeks.map((g) => {
+                      const open = Boolean(expanded[g.key]);
+                      const recon = open ? reconcileWeek(g.year, g.week) : null;
+                      return (
+                        <Fragment key={g.key}>
+                          <tr
+                            className="border-b border-border/60 table-row-hover cursor-pointer"
+                            onClick={() =>
+                              setExpanded((prev) => ({ ...prev, [g.key]: !prev[g.key] }))
+                            }
+                          >
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              {open ? (
+                                <ChevronDown className="h-4 w-4" />
+                              ) : (
+                                <ChevronRight className="h-4 w-4" />
+                              )}
+                            </td>
+                            <td className="px-3 py-2.5 font-medium">{g.weekLabel}</td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              {formatDate(g.weekStart, 'MMM d')} –{' '}
+                              {formatDate(g.weekEnd, 'MMM d, yyyy')}
+                            </td>
+                            <td className="px-3 py-2.5 tabular-nums">{g.invoices.length}</td>
+                            <td className="px-3 py-2.5 tabular-nums font-medium">
+                              {formatCurrency(g.total)}
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <Badge status={g.status} />
+                            </td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              {g.expectedOrPaidDate
+                                ? formatDate(g.expectedOrPaidDate, 'MMM d, yyyy')
+                                : '—'}
+                            </td>
+                          </tr>
+                          {open && (
+                            <tr className="bg-surface-2/40">
+                              <td colSpan={7} className="px-4 py-3">
+                                <div className="space-y-3">
+                                  <table className="w-full text-xs">
+                                    <thead>
+                                      <tr className="text-left text-text-secondary">
+                                        <th className="py-1 pr-2">Invoice</th>
+                                        <th className="py-1 pr-2">Amount</th>
+                                        <th className="py-1 pr-2">Status</th>
+                                        <th className="py-1 pr-2">Invoice date</th>
+                                        <th className="py-1 pr-2">Expected</th>
+                                        <th className="py-1 pr-2">Paid at</th>
+                                        <th className="py-1 pr-2">Tours / Loads</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {g.invoices.map((inv) => (
+                                        <tr key={inv.invoiceId} className="border-t border-border/40">
+                                          <td className="py-1.5 pr-2 font-mono text-[11px]">
+                                            {inv.invoiceId.slice(0, 18)}…
+                                          </td>
+                                          <td className="py-1.5 pr-2 tabular-nums">
+                                            {formatCurrency(inv.amount)}
+                                          </td>
+                                          <td className="py-1.5 pr-2">
+                                            <Badge status={inv.status} />
+                                          </td>
+                                          <td className="py-1.5 pr-2">
+                                            {inv.invoiceDate
+                                              ? formatDate(inv.invoiceDate, 'MMM d')
+                                              : '—'}
+                                          </td>
+                                          <td className="py-1.5 pr-2">
+                                            {inv.expectedPaymentDate
+                                              ? formatDate(inv.expectedPaymentDate, 'MMM d')
+                                              : '—'}
+                                          </td>
+                                          <td className="py-1.5 pr-2">
+                                            {inv.paidAt
+                                              ? formatDate(inv.paidAt.slice(0, 10), 'MMM d')
+                                              : '—'}
+                                          </td>
+                                          <td className="py-1.5 pr-2 tabular-nums">
+                                            {inv.tourIds.length} / {inv.loadIds.length}
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+
+                                  {recon && (
+                                    <div className="rounded-md border border-border/50 bg-background/60 p-3 text-xs space-y-1">
+                                      <p className="font-medium">Reconciliation vs Relay trips</p>
+                                      <p>
+                                        Invoice total {formatCurrency(recon.amazonTotal)} · Our
+                                        payout on invoiced tours {formatCurrency(recon.ourPayout)} ·
+                                        Δ {formatCurrency(recon.delta)}
+                                      </p>
+                                      <p className="text-text-secondary">
+                                        (Full report_loads Amazon Paid compare lands with money
+                                        accuracy PR — using live relay_trips.payout here.)
+                                      </p>
+                                      {recon.missingInCrm.length > 0 && (
+                                        <p>
+                                          <span className="text-warning">Missing in CRM:</span>{' '}
+                                          {recon.missingInCrm.join(', ')}
+                                        </p>
+                                      )}
+                                      {recon.completedNotInvoiced.length > 0 && (
+                                        <p>
+                                          <span className="text-warning">
+                                            Completed not in any invoice:
+                                          </span>{' '}
+                                          {recon.completedNotInvoiced.join(', ')}
+                                        </p>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             )}
           </Card>
         </>
-      ) : (
+      )}
+
+      {tab === 'settlements' && (
         <>
-          <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+          <div className="flex flex-wrap items-end gap-3">
+            <Field label="Ops week">
+              <Select value={weekStart} onChange={(e) => setWeekStart(e.target.value)}>
+                {weekOptions.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                for (const d of drivers.filter((x) => x.status === 'Active')) {
+                  getOrCreateSettlement(d.id, weekStart);
+                }
+              }}
+            >
+              Refresh settlements
+            </Button>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
             <KpiCard title="Total Fleet Gross" value={settlementKpis.fleetGross} icon={DollarSign} highlight />
             <KpiCard title="Total Driver Charges" value={settlementKpis.charges} accent="warning" />
             <KpiCard title="Total Net Payable" value={settlementKpis.net} icon={Wallet} accent="success" />
             <KpiCard title="Paid This Week" value={settlementKpis.paid} accent="success" />
-            <KpiCard title="Pending Payments" value={settlementKpis.pending} format="number" icon={Clock} accent="warning" />
-            <KpiCard title="Overdue / Partial" value={settlementKpis.overdue} format="number" icon={AlertTriangle} accent="danger" />
+            <KpiCard
+              title="Pending Payments"
+              value={settlementKpis.pending}
+              format="number"
+              icon={Clock}
+              accent="warning"
+            />
+            <KpiCard
+              title="Overdue / Partial"
+              value={settlementKpis.overdue}
+              format="number"
+              icon={AlertTriangle}
+              accent="danger"
+            />
           </div>
 
-          <Card className="mb-4 p-3">
-            <div className="flex flex-wrap gap-2">
-              <Select value={weekStart} onChange={(e) => setWeekStart(e.target.value)} className="w-56">
-                {weekOptions.map((w) => (
-                  <option key={w.value} value={w.value}>{w.label}</option>
-                ))}
-              </Select>
-              <SearchInput value={search} onChange={setSearch} placeholder="Search drivers..." className="w-52" />
-              <Select value={driverFilter} onChange={(e) => setDriverFilter(e.target.value)} className="w-44">
-                <option value="">All Drivers</option>
-                {drivers.map((d) => (
-                  <option key={d.id} value={d.id}>{getDriverFullName(d.firstName, d.lastName)}</option>
-                ))}
-              </Select>
-              <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="w-40">
-                <option value="">All Statuses</option>
-                {['Draft', 'Under Review', 'Approved', 'Processing', 'Paid', 'On Hold', 'Partially Paid'].map((s) => (
-                  <option key={s} value={s}>{s}</option>
-                ))}
-              </Select>
-            </div>
-          </Card>
-
           <Card className="overflow-hidden">
-            {sortedSettlements.length === 0 ? (
+            {!sortedSettlements.length ? (
               <EmptyState
                 title="No settlements for this week"
-                description="Settlements appear after drivers and loads are in CRM. Relay payment rows are on the Relay payments tab."
+                description="Settlements appear after drivers and loads are in CRM."
               />
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[1000px] text-sm">
+                <table className="w-full text-sm">
                   <thead>
-                    <tr className="border-b border-border bg-bg/80">
-                      <SortHeader label="Driver" sortKey="name" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                      <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">ID</th>
-                      <SortHeader label="Weekly Gross" sortKey="weeklyGross" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                      <SortHeader label="Deductions" sortKey="totalDeductions" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                      <SortHeader label="Net Payable" sortKey="netPayable" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                      <SortHeader label="Status" sortKey="status" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                      <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Actions</th>
+                    <tr className="border-b border-border/60 text-left text-xs text-text-secondary">
+                      <th className="px-3 py-2">Driver</th>
+                      <th className="px-3 py-2">Gross</th>
+                      <th className="px-3 py-2">Deductions</th>
+                      <th className="px-3 py-2">Net</th>
+                      <th className="px-3 py-2">Status</th>
+                      <th className="px-3 py-2" />
                     </tr>
                   </thead>
                   <tbody>
@@ -408,43 +615,43 @@ export function PaymentsPage() {
                           <td className="px-3 py-2.5">
                             <button
                               type="button"
-                              className="text-left font-medium text-primary hover:underline"
+                              className="font-medium text-primary hover:underline"
                               onClick={() => navigate(`/payments/${r.settlement.id}`)}
                             >
-                              {d ? getDriverFullName(d.firstName, d.lastName) : r.settlement.driverId}
+                              {d
+                                ? getDriverFullName(d.firstName, d.lastName)
+                                : r.settlement.driverId}
                             </button>
                           </td>
-                          <td className="px-3 py-2.5 text-xs text-text-secondary">{d?.driverId ?? '—'}</td>
-                          <td className="px-3 py-2.5 text-right font-medium tabular-nums">
+                          <td className="px-3 py-2.5 tabular-nums">
                             {formatCurrency(r.settlement.weeklyGross)}
                           </td>
-                          <td className="px-3 py-2.5 text-right tabular-nums text-danger">
+                          <td className="px-3 py-2.5 tabular-nums">
                             −{formatCurrency(r.settlement.totalDeductions)}
                           </td>
-                          <td className="px-3 py-2.5 text-right font-bold tabular-nums text-primary">
+                          <td className="px-3 py-2.5 tabular-nums font-medium">
                             {formatCurrency(r.settlement.netPayable)}
                           </td>
-                          <td className="px-3 py-2.5"><Badge status={r.settlement.status} /></td>
                           <td className="px-3 py-2.5">
-                            <div className="flex items-center justify-end gap-1">
-                              <Button variant="ghost" size="sm" onClick={() => navigate(`/payments/${r.settlement.id}`)}>
-                                <Eye className="h-3.5 w-3.5" />
+                            <Badge status={r.settlement.status} />
+                          </td>
+                          <td className="px-3 py-2.5 text-right">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => navigate(`/payments/${r.settlement.id}`)}
+                            >
+                              <Eye className="h-4 w-4" />
+                            </Button>
+                            {r.settlement.status !== 'Paid' && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => openPay(r.settlement)}
+                              >
+                                Pay
                               </Button>
-                              {r.settlement.status !== 'Paid' && (
-                                <Button variant="ghost" size="sm" onClick={() => openPay(r.settlement)}>
-                                  <CheckCircle className="h-3.5 w-3.5 text-success" />
-                                </Button>
-                              )}
-                              {!d && drivers[0] && (
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  onClick={() => getOrCreateSettlement(drivers[0].id, weekStart)}
-                                >
-                                  New
-                                </Button>
-                              )}
-                            </div>
+                            )}
                           </td>
                         </tr>
                       );
@@ -458,40 +665,55 @@ export function PaymentsPage() {
       )}
 
       <Modal
-        open={!!payModal}
+        open={Boolean(payModal)}
         onClose={() => setPayModal(null)}
         title="Record payment"
-        footer={
-          <>
-            <Button variant="outline" onClick={() => setPayModal(null)}>Cancel</Button>
-            <Button onClick={submitPay}>Save payment</Button>
-          </>
-        }
       >
         {payModal && (
           <div className="space-y-3">
-            <p className="text-sm text-text-secondary">
-              Remaining balance: <strong>{formatCurrency(remainingBalance(payModal))}</strong>
-            </p>
             <Field label="Date">
-              <Input type="date" value={payForm.date} onChange={(e) => setPayForm({ ...payForm, date: e.target.value })} />
+              <Input
+                type="date"
+                value={payForm.date}
+                onChange={(e) => setPayForm({ ...payForm, date: e.target.value })}
+              />
             </Field>
             <Field label="Method">
-              <Input value={payForm.method} onChange={(e) => setPayForm({ ...payForm, method: e.target.value })} />
+              <Input
+                value={payForm.method}
+                onChange={(e) => setPayForm({ ...payForm, method: e.target.value })}
+              />
             </Field>
             <Field label="Reference">
-              <Input value={payForm.referenceId} onChange={(e) => setPayForm({ ...payForm, referenceId: e.target.value })} />
+              <Input
+                value={payForm.referenceId}
+                onChange={(e) => setPayForm({ ...payForm, referenceId: e.target.value })}
+              />
             </Field>
             <Field label="Amount">
-              <Input type="number" value={payForm.amount} onChange={(e) => setPayForm({ ...payForm, amount: e.target.value })} />
+              <Input
+                type="number"
+                step="0.01"
+                value={payForm.amount}
+                onChange={(e) => setPayForm({ ...payForm, amount: e.target.value })}
+              />
             </Field>
             <Field label="Notes">
-              <Textarea value={payForm.notes} onChange={(e) => setPayForm({ ...payForm, notes: e.target.value })} />
+              <Textarea
+                value={payForm.notes}
+                onChange={(e) => setPayForm({ ...payForm, notes: e.target.value })}
+              />
             </Field>
             <p className="text-xs text-text-secondary">
-              Partial payments are supported. Settlement stays Partially Paid until the full net is covered.
-              See also <Link className="text-primary underline" to="/loads">Loads</Link> for Relay load rows.
+              Partial payments are supported. Settlement stays Partially Paid until the full net is
+              covered.
             </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setPayModal(null)}>
+                Cancel
+              </Button>
+              <Button onClick={submitPay}>Save payment</Button>
+            </div>
           </div>
         )}
       </Modal>
