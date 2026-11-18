@@ -12,6 +12,7 @@ import { DriversPage } from '@/pages/DriversPage';
 import { DriverDetailPage } from '@/pages/DriverDetailPage';
 import { SettlementsChargesPage } from '@/pages/SettlementsChargesPage';
 import { ReportsPage } from '@/pages/ReportsPage';
+import { DataChecksPage } from '@/pages/DataChecksPage';
 import { SettingsPage } from '@/pages/SettingsPage';
 
 export default function App() {
@@ -30,6 +31,7 @@ export default function App() {
             <Route path="payments/:id" element={<SettlementDetailPage />} />
             <Route path="settlements" element={<SettlementsChargesPage />} />
             <Route path="reports" element={<ReportsPage />} />
+            <Route path="data-checks" element={<DataChecksPage />} />
             <Route path="settings" element={<SettingsPage />} />
           </Route>
         </Routes>

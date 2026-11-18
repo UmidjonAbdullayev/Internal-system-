@@ -1,0 +1,250 @@
+/**
+ * Money math for Drivers / Gross Board / Reports — all from report_loads.
+ * Do not use getLoadFinalGross / loads.rate_gross for these pages.
+ */
+import type { Driver, GrossAdjustment } from '@/types';
+import { getDriverFullName, roundMoney } from '@/lib/utils';
+import { inAmazonWeek } from '@/lib/amazonWeek';
+
+export interface ReportLoadRow {
+  tripUuid: string;
+  tripId: string;
+  tourId: string;
+  tripDisplay: string;
+  loadIds: string;
+  legCount: number;
+  broker: string;
+  driverName: string;
+  driverNameRaw: string | null;
+  pickupDate: string | null;
+  deliveryDate: string | null;
+  puLocation: string;
+  delLocation: string;
+  tourStartTs: string | null;
+  tourStartLa: string | null;
+  weekStart: string | null;
+  weekEnd: string | null;
+  amazonWeek: number | null;
+  amazonWeekYear: number | null;
+  weekLabel: string;
+  mile: string;
+  amazonPaid: number;
+  driverPaid: number;
+  rpm: number;
+  comment: string;
+  dispatch: string;
+  section: string | null;
+  status: string | null;
+  executionStatus: string | null;
+  lastSeenAt: string | null;
+  updatedAt: string | null;
+  hasOverride: boolean;
+}
+
+export interface LoadOverrideRow {
+  tourId: string;
+  driverName: string | null;
+  driverPaid: number | null;
+  comment: string | null;
+  dispatch: string | null;
+  mile: string | null;
+  broker: string | null;
+  source: string;
+  legacyReportIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
+  const num = (v: unknown) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const str = (v: unknown) => (v == null ? '' : String(v));
+  const strOrNull = (v: unknown) => (v == null || v === '' ? null : String(v));
+  return {
+    tripUuid: str(row.trip_uuid),
+    tripId: str(row.trip_id),
+    tourId: str(row.tour_id),
+    tripDisplay: str(row.trip_display),
+    loadIds: str(row.load_ids),
+    legCount: num(row.leg_count),
+    broker: str(row.broker) || 'Amazon',
+    driverName: str(row.driver_name),
+    driverNameRaw: strOrNull(row.driver_name_raw),
+    pickupDate: strOrNull(row.pickup_date),
+    deliveryDate: strOrNull(row.delivery_date),
+    puLocation: str(row.pu_location),
+    delLocation: str(row.del_location),
+    tourStartTs: strOrNull(row.tour_start_ts),
+    tourStartLa: strOrNull(row.tour_start_la),
+    weekStart: strOrNull(row.week_start),
+    weekEnd: strOrNull(row.week_end),
+    amazonWeek: row.amazon_week == null ? null : num(row.amazon_week),
+    amazonWeekYear: row.amazon_week_year == null ? null : num(row.amazon_week_year),
+    weekLabel: str(row.week_label),
+    mile: str(row.mile),
+    amazonPaid: num(row.amazon_paid),
+    driverPaid: num(row.driver_paid),
+    rpm: num(row.rpm),
+    comment: str(row.comment),
+    dispatch: str(row.dispatch),
+    section: strOrNull(row.section),
+    status: strOrNull(row.status),
+    executionStatus: strOrNull(row.execution_status),
+    lastSeenAt: strOrNull(row.last_seen_at),
+    updatedAt: strOrNull(row.updated_at),
+    hasOverride: Boolean(row.has_override),
+  };
+}
+
+export function mapLoadOverride(row: Record<string, unknown>): LoadOverrideRow {
+  const numOrNull = (v: unknown) => {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const strOrNull = (v: unknown) => (v == null || v === '' ? null : String(v));
+  return {
+    tourId: String(row.tour_id || ''),
+    driverName: strOrNull(row.driver_name),
+    driverPaid: numOrNull(row.driver_paid),
+    comment: strOrNull(row.comment),
+    dispatch: strOrNull(row.dispatch),
+    mile: strOrNull(row.mile),
+    broker: strOrNull(row.broker),
+    source: String(row.source || 'migrated'),
+    legacyReportIds: Array.isArray(row.legacy_report_ids)
+      ? (row.legacy_report_ids as string[])
+      : [],
+    createdAt: String(row.created_at || ''),
+    updatedAt: String(row.updated_at || ''),
+  };
+}
+
+/** Normalize driver names for matching report_loads → drivers. */
+export function normalizePersonName(raw: string): string {
+  return raw.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+export function matchDriverToName(drivers: Driver[], name: string): Driver | null {
+  if (!name) return null;
+  const n = normalizePersonName(name);
+  if (!n || /^spot/i.test(n) || /starts/i.test(n)) return null;
+  return (
+    drivers.find((d) => normalizePersonName(getDriverFullName(d.firstName, d.lastName)) === n) ||
+    drivers.find((d) => {
+      const full = normalizePersonName(getDriverFullName(d.firstName, d.lastName));
+      return full.includes(n) || n.includes(full);
+    }) ||
+    null
+  );
+}
+
+export function filterReportLoadsByWeek(
+  rows: ReportLoadRow[],
+  weekStart: string,
+  weekEnd: string,
+): ReportLoadRow[] {
+  return rows.filter((r) => inAmazonWeek(r.tourStartLa, weekStart, weekEnd));
+}
+
+export function sumAmazonPaid(rows: ReportLoadRow[]): number {
+  return roundMoney(rows.reduce((s, r) => s + r.amazonPaid, 0));
+}
+
+export function sumDriverPaid(rows: ReportLoadRow[]): number {
+  return roundMoney(rows.reduce((s, r) => s + r.driverPaid, 0));
+}
+
+export function reportLoadsForDriver(
+  rows: ReportLoadRow[],
+  drivers: Driver[],
+  driverId: string,
+  weekStart?: string,
+  weekEnd?: string,
+): ReportLoadRow[] {
+  const driver = drivers.find((d) => d.id === driverId);
+  if (!driver) return [];
+  const full = normalizePersonName(getDriverFullName(driver.firstName, driver.lastName));
+  return rows.filter((r) => {
+    if (weekStart && weekEnd && !inAmazonWeek(r.tourStartLa, weekStart, weekEnd)) return false;
+    const matched = matchDriverToName(drivers, r.driverName);
+    if (matched) return matched.id === driverId;
+    // fallback: raw name equals
+    return normalizePersonName(r.driverName) === full;
+  });
+}
+
+export function getDriverAmazonGross(
+  rows: ReportLoadRow[],
+  drivers: Driver[],
+  driverId: string,
+  weekStart?: string,
+  weekEnd?: string,
+  adjustments: GrossAdjustment[] = [],
+): number {
+  const list = reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd);
+  const gross = sumAmazonPaid(list);
+  const adj = adjustments
+    .filter(
+      (a) =>
+        a.driverId === driverId &&
+        (!weekStart || !weekEnd || (a.date >= weekStart && a.date <= weekEnd)),
+    )
+    .reduce((s, a) => s + a.amount, 0);
+  return roundMoney(gross + adj);
+}
+
+export function getFleetAmazonGross(
+  rows: ReportLoadRow[],
+  weekStart?: string,
+  weekEnd?: string,
+): number {
+  const list =
+    weekStart && weekEnd ? filterReportLoadsByWeek(rows, weekStart, weekEnd) : rows;
+  return sumAmazonPaid(list);
+}
+
+/** Mon=0 … Sun=6 daily buckets using tour_start_la (Amazon week Sun–Sat still). */
+export function getDailyAmazonByWeekday(
+  rows: ReportLoadRow[],
+  drivers: Driver[],
+  driverId: string,
+  weekStart: string,
+  weekEnd: string,
+): number[] {
+  const daily = [0, 0, 0, 0, 0, 0, 0];
+  const list = reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd);
+  for (const r of list) {
+    if (!r.tourStartLa) continue;
+    const asLocal = parseISONoon(r.tourStartLa);
+    const day = asLocal.getDay(); // 0=Sun
+    const idx = day === 0 ? 6 : day - 1; // Mon=0 … Sun=6 board columns
+    daily[idx] += r.amazonPaid;
+  }
+  return daily.map(roundMoney);
+}
+
+function parseISONoon(ymd: string): Date {
+  return new Date(`${ymd}T12:00:00`);
+}
+
+export function groupReportLoadsByWeekLabel(
+  rows: ReportLoadRow[],
+): { week: string; rows: ReportLoadRow[] }[] {
+  const sorted = [...rows].sort((a, b) => {
+    const ad = a.tourStartLa || a.pickupDate || '';
+    const bd = b.tourStartLa || b.pickupDate || '';
+    if (ad !== bd) return ad.localeCompare(bd);
+    return a.tourId.localeCompare(b.tourId);
+  });
+  const groups: { week: string; rows: ReportLoadRow[] }[] = [];
+  for (const row of sorted) {
+    const week = row.weekLabel || 'Week??';
+    const last = groups[groups.length - 1];
+    if (last && last.week.toLowerCase() === week.toLowerCase()) last.rows.push(row);
+    else groups.push({ week, rows: [row] });
+  }
+  return groups;
+}

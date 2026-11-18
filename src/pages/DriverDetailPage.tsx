@@ -9,20 +9,17 @@ import { Badge } from '@/components/ui/Badge';
 import { KpiCard } from '@/components/ui/KpiCard';
 import { Modal, ConfirmDialog } from '@/components/ui/Modal';
 import { Input, Field, Select, Textarea } from '@/components/ui/Input';
-import {
-  deriveDriverStatus,
-  getDriverGross,
-  getEligibleLoads,
-  getLoadFinalGross,
-  getMonthRange,
-} from '@/lib/calculations';
+import { deriveDriverStatus, getMonthRange } from '@/lib/calculations';
 import {
   formatCurrency,
   formatDate,
-  getWeekRange,
   getDriverFullName,
-  todayISO,
 } from '@/lib/utils';
+import { amazonWeekRangeFromAnchor, laTodayISO } from '@/lib/amazonWeek';
+import {
+  getDriverAmazonGross,
+  reportLoadsForDriver,
+} from '@/lib/reportLoadMoney';
 import type { ChargeCategory, FeeCalculationType, FeeFrequency, DriverFee } from '@/types';
 
 const CATEGORIES: ChargeCategory[] = ['Fuel', 'Dispatch', 'Insurance', 'Equipment', 'ELD', 'Trailer', 'Damage', 'Other'];
@@ -33,13 +30,14 @@ export function DriverDetailPage() {
   const {
     getDriver,
     loads,
+    reportLoads,
+    drivers,
     settlements,
     driverFees,
     oneTimeCharges,
     addFee,
     updateFee,
     deleteFee,
-    companySettings,
   } = useData();
 
   const driver = getDriver(id ?? '');
@@ -59,15 +57,18 @@ export function DriverDetailPage() {
     description: '',
   });
 
-  const today = todayISO(companySettings.timezone || 'America/Chicago');
-  const week = getWeekRange(today);
+  const today = laTodayISO();
+  const week = amazonWeekRangeFromAnchor(today);
   const month = getMonthRange(today);
 
-  const driverLoads = useMemo(
-    () => loads.filter((l) => l.driverId === id).sort((a, b) => b.deliveryDate.localeCompare(a.deliveryDate)),
-    [loads, id]
+  const driverTours = useMemo(
+    () =>
+      reportLoadsForDriver(reportLoads, drivers, id ?? '').sort((a, b) =>
+        (b.tourStartLa || '').localeCompare(a.tourStartLa || ''),
+      ),
+    [reportLoads, drivers, id],
   );
-  const eligible = getEligibleLoads(loads, id);
+  const eligible = driverTours;
   const driverSettlements = settlements
     .filter((s) => s.driverId === id)
     .sort((a, b) => b.weekStart.localeCompare(a.weekStart));
@@ -136,7 +137,7 @@ export function DriverDetailPage() {
 
   const tabs = [
     { key: 'overview' as const, label: 'Overview' },
-    { key: 'loads' as const, label: `Loads (${driverLoads.length})` },
+    { key: 'loads' as const, label: `Tours (${driverTours.length})` },
     { key: 'payments' as const, label: `Payments (${driverSettlements.length})` },
     { key: 'fees' as const, label: `Fee Config (${fees.length})` },
   ];
@@ -166,9 +167,16 @@ export function DriverDetailPage() {
       />
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4 mb-5">
-        <KpiCard title="Weekly Gross" value={getDriverGross(loads, driver.id, week)} highlight />
-        <KpiCard title="Monthly Gross" value={getDriverGross(loads, driver.id, month)} />
-        <KpiCard title="Total Loads" value={eligible.length} format="number" accent="info" />
+        <KpiCard
+          title="Weekly Gross"
+          value={getDriverAmazonGross(reportLoads, drivers, driver.id, week.start, week.end)}
+          highlight
+        />
+        <KpiCard
+          title="Monthly Gross"
+          value={getDriverAmazonGross(reportLoads, drivers, driver.id, month.start, month.end)}
+        />
+        <KpiCard title="Total Tours" value={eligible.length} format="number" accent="info" />
         <KpiCard
           title="Latest Net Pay"
           value={driverSettlements[0]?.netPayable ?? 0}
@@ -235,21 +243,21 @@ export function DriverDetailPage() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border bg-bg/80">
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Load</th>
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Tour</th>
                   <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Route</th>
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Delivery</th>
-                  <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Status</th>
-                  <th className="px-3 py-2 text-right text-xs font-semibold text-text-secondary">Gross</th>
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Tour start</th>
+                  <th className="px-3 py-2 text-left text-xs font-semibold text-text-secondary">Week</th>
+                  <th className="px-3 py-2 text-right text-xs font-semibold text-text-secondary">Amazon $</th>
                 </tr>
               </thead>
               <tbody>
-                {driverLoads.slice(0, 50).map((l) => (
-                  <tr key={l.id} className="border-b border-border/60 table-row-hover">
-                    <td className="px-3 py-2 font-medium text-primary">{l.loadId}</td>
-                    <td className="px-3 py-2 text-xs">{l.pickupLocation} → {l.deliveryLocation}</td>
-                    <td className="px-3 py-2 text-xs">{formatDate(l.deliveryDate, 'MMM d')}</td>
-                    <td className="px-3 py-2"><Badge status={l.loadStatus} /></td>
-                    <td className="px-3 py-2 text-right tabular-nums">{formatCurrency(getLoadFinalGross(l))}</td>
+                {driverTours.slice(0, 50).map((l) => (
+                  <tr key={l.tourId} className="border-b border-border/60 table-row-hover">
+                    <td className="px-3 py-2 font-medium text-primary">{l.tripDisplay}</td>
+                    <td className="px-3 py-2 text-xs">{l.puLocation} → {l.delLocation}</td>
+                    <td className="px-3 py-2 text-xs">{l.tourStartLa ? formatDate(l.tourStartLa, 'MMM d') : '—'}</td>
+                    <td className="px-3 py-2 text-xs">{l.weekLabel}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{formatCurrency(l.amazonPaid)}</td>
                   </tr>
                 ))}
               </tbody>
