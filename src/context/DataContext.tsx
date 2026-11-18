@@ -60,6 +60,12 @@ import {
   loadInDateRange,
   sanitizeReportLocation,
 } from '@/lib/reportRows';
+import {
+  mapLoadOverride,
+  mapReportLoad,
+  type LoadOverrideRow,
+  type ReportLoadRow,
+} from '@/lib/reportLoadMoney';
 import { toast } from 'sonner';
 
 interface CompanySettings {
@@ -86,10 +92,10 @@ const EMPTY_SETTINGS: CompanySettings = {
   companyName: 'Internal Sys',
   companyAddress: '',
   ein: '',
-  weekStartsOn: 1,
+  weekStartsOn: 0, // Amazon money weeks are Sunday–Saturday (LA)
   defaultDispatchFeePercent: 10,
   currency: 'USD',
-  timezone: 'America/Chicago',
+  timezone: 'America/Los_Angeles',
   historyRetentionDays: DEFAULT_HISTORY_RETENTION_DAYS,
 };
 
@@ -100,6 +106,9 @@ interface DataContextValue {
   relaySnapshots: RelaySectionSnapshot[];
   relaySyncHealth: RelaySyncHealth;
   loadReports: LoadReport[];
+  /** Canonical money rows — one per Relay tour (view report_loads). */
+  reportLoads: ReportLoadRow[];
+  loadOverrides: LoadOverrideRow[];
   payments: RelayPayment[];
   driverFees: DriverFee[];
   oneTimeCharges: OneTimeCharge[];
@@ -137,6 +146,13 @@ interface DataContextValue {
     end: string,
     opts?: { quiet?: boolean },
   ) => Promise<number>;
+  /** Upsert manual fields for a tour (Reports edits). Rehydrates report_loads. */
+  upsertLoadOverride: (
+    tourId: string,
+    patch: Partial<
+      Pick<LoadOverrideRow, 'driverName' | 'driverPaid' | 'comment' | 'dispatch' | 'mile' | 'broker'>
+    >,
+  ) => Promise<void>;
   // Fees
   addFee: (fee: Omit<DriverFee, 'id' | 'createdAt' | 'updatedAt'>) => DriverFee;
   updateFee: (id: string, patch: Partial<DriverFee>) => void;
@@ -184,6 +200,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
     detail: null,
   });
   const [loadReports, setLoadReports] = useState<LoadReport[]>([]);
+  const [reportLoads, setReportLoads] = useState<ReportLoadRow[]>([]);
+  const [loadOverrides, setLoadOverrides] = useState<LoadOverrideRow[]>([]);
   const [payments, setPayments] = useState<RelayPayment[]>([]);
   const [driverFees, setDriverFees] = useState<DriverFee[]>([]);
   const [oneTimeCharges, setOneTimeCharges] = useState<OneTimeCharge[]>([]);
@@ -260,6 +278,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
       relaySnapshotsRes,
       syncRunsRes,
       loadReportsRes,
+      reportLoadsRes,
+      loadOverridesRes,
       feesRes,
       chargesRes,
       settlementsRes,
@@ -280,6 +300,14 @@ export function DataProvider({ children }: { children: ReactNode }) {
         .order('started_at', { ascending: false })
         .limit(5),
       supabase.from('load_reports').select('*').order('pickup_date', { ascending: true }),
+      fetchAllPages<Record<string, unknown>>((from, to) =>
+        supabase
+          .from('report_loads')
+          .select('*')
+          .order('tour_start_la', { ascending: true })
+          .range(from, to),
+      ),
+      supabase.from('load_overrides').select('*'),
       supabase.from('driver_fees').select('*'),
       supabase.from('one_time_charges').select('*'),
       supabase.from('settlements').select('*'),
@@ -430,6 +458,16 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setLoadReports(
       (loadReportsRes.data || []).map((r) => mapLoadReport(r as Record<string, unknown>)),
     );
+    if (!reportLoadsRes.error) {
+      setReportLoads((reportLoadsRes.data || []).map((r) => mapReportLoad(r)));
+    } else {
+      console.error('report_loads hydrate failed', reportLoadsRes.error.message);
+    }
+    if (!loadOverridesRes.error) {
+      setLoadOverrides(
+        (loadOverridesRes.data || []).map((r) => mapLoadOverride(r as Record<string, unknown>)),
+      );
+    }
     setPayments(mappedPayments);
     setDriverFees((feesRes.data || []).map((r) => mapFee(r as Record<string, unknown>)));
     setOneTimeCharges((chargesRes.data || []).map((r) => mapCharge(r as Record<string, unknown>)));
@@ -844,6 +882,40 @@ export function DataProvider({ children }: { children: ReactNode }) {
     [drivers, hydrate, loadReports, loads],
   );
 
+  const upsertLoadOverride = useCallback(
+    async (
+      tourId: string,
+      patch: Partial<
+        Pick<LoadOverrideRow, 'driverName' | 'driverPaid' | 'comment' | 'dispatch' | 'mile' | 'broker'>
+      >,
+    ) => {
+      const bare = tourId.trim().toUpperCase().replace(/^T-/, '');
+      if (!bare) {
+        toast.error('Missing tour id');
+        return;
+      }
+      const row = {
+        tour_id: bare,
+        driver_name: patch.driverName ?? null,
+        driver_paid: patch.driverPaid ?? null,
+        comment: patch.comment ?? null,
+        dispatch: patch.dispatch ?? null,
+        mile: patch.mile ?? null,
+        broker: patch.broker ?? 'Amazon',
+        source: 'manual',
+        updated_at: now(),
+      };
+      const { error } = await supabase.from('load_overrides').upsert(row, { onConflict: 'tour_id' });
+      if (error) {
+        toast.error(`Override save failed: ${error.message}`);
+        return;
+      }
+      toast.success('Saved');
+      await hydrate();
+    },
+    [hydrate],
+  );
+
   const addFee = useCallback(
     (data: Omit<DriverFee, 'id' | 'createdAt' | 'updatedAt'>) => {
       const id = crypto.randomUUID();
@@ -1224,6 +1296,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
       relaySnapshots,
       relaySyncHealth,
       loadReports,
+      reportLoads,
+      loadOverrides,
       payments,
       driverFees,
       oneTimeCharges,
@@ -1252,6 +1326,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       updateLoadReport,
       deleteLoadReport,
       syncLoadReportsForRange,
+      upsertLoadOverride,
       addFee,
       updateFee,
       deleteFee,
@@ -1276,6 +1351,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
       relaySnapshots,
       relaySyncHealth,
       loadReports,
+      reportLoads,
+      loadOverrides,
       payments,
       driverFees,
       oneTimeCharges,
@@ -1303,6 +1380,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       updateLoadReport,
       deleteLoadReport,
       syncLoadReportsForRange,
+      upsertLoadOverride,
       addFee,
       updateFee,
       deleteFee,

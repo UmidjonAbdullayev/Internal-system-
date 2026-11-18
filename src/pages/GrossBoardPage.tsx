@@ -4,7 +4,7 @@ import { Download, TrendingUp, DollarSign, Users, Package, ChevronLeft, ChevronR
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
-import { format, parseISO, subWeeks, addWeeks } from 'date-fns';
+import { format, parseISO } from 'date-fns';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { KpiCard } from '@/components/ui/KpiCard';
@@ -16,69 +16,101 @@ import { Select } from '@/components/ui/Input';
 import { Drawer } from '@/components/ui/Drawer';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { SortHeader, useSort, type SortDir } from '@/components/shared/SortHeader';
-import {
-  deriveDriverStatus,
-  getDailyGrossByWeekday,
-  getDriverGross,
-  getEligibleLoads,
-  getFleetGross,
-  getPreviousWeekRange,
-  getWeeklyDriverLoadPay,
-  percentChange,
-  getMonthRange,
-  getLoadFinalGross,
-  dailyRevenueSeries,
-} from '@/lib/calculations';
+import { deriveDriverStatus, percentChange, getMonthRange } from '@/lib/calculations';
 import {
   formatCurrency,
   formatPercent,
   formatDate,
   downloadCSV,
-  getWeekRange,
   getDriverFullName,
-  todayISO,
   cn,
 } from '@/lib/utils';
+import {
+  amazonWeekRangeFromAnchor,
+  laTodayISO,
+  shiftAmazonWeek,
+} from '@/lib/amazonWeek';
+import {
+  filterReportLoadsByWeek,
+  getDailyAmazonByWeekday,
+  getDriverAmazonGross,
+  getFleetAmazonGross,
+  matchDriverToName,
+  reportLoadsForDriver,
+  type ReportLoadRow,
+} from '@/lib/reportLoadMoney';
 import type { Driver, DateRange } from '@/types';
 
 type ViewMode = 'daily' | 'weekly' | 'monthly' | 'custom';
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export function GrossBoardPage() {
-  const { drivers, loads, grossAdjustments, companySettings } = useData();
+  const { drivers, loads, reportLoads, grossAdjustments } = useData();
   const [view, setView] = useState<ViewMode>('weekly');
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [sortKey, setSortKey] = useState('weeklyGross');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [selectedDriver, setSelectedDriver] = useState<Driver | null>(null);
-  const todayStr = todayISO(companySettings.timezone || 'America/Chicago');
+  const todayStr = laTodayISO();
   const [weekAnchor, setWeekAnchor] = useState(todayStr);
-  const [customRange, setCustomRange] = useState<DateRange>(() => getWeekRange(todayStr));
+  const [customRange, setCustomRange] = useState<DateRange>(() => {
+    const w = amazonWeekRangeFromAnchor(todayStr);
+    return { start: w.start, end: w.end };
+  });
 
-  const thisWeek = getWeekRange(weekAnchor);
-  const lastWeek = getPreviousWeekRange(thisWeek.start);
+  const thisWeek = amazonWeekRangeFromAnchor(weekAnchor);
+  const lastWeekStart = shiftAmazonWeek(thisWeek.start, -1);
+  const lastWeek = amazonWeekRangeFromAnchor(lastWeekStart);
   const thisMonth = getMonthRange(todayStr);
   const today = { start: todayStr, end: todayStr };
 
   const activeRange: DateRange =
-    view === 'monthly' ? thisMonth : view === 'custom' ? customRange : thisWeek;
+    view === 'monthly' ? thisMonth : view === 'custom' ? customRange : { start: thisWeek.start, end: thisWeek.end };
 
   const rows = useMemo(() => {
     return drivers
       .filter((d) => d.status !== 'Inactive')
       .map((driver) => {
         const liveStatus = deriveDriverStatus(driver, loads);
-        const daily = getDailyGrossByWeekday(loads, driver.id, thisWeek);
-        const weeklyGross = getDriverGross(loads, driver.id, thisWeek, grossAdjustments);
-        const prevWeekGross = getDriverGross(
-          loads,
+        const daily = getDailyAmazonByWeekday(
+          reportLoads,
+          drivers,
           driver.id,
-          lastWeek,
+          thisWeek.start,
+          thisWeek.end,
+        );
+        const weeklyGross = getDriverAmazonGross(
+          reportLoads,
+          drivers,
+          driver.id,
+          thisWeek.start,
+          thisWeek.end,
           grossAdjustments,
         );
-        const monthlyGross = getDriverGross(loads, driver.id, thisMonth, grossAdjustments);
-        const weekLoads = getEligibleLoads(loads, driver.id, thisWeek);
+        const prevWeekGross = getDriverAmazonGross(
+          reportLoads,
+          drivers,
+          driver.id,
+          lastWeek.start,
+          lastWeek.end,
+          grossAdjustments,
+        );
+        const monthlyGross = getDriverAmazonGross(
+          reportLoads,
+          drivers,
+          driver.id,
+          thisMonth.start,
+          thisMonth.end,
+          grossAdjustments,
+        );
+        const weekLoads = reportLoadsForDriver(
+          reportLoads,
+          drivers,
+          driver.id,
+          thisWeek.start,
+          thisWeek.end,
+        );
         return {
           driver,
           liveStatus,
@@ -100,12 +132,27 @@ export function GrossBoardPage() {
           r.driver.driverId.toLowerCase().includes(q)
         );
       });
-  }, [drivers, loads, grossAdjustments, search, statusFilter, thisWeek, thisMonth, lastWeek]);
+  }, [drivers, loads, reportLoads, grossAdjustments, search, statusFilter, thisWeek, thisMonth, lastWeek]);
 
-  const weeklyRoster = useMemo(
-    () => getWeeklyDriverLoadPay(loads, drivers, thisWeek),
-    [loads, drivers, thisWeek],
-  );
+  const weeklyRoster = useMemo(() => {
+    const inWeek = filterReportLoadsByWeek(reportLoads, thisWeek.start, thisWeek.end);
+    return inWeek
+      .map((load) => ({
+        driver: matchDriverToName(drivers, load.driverName),
+        load,
+        pay: load.amazonPaid,
+      }))
+      .sort((a, b) => {
+        const an = a.driver
+          ? `${a.driver.lastName} ${a.driver.firstName}`
+          : a.load.driverName || 'zzz';
+        const bn = b.driver
+          ? `${b.driver.lastName} ${b.driver.firstName}`
+          : b.load.driverName || 'zzz';
+        if (an !== bn) return an.localeCompare(bn);
+        return (a.load.tourStartLa || '').localeCompare(b.load.tourStartLa || '');
+      });
+  }, [reportLoads, drivers, thisWeek]);
 
   const sorted = useSort(rows, sortKey, sortDir, {
     name: (r) => getDriverFullName(r.driver.firstName, r.driver.lastName),
@@ -140,11 +187,11 @@ export function GrossBoardPage() {
   }, [rows]);
 
   const kpis = {
-    fleetGross: getFleetGross(loads, activeRange),
-    todayGross: getFleetGross(loads, today),
-    weekGross: getFleetGross(loads, thisWeek),
-    lastWeekGross: getFleetGross(loads, lastWeek),
-    monthGross: getFleetGross(loads, thisMonth),
+    fleetGross: getFleetAmazonGross(reportLoads, activeRange.start, activeRange.end),
+    todayGross: getFleetAmazonGross(reportLoads, today.start, today.end),
+    weekGross: getFleetAmazonGross(reportLoads, thisWeek.start, thisWeek.end),
+    lastWeekGross: getFleetAmazonGross(reportLoads, lastWeek.start, lastWeek.end),
+    monthGross: getFleetAmazonGross(reportLoads, thisMonth.start, thisMonth.end),
   };
 
   const handleSort = (key: string) => {
@@ -176,42 +223,53 @@ export function GrossBoardPage() {
   const exportWeekLoads = () => {
     downloadCSV(
       `gross-week-${thisWeek.start}.csv`,
-      ['Driver', 'Driver ID', 'Load ID', 'Delivery', 'Pickup', 'Delivery Loc', 'Pay', 'Payment Status'],
+      ['Driver', 'Driver ID', 'Tour', 'Tour start', 'Pickup', 'Delivery Loc', 'Amazon Paid', 'Week'],
       weeklyRoster.map((r) => [
         r.driver
           ? getDriverFullName(r.driver.firstName, r.driver.lastName)
-          : r.load.driverNameRaw || 'Unassigned',
+          : r.load.driverName || 'Unassigned',
         r.driver?.driverId || '',
-        r.load.loadId,
-        r.load.deliveryDate,
-        r.load.pickupLocation,
-        r.load.deliveryLocation,
+        r.load.tripDisplay,
+        r.load.tourStartLa || '',
+        r.load.puLocation,
+        r.load.delLocation,
         r.pay,
-        r.load.paymentStatus,
+        r.load.weekLabel,
       ]),
     );
   };
 
-  const detailLoads = selectedDriver
-    ? getEligibleLoads(loads, selectedDriver.id, activeRange)
-    : [];
-  const detailTrend = selectedDriver
-    ? dailyRevenueSeries(
-        loads.filter((l) => l.driverId === selectedDriver.id),
-        activeRange,
+  const detailLoads: ReportLoadRow[] = selectedDriver
+    ? reportLoadsForDriver(
+        reportLoads,
+        drivers,
+        selectedDriver.id,
+        activeRange.start,
+        activeRange.end,
       )
     : [];
+  const detailTrend = (() => {
+    if (!selectedDriver) return [] as { date: string; gross: number }[];
+    const map = new Map<string, number>();
+    for (const l of detailLoads) {
+      const key = l.tourStartLa || '';
+      if (!key) continue;
+      map.set(key, (map.get(key) || 0) + l.amazonPaid);
+    }
+    return Array.from(map.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, gross]) => ({ date, gross }));
+  })();
 
   const shiftWeek = (delta: number) => {
-    const next = delta < 0 ? subWeeks(parseISO(weekAnchor), 1) : addWeeks(parseISO(weekAnchor), 1);
-    setWeekAnchor(format(next, 'yyyy-MM-dd'));
+    setWeekAnchor(shiftAmazonWeek(amazonWeekRangeFromAnchor(weekAnchor).start, delta));
   };
 
   return (
     <div>
       <PageHeader
         title="Gross Board"
-        subtitle={`Weekly driver × load × pay · week ${thisWeek.start} → ${thisWeek.end} · History-synced loads`}
+        subtitle={`Amazon week ${thisWeek.label} · ${thisWeek.start} → ${thisWeek.end} (Sun–Sat LA) · report_loads`}
         badge={
           <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-semibold text-primary">
             Priority
@@ -308,8 +366,8 @@ export function GrossBoardPage() {
         </CardHeader>
         {weeklyRoster.length === 0 ? (
           <EmptyState
-            title="No History loads in this week"
-            description="Gross uses Completed / Delivered / History-bucket loads. Sync Relay History (extension PR A) or widen the week. In-Transit pay is not counted until History."
+            title="No tours in this Amazon week"
+            description="Gross Board uses report_loads (one row per Relay tour), assigned by first pickup in America/Los_Angeles (Sun–Sat)."
           />
         ) : (
           <div className="overflow-x-auto">
@@ -317,16 +375,16 @@ export function GrossBoardPage() {
               <thead>
                 <tr className="border-b border-border bg-bg/80">
                   <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Driver</th>
-                  <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Load</th>
+                  <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Tour</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Route</th>
-                  <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Delivery</th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Pay</th>
-                  <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Payment</th>
+                  <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Tour start</th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Amazon $</th>
+                  <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Week</th>
                 </tr>
               </thead>
               <tbody>
                 {weeklyRoster.map((r) => (
-                  <tr key={r.load.id} className="border-b border-border/60 table-row-hover">
+                  <tr key={r.load.tourId} className="border-b border-border/60 table-row-hover">
                     <td className="px-3 py-2.5">
                       {r.driver ? (
                         <Link
@@ -337,30 +395,28 @@ export function GrossBoardPage() {
                         </Link>
                       ) : (
                         <span className="text-text-secondary italic">
-                          {r.load.driverNameRaw || 'Unassigned'}
+                          {r.load.driverName || 'Unassigned'}
                         </span>
                       )}
                     </td>
-                    <td className="px-3 py-2.5 font-medium tabular-nums">{r.load.loadId}</td>
+                    <td className="px-3 py-2.5 font-medium tabular-nums">{r.load.tripDisplay}</td>
                     <td className="px-3 py-2.5 text-xs">
-                      {r.load.pickupLocation} → {r.load.deliveryLocation}
+                      {r.load.puLocation} → {r.load.delLocation}
                     </td>
                     <td className="px-3 py-2.5 text-xs whitespace-nowrap">
-                      {formatDate(r.load.deliveryDate, 'MMM d')}
+                      {r.load.tourStartLa ? formatDate(r.load.tourStartLa, 'MMM d') : '—'}
                     </td>
                     <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
                       {formatCurrency(r.pay)}
                     </td>
-                    <td className="px-3 py-2.5">
-                      <Badge status={r.load.paymentStatus} />
-                    </td>
+                    <td className="px-3 py-2.5 text-xs">{r.load.weekLabel}</td>
                   </tr>
                 ))}
               </tbody>
               <tfoot>
                 <tr className="bg-primary/5 font-semibold">
                   <td className="px-3 py-3" colSpan={4}>
-                    Week total ({weeklyRoster.length} loads)
+                    Week total ({weeklyRoster.length} tours)
                   </td>
                   <td className="px-3 py-3 text-right tabular-nums text-primary">
                     {formatCurrency(weeklyRoster.reduce((s, r) => s + r.pay, 0))}
@@ -462,14 +518,34 @@ export function GrossBoardPage() {
               <span className="text-sm text-text-secondary">{selectedDriver.driverId}</span>
             </div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <MiniKpi label="Weekly" value={getDriverGross(loads, selectedDriver.id, thisWeek, grossAdjustments)} />
-              <MiniKpi label="Monthly" value={getDriverGross(loads, selectedDriver.id, thisMonth, grossAdjustments)} />
-              <MiniKpi label="Loads" value={detailLoads.length} currency={false} />
               <MiniKpi
-                label="Avg/Load"
+                label="Weekly"
+                value={getDriverAmazonGross(
+                  reportLoads,
+                  drivers,
+                  selectedDriver.id,
+                  thisWeek.start,
+                  thisWeek.end,
+                  grossAdjustments,
+                )}
+              />
+              <MiniKpi
+                label="Monthly"
+                value={getDriverAmazonGross(
+                  reportLoads,
+                  drivers,
+                  selectedDriver.id,
+                  thisMonth.start,
+                  thisMonth.end,
+                  grossAdjustments,
+                )}
+              />
+              <MiniKpi label="Tours" value={detailLoads.length} currency={false} />
+              <MiniKpi
+                label="Avg/Tour"
                 value={
                   detailLoads.length
-                    ? detailLoads.reduce((s, l) => s + getLoadFinalGross(l), 0) / detailLoads.length
+                    ? detailLoads.reduce((s, l) => s + l.amazonPaid, 0) / detailLoads.length
                     : 0
                 }
               />
@@ -489,18 +565,20 @@ export function GrossBoardPage() {
               </CardContent>
             </Card>
             <div>
-              <p className="text-sm font-semibold mb-2">Loads in period ({detailLoads.length})</p>
+              <p className="text-sm font-semibold mb-2">Tours in period ({detailLoads.length})</p>
               <div className="space-y-2 max-h-64 overflow-y-auto">
                 {detailLoads.map((l) => (
-                  <div key={l.id} className="flex items-center justify-between rounded-lg border border-border p-3 text-sm">
+                  <div key={l.tourId} className="flex items-center justify-between rounded-lg border border-border p-3 text-sm">
                     <div>
-                      <p className="font-medium text-primary">{l.loadId}</p>
+                      <p className="font-medium text-primary">{l.tripDisplay}</p>
                       <p className="text-xs text-text-secondary">
-                        {l.pickupLocation} → {l.deliveryLocation}
+                        {l.puLocation} → {l.delLocation}
                       </p>
-                      <p className="text-xs text-text-secondary">{formatDate(l.deliveryDate)}</p>
+                      <p className="text-xs text-text-secondary">
+                        {l.tourStartLa ? formatDate(l.tourStartLa) : '—'} · {l.weekLabel}
+                      </p>
                     </div>
-                    <p className="font-semibold tabular-nums">{formatCurrency(getLoadFinalGross(l))}</p>
+                    <p className="font-semibold tabular-nums">{formatCurrency(l.amazonPaid)}</p>
                   </div>
                 ))}
                 {detailLoads.length === 0 && (
