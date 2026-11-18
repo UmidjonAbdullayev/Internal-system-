@@ -3,6 +3,7 @@ import {
   isValidRelayId,
   isFullyCancelledTrip,
   normalizeSection,
+  recordIncomeStatusChange,
   recordTripEvent,
   sanitizeDriverName,
 } from "./shared.ts";
@@ -209,7 +210,7 @@ export async function upsertTrips(
     if (stopErr) errors.push(`Stop bulk upsert: ${stopErr.message}`);
   }
 
-  // Section-change / cancelled events (best-effort; parallel but not N×await in a loop body).
+  // Section-change / cancelled / income-status events (best-effort).
   await Promise.all(
     prepared.map(async (p) => {
       const prev = prevMap.get(p.tripId);
@@ -221,7 +222,7 @@ export async function upsertTrips(
           to_section: p.section,
           from_status: prev.status,
           to_status: p.nextStatus != null ? String(p.nextStatus) : null,
-          detail: { source_tab: p.sourceTab },
+          detail: { source_tab: p.sourceTab, code_path: "relay-snapshot/upsert" },
         });
       } else if (!prev && p.cancelled && p.section === "HISTORY") {
         await recordTripEvent(sb, {
@@ -230,7 +231,18 @@ export async function upsertTrips(
           from_section: p.sourceTab,
           to_section: "HISTORY",
           to_status: p.nextStatus != null ? String(p.nextStatus) : null,
-          detail: { source_tab: p.sourceTab, first_seen: true },
+          detail: { source_tab: p.sourceTab, first_seen: true, code_path: "relay-snapshot/upsert" },
+        });
+      }
+      if (prev) {
+        await recordIncomeStatusChange(sb, {
+          trip_id: p.tripId,
+          from_status: prev.status,
+          to_status: p.nextStatus != null ? String(p.nextStatus) : null,
+          reason: p.cancelled ? "upsert_cancelled" : "upsert_status",
+          code_path: "relay-snapshot/upsert.ts",
+          from_section: prev.section,
+          to_section: p.section,
         });
       }
     }),

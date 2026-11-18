@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "test:money": "node scripts/money-income-guard.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.119.0",

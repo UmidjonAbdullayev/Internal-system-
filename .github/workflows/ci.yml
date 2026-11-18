@@ -23,6 +23,9 @@ jobs:
       - name: Typecheck + build
         run: npm run build
 
+      - name: Money income guard (TONU + W46 MAIN fixture)
+        run: npm run test:money
+
       - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
 

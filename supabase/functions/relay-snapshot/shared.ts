@@ -112,6 +112,65 @@ export async function recordTripEvent(
     .then(() => null, () => null);
 }
 
+/** Status blob that can flip money_bucket (COMPLETED / TONU / cancel+payout). */
+export function incomeStatusSignal(
+  status: unknown,
+  executionStatus?: unknown,
+  payout?: unknown,
+): string {
+  const st = String(status || "").toUpperCase();
+  const ex = String(executionStatus || "").toUpperCase();
+  const paid = Number(payout) || 0;
+  if (st.includes("TONU") || ex.includes("TONU")) return "tonu";
+  if (paid > 0 && (st.includes("CANCEL") || ex.includes("CANCEL"))) return "tonu_cancel_payout";
+  if (st === "COMPLETED" || st.includes("COMPLET") || ex.includes("COMPLET")) return "completed";
+  if (st.includes("CANCEL") || ex.includes("CANCEL")) return "cancelled_zero";
+  if (st === "REMOVED_FROM_RELAY") return "removed_from_relay";
+  return st || "unknown";
+}
+
+/**
+ * Guardrail: any sync/cleanup that changes income-relevant status must write trip_events.
+ * Call whenever status (or cancel/payout signal) changes.
+ */
+export async function recordIncomeStatusChange(
+  sb: SupabaseClient,
+  opts: {
+    trip_id: string;
+    from_status: string | null | undefined;
+    to_status: string | null | undefined;
+    from_execution?: string | null;
+    to_execution?: string | null;
+    payout?: number | null;
+    reason: string;
+    code_path: string;
+    from_section?: string | null;
+    to_section?: string | null;
+  },
+) {
+  const fromSig = incomeStatusSignal(opts.from_status, opts.from_execution, opts.payout);
+  const toSig = incomeStatusSignal(opts.to_status, opts.to_execution, opts.payout);
+  const statusChanged = String(opts.from_status || "") !== String(opts.to_status || "");
+  if (!statusChanged && fromSig === toSig) return;
+  await recordTripEvent(sb, {
+    trip_id: opts.trip_id,
+    event_type: "income_status_change",
+    from_section: opts.from_section ?? null,
+    to_section: opts.to_section ?? null,
+    from_status: opts.from_status ?? null,
+    to_status: opts.to_status ?? null,
+    detail: {
+      reason: opts.reason,
+      code_path: opts.code_path,
+      from_signal: fromSig,
+      to_signal: toSig,
+      from_execution: opts.from_execution ?? null,
+      to_execution: opts.to_execution ?? null,
+      payout: opts.payout ?? null,
+    },
+  });
+}
+
 export function sanitizeDriverName(raw: unknown): string | null {
   if (raw == null) return null;
   const firstLine = String(raw).split(/\n/)[0].replace(/\s+/g, " ").trim();
