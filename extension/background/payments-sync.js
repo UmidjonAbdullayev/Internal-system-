@@ -117,7 +117,9 @@ export async function ingestSettlementsPayload(data, { source = 'passive' } = {}
     : Array.isArray(data)
       ? data
       : [];
-  const mapped = mapSettlementList(list);
+  const mapped = mapSettlementList(list).filter(
+    (inv) => inv?.invoice_id && !String(inv.invoice_id).startsWith('FIXTURE-'),
+  );
   if (!mapped.length) return { invoices: 0 };
 
   const state = await getState();

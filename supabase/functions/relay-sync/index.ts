@@ -1274,6 +1274,8 @@ Deno.serve(async (req: Request) => {
         errors.push("Invoice missing invoice_id");
         continue;
       }
+      // Never persist verification seeds via sync
+      if (invoiceId.startsWith("FIXTURE-")) continue;
       if (
         inv.amazon_week_year == null ||
         inv.amazon_week == null ||
@@ -1369,12 +1371,23 @@ Deno.serve(async (req: Request) => {
       if (sumErr) errors.push(`payments_summary: ${sumErr.message}`);
     }
 
-    // Drop verification seeds once real Relay invoices arrive
-    const realInvoice = invoicesIn.some(
-      (i) => i?.invoice_id && !String(i.invoice_id).startsWith("FIXTURE-"),
-    );
-    if (realInvoice) {
-      await sb.from("invoices").delete().like("invoice_id", "FIXTURE-%");
+    // After first successful live settlements upsert (real AZNG… ids), explicitly
+    // delete all FIXTURE-* rows — upsert cannot replace them (different PKs).
+    if (invoicesUpserted > 0) {
+      const { error: fixTripErr } = await sb
+        .from("invoice_trips")
+        .delete()
+        .like("invoice_id", "FIXTURE-%");
+      if (fixTripErr) {
+        errors.push(`FIXTURE invoice_trips delete: ${fixTripErr.message}`);
+      }
+      const { error: fixInvErr } = await sb
+        .from("invoices")
+        .delete()
+        .like("invoice_id", "FIXTURE-%");
+      if (fixInvErr) {
+        errors.push(`FIXTURE invoices delete: ${fixInvErr.message}`);
+      }
     }
 
     // Mark loads not observed recently as stale (36h)

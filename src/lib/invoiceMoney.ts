@@ -3,6 +3,15 @@
  */
 import { roundMoney } from '@/lib/utils';
 
+/** Verification seeds — never count in reports/totals/CRM money. */
+export function isFixtureInvoiceId(id: string | null | undefined): boolean {
+  return String(id || '').startsWith('FIXTURE-');
+}
+
+export function excludeFixtureInvoices<T extends { invoiceId: string }>(rows: T[]): T[] {
+  return rows.filter((r) => !isFixtureInvoiceId(r.invoiceId));
+}
+
 export interface InvoiceRow {
   invoiceId: string;
   amazonWeekYear: number;
@@ -122,7 +131,7 @@ export function normalizeTourId(raw: string | null | undefined): string {
 
 export function groupInvoicesByWeek(invoices: InvoiceRow[]): WeekInvoiceGroup[] {
   const map = new Map<string, InvoiceRow[]>();
-  for (const inv of invoices) {
+  for (const inv of excludeFixtureInvoices(invoices)) {
     const key = `${inv.amazonWeekYear}#${inv.amazonWeek}`;
     const list = map.get(key) || [];
     list.push(inv);
@@ -178,19 +187,21 @@ export function invoicePaidStatusForTour(
 ): { paidStatus: 'Paid' | 'Pending' | 'Not invoiced yet'; invoiceWeek: string | null } {
   const bare = normalizeTourId(tourId);
   const loads = new Set(loadIds.map((l) => l.toUpperCase()).filter(Boolean));
+  const realInvoices = excludeFixtureInvoices(invoices);
+  const realTrips = excludeFixtureInvoices(invoiceTrips);
   const invIds = new Set<string>();
-  for (const it of invoiceTrips) {
+  for (const it of realTrips) {
     if (it.tourId && normalizeTourId(it.tourId) === bare) invIds.add(it.invoiceId);
     if (it.loadId && loads.has(it.loadId.toUpperCase())) invIds.add(it.invoiceId);
   }
   // Also match invoice arrays directly
-  for (const inv of invoices) {
+  for (const inv of realInvoices) {
     if (inv.tourIds.some((t) => normalizeTourId(t) === bare)) invIds.add(inv.invoiceId);
     if (inv.loadIds.some((l) => loads.has(l.toUpperCase()))) invIds.add(inv.invoiceId);
   }
   if (!invIds.size) return { paidStatus: 'Not invoiced yet', invoiceWeek: null };
 
-  const matched = invoices.filter((i) => invIds.has(i.invoiceId));
+  const matched = realInvoices.filter((i) => invIds.has(i.invoiceId));
   // Prefer MAIN invoice week (largest amount among matched)
   const main = [...matched].sort((a, b) => b.amount - a.amount)[0];
   const statuses = new Set(matched.map((m) => m.status));

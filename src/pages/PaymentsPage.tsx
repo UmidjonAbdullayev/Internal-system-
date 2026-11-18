@@ -31,7 +31,11 @@ import {
   getDriverFullName,
   roundMoney,
 } from '@/lib/utils';
-import { groupInvoicesByWeek, normalizeTourId } from '@/lib/invoiceMoney';
+import {
+  excludeFixtureInvoices,
+  groupInvoicesByWeek,
+  normalizeTourId,
+} from '@/lib/invoiceMoney';
 import { format, subWeeks, parseISO } from 'date-fns';
 import type { Settlement } from '@/types';
 
@@ -89,8 +93,14 @@ export function PaymentsPage() {
     });
   }, []);
 
+  const liveInvoices = useMemo(() => excludeFixtureInvoices(invoices), [invoices]);
+  const liveInvoiceTrips = useMemo(
+    () => excludeFixtureInvoices(invoiceTrips),
+    [invoiceTrips],
+  );
+
   const weekGroups = useMemo(() => {
-    const groups = groupInvoicesByWeek(invoices);
+    const groups = groupInvoicesByWeek(liveInvoices);
     const q = search.toLowerCase().trim();
     if (!q) return groups;
     return groups.filter(
@@ -103,7 +113,7 @@ export function PaymentsPage() {
             String(i.amount).includes(q),
         ),
     );
-  }, [invoices, search]);
+  }, [liveInvoices, search]);
 
   const sortedWeeks = useSort(weekGroups, sortKey, sortDir, {
     week: (g) => g.year * 100 + g.week,
@@ -113,22 +123,22 @@ export function PaymentsPage() {
   });
 
   const invoiceKpis = useMemo(() => {
-    const total = roundMoney(invoices.reduce((s, i) => s + i.amount, 0));
-    const pending = invoices.filter((i) => i.status === 'Pending').length;
-    const paid = invoices.filter((i) => i.status === 'Paid').length;
+    const total = roundMoney(liveInvoices.reduce((s, i) => s + i.amount, 0));
+    const pending = liveInvoices.filter((i) => i.status === 'Pending').length;
+    const paid = liveInvoices.filter((i) => i.status === 'Paid').length;
     return {
       weeks: weekGroups.length,
-      invoices: invoices.length,
+      invoices: liveInvoices.length,
       total,
       pending,
       paid,
       pendingAmt: paymentsSummary?.pendingInvoicePaymentAmt ?? null,
     };
-  }, [invoices, weekGroups.length, paymentsSummary]);
+  }, [liveInvoices, weekGroups.length, paymentsSummary]);
 
   /** Reconciliation helpers vs report_loads-equivalent: relay trip payouts for invoiced tours. */
   const reconcileWeek = (year: number, week: number) => {
-    const weekInvoices = invoices.filter(
+    const weekInvoices = liveInvoices.filter(
       (i) => i.amazonWeekYear === year && i.amazonWeek === week,
     );
     const tourIds = new Set<string>();
@@ -137,7 +147,7 @@ export function PaymentsPage() {
       for (const t of inv.tourIds) tourIds.add(normalizeTourId(t));
       for (const l of inv.loadIds) loadIds.add(l.toUpperCase());
     }
-    for (const it of invoiceTrips) {
+    for (const it of liveInvoiceTrips) {
       if (it.amazonWeekYear !== year || it.amazonWeek !== week) continue;
       if (it.tourId) tourIds.add(normalizeTourId(it.tourId));
       if (it.loadId) loadIds.add(it.loadId.toUpperCase());
@@ -300,7 +310,7 @@ export function PaymentsPage() {
           size="sm"
           onClick={() => setTab('invoices')}
         >
-          Relay invoices ({invoices.length})
+          Relay invoices ({liveInvoices.length})
         </Button>
         <Button
           variant={tab === 'settlements' ? 'primary' : 'outline'}
@@ -360,7 +370,7 @@ export function PaymentsPage() {
             ) : !sortedWeeks.length ? (
               <EmptyState
                 title="No Relay invoices yet"
-                description="Open Amazon Relay Payments while the extension is LIVE — settlements sync every 30 minutes."
+                description="Open Amazon Relay Payments while the extension is LIVE — settlements sync every 30 minutes. FIXTURE seeds never appear here."
               />
             ) : (
               <div className="overflow-x-auto">

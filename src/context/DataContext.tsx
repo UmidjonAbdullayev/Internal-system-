@@ -30,6 +30,7 @@ import type {
 import { computeOrRefreshSettlement, remainingBalance } from '@/lib/calculations';
 import { generateId, getWeekRange } from '@/lib/utils';
 import {
+  excludeFixtureInvoices,
   mapInvoice,
   mapInvoiceTrip,
   mapPaymentsSummary,
@@ -303,8 +304,16 @@ export function DataProvider({ children }: { children: ReactNode }) {
       supabase.from('settlement_loads').select('*'),
       supabase.from('settlement_charges').select('*'),
       supabase.from('payments').select('*').order('payment_date', { ascending: false }),
-      supabase.from('invoices').select('*').order('week_start', { ascending: false }),
-      supabase.from('invoice_trips').select('*'),
+      // FIXTURE-* verification seeds never hydrate into CRM totals/reports
+      supabase
+        .from('invoices')
+        .select('*')
+        .not('invoice_id', 'like', 'FIXTURE-%')
+        .order('week_start', { ascending: false }),
+      supabase
+        .from('invoice_trips')
+        .select('*')
+        .not('invoice_id', 'like', 'FIXTURE-%'),
       supabase.from('payments_summary').select('*').eq('id', 1).maybeSingle(),
       supabase.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(100),
       supabase.from('sync_state').select('*'),
@@ -453,9 +462,15 @@ export function DataProvider({ children }: { children: ReactNode }) {
       (loadReportsRes.data || []).map((r) => mapLoadReport(r as Record<string, unknown>)),
     );
     setPayments(mappedPayments);
-    setInvoices((invoicesRes.data || []).map((r) => mapInvoice(r as Record<string, unknown>)));
+    setInvoices(
+      excludeFixtureInvoices(
+        (invoicesRes.data || []).map((r) => mapInvoice(r as Record<string, unknown>)),
+      ),
+    );
     setInvoiceTrips(
-      (invoiceTripsRes.data || []).map((r) => mapInvoiceTrip(r as Record<string, unknown>)),
+      excludeFixtureInvoices(
+        (invoiceTripsRes.data || []).map((r) => mapInvoiceTrip(r as Record<string, unknown>)),
+      ),
     );
     setPaymentsSummary(
       paymentsSummaryRes.data

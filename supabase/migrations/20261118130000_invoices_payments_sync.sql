@@ -144,6 +144,7 @@ with main_invoices as (
     i.week_end,
     (i.amount)::numeric as invoice_total
   from public.invoices i
+  where i.invoice_id not like 'FIXTURE-%'
   order by i.amazon_week_year, i.amazon_week, i.amount desc nulls last, i.invoice_id
 ),
 tour_links as (
@@ -153,6 +154,7 @@ tour_links as (
   from public.invoice_trips it
   where it.tour_id is not null
     and public.normalize_tour_id(it.tour_id) <> ''
+    and it.invoice_id not like 'FIXTURE-%'
 
   union
 
@@ -165,6 +167,7 @@ tour_links as (
   where it.load_id is not null
     and coalesce(l.archived, false) = false
     and public.normalize_tour_id(l.trip_id) <> ''
+    and it.invoice_id not like 'FIXTURE-%'
 
   union
 
@@ -175,6 +178,7 @@ tour_links as (
   from public.invoice_trips it
   where it.load_id is not null
     and public.normalize_tour_id(it.load_id) <> ''
+    and it.invoice_id not like 'FIXTURE-%'
     and exists (
       select 1
       from public.relay_trips t
@@ -196,4 +200,4 @@ join main_invoices m on m.invoice_id = tl.invoice_id
 where tl.tour_id is not null and tl.tour_id <> '';
 
 comment on view public.money_invoice_tour_weeks is
-  'Tours appearing on the MAIN (largest) invoice of an Amazon week — overrides pickup-date week in report_loads.';
+  'Tours on MAIN invoice week for report_loads. FIXTURE-* seeds are excluded.';
