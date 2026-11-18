@@ -10,7 +10,9 @@ import {
   sumAmazonPaid,
 } from '@/lib/reportLoadMoney';
 
-const AMAZON_INVOICE_WEEK46 = 295626.3;
+/** Real AZNG W46 invoice total (exclude SMOKE/FIXTURE). Acceptance: $295,660.37. */
+const AMAZON_INVOICE_WEEK46 = 295660.37;
+const AMAZON_INVOICE_WEEK45 = 306609.2;
 
 type TwinRow = {
   bare_load: string;
@@ -81,17 +83,22 @@ export function DataChecksPage() {
   }, []);
 
   const week45 = useMemo(() => {
-    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-01', '2026-11-07');
+    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-01', '2026-11-07').filter(
+      (r) => r.amazonPaid > 0,
+    );
     return { count: rows.length, amazon: sumAmazonPaid(rows) };
   }, [reportLoads]);
 
   const week46 = useMemo(() => {
-    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-08', '2026-11-14');
+    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-08', '2026-11-14').filter(
+      (r) => r.amazonPaid > 0,
+    );
     return { count: rows.length, amazon: sumAmazonPaid(rows) };
   }, [reportLoads]);
 
   const twinExtra = twins.reduce((s, t) => s + t.double_counted_extra, 0);
   const stackedTripLevel = stacked.reduce((s, t) => s + t.trip_level_amazon, 0);
+  const invoiceDelta45 = week45.amazon - AMAZON_INVOICE_WEEK45;
   const invoiceDelta = week46.amazon - AMAZON_INVOICE_WEEK46;
 
   return (
@@ -117,43 +124,45 @@ export function DataChecksPage() {
           highlight
         />
         <Metric
-          title="Amazon invoice W46"
-          subtitle="External target"
-          lines={[formatCurrency(AMAZON_INVOICE_WEEK46), `Δ report_loads ${formatCurrency(invoiceDelta)}`]}
+          title="Amazon invoices"
+          subtitle="W45 Paid · W46 Pending"
+          lines={[
+            `W45 ${formatCurrency(AMAZON_INVOICE_WEEK45)}`,
+            `W46 ${formatCurrency(AMAZON_INVOICE_WEEK46)}`,
+          ]}
         />
         <Metric
-          title="Overrides migrated"
-          subtitle="load_overrides from load_reports"
-          lines={[`${loadOverrides.length} tours`, 'legacy tables retained']}
+          title="Overrides"
+          subtitle="manual editable · migrated seed kept"
+          lines={[
+            `${loadOverrides.filter((o) => o.source === 'manual').length} manual`,
+            `${loadOverrides.length} total rows`,
+          ]}
         />
       </div>
 
       <Card className="mb-6">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            Week 46 vs invoice
+            Week 45/46 vs Amazon invoices
             <Badge status={Math.abs(invoiceDelta) < 1 ? 'Paid' : 'On Hold'} />
           </CardTitle>
         </CardHeader>
         <CardContent className="text-sm space-y-2">
           <p>
+            <span className="font-medium">report_loads Week45:</span>{' '}
+            {week45.count} tours · {formatCurrency(week45.amazon)} · Δ{' '}
+            {formatCurrency(invoiceDelta45)} vs {formatCurrency(AMAZON_INVOICE_WEEK45)}
+          </p>
+          <p>
             <span className="font-medium">report_loads Week46:</span>{' '}
-            {week46.count} tours · {formatCurrency(week46.amazon)}
-          </p>
-          <p>
-            <span className="font-medium">Amazon invoice Week46:</span>{' '}
-            {formatCurrency(AMAZON_INVOICE_WEEK46)}
-          </p>
-          <p>
-            <span className="font-medium">Difference:</span> {formatCurrency(invoiceDelta)}{' '}
-            <span className="text-text-secondary">
-              (currently all weeks are pickup-estimated; MAIN invoice override via{' '}
-              <code>money_invoice_tour_weeks</code> when payments agent wires invoice_trips)
-            </span>
+            {week46.count} tours · {formatCurrency(week46.amazon)} · Δ{' '}
+            {formatCurrency(invoiceDelta)} vs {formatCurrency(AMAZON_INVOICE_WEEK46)}
           </p>
           <p className="text-xs text-text-secondary">
-            Week rule: MAIN invoice week wins when present; else pickup Sun–Sat America/Los_Angeles
-            with <code>estimated_week=true</code>.
+            Week rule: MAIN invoice week from <code>money_invoice_tour_weeks</code> (invoice_trips)
+            wins; else pickup Sun–Sat America/Los_Angeles with <code>estimated_week=true</code>.
+            Drivers / Gross Board / Reports share <code>report_loads</code>.
           </p>
         </CardContent>
       </Card>

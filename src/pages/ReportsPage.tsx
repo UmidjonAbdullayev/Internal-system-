@@ -6,11 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Modal } from '@/components/ui/Modal';
 import { Field, Input, Select } from '@/components/ui/Input';
-import {
-  downloadCSV,
-  formatCurrency,
-  formatDate,
-} from '@/lib/utils';
+import { downloadCSV, formatCurrency } from '@/lib/utils';
 import {
   amazonWeekRangeFromAnchor,
   laTodayISO,
@@ -22,19 +18,21 @@ import {
   sumAmazonPaid,
   sumDriverPaid,
   type ReportLoadRow,
+  type ReportSortKey,
 } from '@/lib/reportLoadMoney';
 import { computeRpm, formatSheetDate } from '@/lib/reportRows';
 import { toast } from 'sonner';
 
+/** Excel + screen columns (exact sheet headers). */
 const REPORT_HEADERS = [
   'Broker',
   'Trip',
   'Load',
-  'Driver name',
+  'Driver',
   'Pick up',
   'Delivery',
-  'PU location',
-  'Del location',
+  'PU',
+  'Del',
   'Mile',
   'Amazon Paid',
   'Driver Paid',
@@ -42,6 +40,18 @@ const REPORT_HEADERS = [
   'Comment',
   'Dispatch',
 ] as const;
+
+const SORTABLE: Partial<Record<(typeof REPORT_HEADERS)[number], ReportSortKey>> = {
+  Trip: 'trip',
+  Load: 'load',
+  Driver: 'driver',
+  'Pick up': 'pickup',
+  Delivery: 'delivery',
+  Mile: 'mile',
+  'Amazon Paid': 'amazon',
+  'Driver Paid': 'driverPaid',
+  Dispatch: 'dispatch',
+};
 
 type EditForm = {
   tourId: string;
@@ -53,14 +63,27 @@ type EditForm = {
   mile: string;
 };
 
+function rowToCsv(r: ReportLoadRow): (string | number)[] {
+  return [
+    r.broker,
+    r.tripDisplay,
+    r.loadIds,
+    r.driverName,
+    formatSheetDate(r.pickupDate),
+    formatSheetDate(r.deliveryDate),
+    r.puLocation,
+    r.delLocation,
+    r.mile,
+    r.amazonPaid,
+    r.driverPaid,
+    r.rpm || computeRpm(r.amazonPaid, r.mile) || '',
+    r.comment || r.weekLabel,
+    r.dispatch,
+  ];
+}
+
 export function ReportsPage() {
-  const {
-    reportLoads,
-    drivers,
-    refreshData,
-    upsertLoadOverride,
-    dataReady,
-  } = useData();
+  const { reportLoads, drivers, refreshData, upsertLoadOverride, dataReady } = useData();
 
   const today = laTodayISO();
   const [weekAnchor, setWeekAnchor] = useState(today);
@@ -69,6 +92,8 @@ export function ReportsPage() {
   const [editOpen, setEditOpen] = useState(false);
   const [form, setForm] = useState<EditForm | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [sortKey, setSortKey] = useState<ReportSortKey>('week');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
 
   const dispatchOptions = useMemo(() => {
     const set = new Set<string>(['Khalid', 'David', 'Connor']);
@@ -78,17 +103,32 @@ export function ReportsPage() {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [reportLoads]);
 
-  const rowsInRange = useMemo(
-    () => filterReportLoadsByWeek(reportLoads, week.start, week.end),
-    [reportLoads, week.end, week.start],
-  );
+  const rowsInRange = useMemo(() => {
+    // One row per tour; drop $0 payout rows (legacy leg noise).
+    return filterReportLoadsByWeek(reportLoads, week.start, week.end).filter(
+      (r) => r.amazonPaid > 0,
+    );
+  }, [reportLoads, week.end, week.start]);
 
-  const groups = useMemo(() => groupReportLoadsByWeekLabel(rowsInRange), [rowsInRange]);
+  const groups = useMemo(
+    () => groupReportLoadsByWeekLabel(rowsInRange, sortKey, sortDir),
+    [rowsInRange, sortDir, sortKey],
+  );
 
   const amazonTotal = sumAmazonPaid(rowsInRange);
   const driverTotal = sumDriverPaid(rowsInRange);
   const estimatedCount = rowsInRange.filter((r) => r.estimatedWeek).length;
   const invoiceWeekCount = rowsInRange.length - estimatedCount;
+  const paidCount = rowsInRange.filter((r) => /paid/i.test(r.paidStatus)).length;
+  const pendingCount = rowsInRange.filter((r) => /pend/i.test(r.paidStatus)).length;
+
+  const toggleSort = (key: ReportSortKey) => {
+    if (sortKey === key) setSortDir((d) => (d === 'desc' ? 'asc' : 'desc'));
+    else {
+      setSortKey(key);
+      setSortDir(key === 'week' || key === 'pickup' || key === 'delivery' ? 'desc' : 'asc');
+    }
+  };
 
   const openEdit = (r: ReportLoadRow) => {
     setForm({
@@ -119,22 +159,7 @@ export function ReportsPage() {
     downloadCSV(
       `reports-${week.label}-${week.start}.csv`,
       [...REPORT_HEADERS],
-      rowsInRange.map((r) => [
-        r.broker,
-        r.tripDisplay,
-        r.loadIds,
-        r.driverName,
-        formatSheetDate(r.pickupDate),
-        formatSheetDate(r.deliveryDate),
-        r.puLocation,
-        r.delLocation,
-        r.mile,
-        r.amazonPaid,
-        r.driverPaid,
-        r.rpm,
-        r.comment || r.weekLabel,
-        r.dispatch,
-      ]),
+      rowsInRange.map(rowToCsv),
     );
   };
 
@@ -152,7 +177,7 @@ export function ReportsPage() {
     <div>
       <PageHeader
         title="Reports"
-        subtitle={`Ops sheet · ${week.label} · ${week.start} → ${week.end} (Sun–Sat LA) · MAIN invoice week when available, else estimated from pickup`}
+        subtitle={`${week.header} · Sun–Sat LA · invoice week when linked, else estimated pickup · one row per tour`}
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={refreshing}>
@@ -175,7 +200,7 @@ export function ReportsPage() {
           Prev week
         </Button>
         <span className="rounded-lg border border-border bg-white px-3 py-1.5 text-sm font-medium tabular-nums">
-          {week.label}: {formatDate(week.start, 'MMM d')} – {formatDate(week.end, 'MMM d, yyyy')}
+          {week.header}
         </span>
         <Button
           variant="outline"
@@ -188,17 +213,25 @@ export function ReportsPage() {
         <Button variant="outline" size="sm" type="button" onClick={() => setWeekAnchor(today)}>
           This week
         </Button>
-        <span className="text-xs text-text-secondary ml-2">
-          {drivers.length} drivers · filter = tour start LA only (not pickup OR delivery)
+        <span className="ml-2 text-xs text-text-secondary">
+          {drivers.length} drivers · legacy load_reports sync disabled
         </span>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-6">
         <Stat label="Tours" value={String(rowsInRange.length)} />
         <Stat label="Amazon Paid" value={formatCurrency(amazonTotal)} />
         <Stat label="Driver Paid" value={formatCurrency(driverTotal)} />
         <Stat label="Invoice week" value={String(invoiceWeekCount)} />
-        <Stat label="Estimated week" value={String(estimatedCount)} />
+        <Stat label="Estimated" value={String(estimatedCount)} />
+        <Stat
+          label="Paid status"
+          value={
+            paidCount || pendingCount
+              ? `${paidCount} Paid · ${pendingCount} Pending`
+              : '—'
+          }
+        />
       </div>
 
       {!dataReady ? (
@@ -206,23 +239,43 @@ export function ReportsPage() {
       ) : rowsInRange.length === 0 ? (
         <EmptyState
           title="No tours this Amazon week"
-          description="One row per Relay tour. Week = first pickup (tour start) in America/Los_Angeles, Sunday–Saturday."
+          description="One row per Relay tour. Week = MAIN invoice week when linked; else first pickup Sun–Sat America/Los_Angeles."
         />
       ) : (
         <div className="overflow-hidden rounded-xl border border-border bg-white">
           <div className="overflow-x-auto">
-            <table className="w-full text-sm min-w-[1100px]">
+            <table className="w-full min-w-[1100px] text-sm">
               <thead>
                 <tr className="border-b border-border bg-bg/80">
-                  {REPORT_HEADERS.map((h) => (
-                    <th
-                      key={h}
-                      className="px-2 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-text-secondary whitespace-nowrap"
-                    >
-                      {h}
-                    </th>
-                  ))}
-                  <th className="px-2 py-2 text-[10px] font-semibold uppercase text-text-secondary">Edit</th>
+                  {REPORT_HEADERS.map((h) => {
+                    const key = SORTABLE[h];
+                    const active = key && sortKey === key;
+                    return (
+                      <th
+                        key={h}
+                        className="whitespace-nowrap px-2 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-text-secondary"
+                      >
+                        {key ? (
+                          <button
+                            type="button"
+                            className={`inline-flex items-center gap-1 hover:text-text ${active ? 'text-text' : ''}`}
+                            onClick={() => toggleSort(key)}
+                          >
+                            {h}
+                            {active ? (sortDir === 'desc' ? ' ↓' : ' ↑') : ''}
+                          </button>
+                        ) : (
+                          h
+                        )}
+                      </th>
+                    );
+                  })}
+                  <th className="px-2 py-2 text-[10px] font-semibold uppercase text-text-secondary">
+                    Paid
+                  </th>
+                  <th className="px-2 py-2 text-[10px] font-semibold uppercase text-text-secondary">
+                    Edit
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -238,23 +291,23 @@ export function ReportsPage() {
       <Modal
         open={editOpen && !!form}
         onClose={() => setEditOpen(false)}
-        title={form ? `Override ${form.tripDisplay}` : 'Override'}
+        title={form ? `Manual override ${form.tripDisplay}` : 'Manual override'}
         footer={
           <>
             <Button variant="outline" onClick={() => setEditOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={() => void saveEdit()}>Save override</Button>
+            <Button onClick={() => void saveEdit()}>Save manual</Button>
           </>
         }
       >
         {form && (
           <div className="space-y-3">
             <p className="text-xs text-text-secondary">
-              Amazon $, PU/Del, and dates come live from Relay. Only driver name / paid / comment /
-              dispatch / mile are stored in load_overrides.
+              Saves to load_overrides with source=manual only. Amazon $, PU/Del, and dates stay live
+              from Relay. Migrated seed rows are not editable overrides.
             </p>
-            <Field label="Driver name">
+            <Field label="Driver">
               <Input
                 value={form.driverName}
                 onChange={(e) => setForm({ ...form, driverName: e.target.value })}
@@ -321,36 +374,39 @@ function GroupRows({
   return (
     <>
       <tr className="bg-sky-50/80">
-        <td colSpan={15} className="px-3 py-1.5 text-xs font-bold text-sky-800">
+        <td colSpan={16} className="px-3 py-1.5 text-xs font-bold text-sky-800">
           {week} · {rows.length} tours · Amazon {formatCurrency(sumAmazonPaid(rows))}
+          {rows[0]?.weekStart && rows[0]?.weekEnd
+            ? ` · ${rows[0].weekStart} → ${rows[0].weekEnd}`
+            : ''}
         </td>
       </tr>
       {rows.map((r) => (
-        <tr key={r.tourId} className="border-b border-border/60 table-row-hover">
-          <td className="px-2 py-1.5 whitespace-nowrap">{r.broker}</td>
-          <td className="px-2 py-1.5 font-medium text-primary whitespace-nowrap">{r.tripDisplay}</td>
-          <td className="px-2 py-1.5 text-xs tabular-nums max-w-[140px] truncate" title={r.loadIds}>
+        <tr key={r.tourId} className="table-row-hover border-b border-border/60">
+          <td className="whitespace-nowrap px-2 py-1.5">{r.broker}</td>
+          <td className="whitespace-nowrap px-2 py-1.5 font-medium text-primary">{r.tripDisplay}</td>
+          <td className="max-w-[140px] truncate px-2 py-1.5 text-xs tabular-nums" title={r.loadIds}>
             {r.loadIds}
           </td>
-          <td className="px-2 py-1.5 whitespace-nowrap">{r.driverName || '—'}</td>
-          <td className="px-2 py-1.5 text-xs whitespace-nowrap">{formatSheetDate(r.pickupDate)}</td>
-          <td className="px-2 py-1.5 text-xs whitespace-nowrap">{formatSheetDate(r.deliveryDate)}</td>
-          <td className="px-2 py-1.5 text-xs max-w-[120px] truncate" title={r.puLocation}>
+          <td className="whitespace-nowrap px-2 py-1.5">{r.driverName || '—'}</td>
+          <td className="whitespace-nowrap px-2 py-1.5 text-xs">{formatSheetDate(r.pickupDate)}</td>
+          <td className="whitespace-nowrap px-2 py-1.5 text-xs">{formatSheetDate(r.deliveryDate)}</td>
+          <td className="max-w-[120px] truncate px-2 py-1.5 text-xs" title={r.puLocation}>
             {r.puLocation || '—'}
           </td>
-          <td className="px-2 py-1.5 text-xs max-w-[120px] truncate" title={r.delLocation}>
+          <td className="max-w-[120px] truncate px-2 py-1.5 text-xs" title={r.delLocation}>
             {r.delLocation || '—'}
           </td>
           <td className="px-2 py-1.5 text-xs tabular-nums">{r.mile || '—'}</td>
-          <td className="px-2 py-1.5 text-right tabular-nums font-medium">
+          <td className="px-2 py-1.5 text-right font-medium tabular-nums">
             {formatCurrency(r.amazonPaid)}
           </td>
           <td className="px-2 py-1.5 text-right tabular-nums">{formatCurrency(r.driverPaid)}</td>
-          <td className="px-2 py-1.5 text-right tabular-nums text-xs">
+          <td className="px-2 py-1.5 text-right text-xs tabular-nums">
             {r.rpm || computeRpm(r.amazonPaid, r.mile) || '—'}
           </td>
           <td
-            className="px-2 py-1.5 text-xs max-w-[140px] truncate"
+            className="max-w-[140px] truncate px-2 py-1.5 text-xs"
             title={
               r.estimatedWeek
                 ? `Estimated week from pickup (${r.weekLabel})`
@@ -369,9 +425,32 @@ function GroupRows({
             )}
           </td>
           <td className="px-2 py-1.5 text-xs">{r.dispatch || '—'}</td>
+          <td className="whitespace-nowrap px-2 py-1.5 text-xs">
+            {r.paidStatus ? (
+              <span
+                className={
+                  /paid/i.test(r.paidStatus)
+                    ? 'rounded bg-emerald-100 px-1.5 py-0.5 font-semibold text-emerald-800'
+                    : 'rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-800'
+                }
+              >
+                {r.paidStatus}
+              </span>
+            ) : (
+              '—'
+            )}
+          </td>
           <td className="px-2 py-1.5">
-            <Button variant="ghost" size="sm" type="button" onClick={() => onEdit(r)}>
-              <Pencil className="h-3.5 w-3.5" />
+            <Button
+              variant="ghost"
+              size="sm"
+              type="button"
+              title={r.hasOverride ? 'Edit manual override' : 'Add manual override'}
+              onClick={() => onEdit(r)}
+            >
+              <Pencil
+                className={`h-3.5 w-3.5 ${r.hasOverride ? 'text-primary' : 'text-text-secondary'}`}
+              />
             </Button>
           </td>
         </tr>

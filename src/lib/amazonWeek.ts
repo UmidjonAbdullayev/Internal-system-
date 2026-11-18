@@ -55,7 +55,29 @@ export function amazonWeekLabel(ymd: string): string {
   return `Week${String(amazonWeekNumber(ymd)).padStart(2, '0')}`;
 }
 
-export function amazonWeekRangeFromAnchor(ymd: string): { start: string; end: string; week: number; year: number; label: string } {
+/** Header chip: "Week 47 · Nov 15–21" (America/Los_Angeles Sun–Sat). */
+export function amazonWeekHeaderLabel(ymd: string): string {
+  const start = amazonWeekStart(ymd);
+  const end = amazonWeekEnd(ymd);
+  const week = amazonWeekNumber(ymd);
+  const startLbl = format(parseISO(start + 'T12:00:00'), 'MMM d');
+  const endLbl = format(parseISO(end + 'T12:00:00'), 'd');
+  // Same month → "Nov 15–21"; cross-month → "Nov 30–Dec 6"
+  const endFull =
+    format(parseISO(start + 'T12:00:00'), 'MMM') === format(parseISO(end + 'T12:00:00'), 'MMM')
+      ? endLbl
+      : format(parseISO(end + 'T12:00:00'), 'MMM d');
+  return `Week ${week} · ${startLbl}–${endFull}`;
+}
+
+export function amazonWeekRangeFromAnchor(ymd: string): {
+  start: string;
+  end: string;
+  week: number;
+  year: number;
+  label: string;
+  header: string;
+} {
   const start = amazonWeekStart(ymd);
   const end = amazonWeekEnd(ymd);
   return {
@@ -64,6 +86,7 @@ export function amazonWeekRangeFromAnchor(ymd: string): { start: string; end: st
     week: amazonWeekNumber(ymd),
     year: amazonWeekYear(ymd),
     label: amazonWeekLabel(ymd),
+    header: amazonWeekHeaderLabel(ymd),
   };
 }
 

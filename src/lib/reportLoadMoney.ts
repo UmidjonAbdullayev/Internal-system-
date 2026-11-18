@@ -32,6 +32,8 @@ export interface ReportLoadRow {
   /** 'invoice_main' | 'pickup_estimate' */
   weekSource: 'invoice_main' | 'pickup_estimate' | string;
   invoiceId: string | null;
+  /** Paid / Pending from MAIN invoice when week_source=invoice_main. */
+  paidStatus: string;
   mile: string;
   amazonPaid: number;
   driverPaid: number;
@@ -43,7 +45,9 @@ export interface ReportLoadRow {
   executionStatus: string | null;
   lastSeenAt: string | null;
   updatedAt: string | null;
+  /** True only when load_overrides.source = 'manual'. */
   hasOverride: boolean;
+  overrideSource: string;
 }
 
 export interface LoadOverrideRow {
@@ -91,6 +95,7 @@ export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
     estimatedWeek: row.estimated_week == null ? true : Boolean(row.estimated_week),
     weekSource: str(row.week_source) || 'pickup_estimate',
     invoiceId: strOrNull(row.invoice_id),
+    paidStatus: str(row.paid_status),
     mile: str(row.mile),
     amazonPaid: num(row.amazon_paid),
     driverPaid: num(row.driver_paid),
@@ -103,6 +108,7 @@ export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
     lastSeenAt: strOrNull(row.last_seen_at),
     updatedAt: strOrNull(row.updated_at),
     hasOverride: Boolean(row.has_override),
+    overrideSource: str(row.override_source),
   };
 }
 
@@ -154,7 +160,12 @@ export function filterReportLoadsByWeek(
   weekStart: string,
   weekEnd: string,
 ): ReportLoadRow[] {
-  return rows.filter((r) => inAmazonWeek(r.tourStartLa, weekStart, weekEnd));
+  // Prefer assigned week_start (MAIN invoice week, else pickup estimate).
+  // Fall back to tour_start_la for rows missing week_start.
+  return rows.filter((r) => {
+    const key = r.weekStart || r.tourStartLa;
+    return inAmazonWeek(key, weekStart, weekEnd);
+  });
 }
 
 export function sumAmazonPaid(rows: ReportLoadRow[]): number {
@@ -238,21 +249,95 @@ function parseISONoon(ymd: string): Date {
   return new Date(`${ymd}T12:00:00`);
 }
 
-export function groupReportLoadsByWeekLabel(
+export type ReportSortKey =
+  | 'week'
+  | 'pickup'
+  | 'delivery'
+  | 'trip'
+  | 'load'
+  | 'driver'
+  | 'amazon'
+  | 'driverPaid'
+  | 'mile'
+  | 'dispatch';
+
+/** Newest first by default: week_start desc, pickup desc. */
+export function sortReportLoads(
   rows: ReportLoadRow[],
-): { week: string; rows: ReportLoadRow[] }[] {
-  const sorted = [...rows].sort((a, b) => {
-    const ad = a.tourStartLa || a.pickupDate || '';
-    const bd = b.tourStartLa || b.pickupDate || '';
-    if (ad !== bd) return ad.localeCompare(bd);
+  key: ReportSortKey = 'week',
+  dir: 'asc' | 'desc' = 'desc',
+): ReportLoadRow[] {
+  const mul = dir === 'asc' ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const cmp = (av: string | number, bv: string | number) => {
+      if (av < bv) return -1 * mul;
+      if (av > bv) return 1 * mul;
+      return 0;
+    };
+    let primary = 0;
+    switch (key) {
+      case 'week':
+        primary = cmp(a.weekStart || '', b.weekStart || '');
+        if (primary === 0) primary = cmp(a.pickupDate || a.tourStartLa || '', b.pickupDate || b.tourStartLa || '');
+        break;
+      case 'pickup':
+        primary = cmp(a.pickupDate || a.tourStartLa || '', b.pickupDate || b.tourStartLa || '');
+        break;
+      case 'delivery':
+        primary = cmp(a.deliveryDate || '', b.deliveryDate || '');
+        break;
+      case 'trip':
+        primary = cmp(a.tripDisplay, b.tripDisplay);
+        break;
+      case 'load':
+        primary = cmp(a.loadIds, b.loadIds);
+        break;
+      case 'driver':
+        primary = cmp(a.driverName, b.driverName);
+        break;
+      case 'amazon':
+        primary = cmp(a.amazonPaid, b.amazonPaid);
+        break;
+      case 'driverPaid':
+        primary = cmp(a.driverPaid, b.driverPaid);
+        break;
+      case 'mile':
+        primary = cmp(a.mile, b.mile);
+        break;
+      case 'dispatch':
+        primary = cmp(a.dispatch, b.dispatch);
+        break;
+      default:
+        primary = 0;
+    }
+    if (primary !== 0) return primary;
+    // Stable newest-first tiebreak
+    const tie = (b.pickupDate || b.tourStartLa || '').localeCompare(a.pickupDate || a.tourStartLa || '');
+    if (tie !== 0) return tie;
     return a.tourId.localeCompare(b.tourId);
   });
+}
+
+export function groupReportLoadsByWeekLabel(
+  rows: ReportLoadRow[],
+  sortKey: ReportSortKey = 'week',
+  sortDir: 'asc' | 'desc' = 'desc',
+): { week: string; rows: ReportLoadRow[] }[] {
+  const sorted = sortReportLoads(rows, sortKey, sortDir);
   const groups: { week: string; rows: ReportLoadRow[] }[] = [];
   for (const row of sorted) {
     const week = row.weekLabel || 'Week??';
     const last = groups[groups.length - 1];
     if (last && last.week.toLowerCase() === week.toLowerCase()) last.rows.push(row);
     else groups.push({ week, rows: [row] });
+  }
+  // When sorting by week desc, groups should appear newest-first
+  if (sortKey === 'week' && sortDir === 'desc') {
+    return groups.sort((a, b) => {
+      const aw = a.rows[0]?.weekStart || '';
+      const bw = b.rows[0]?.weekStart || '';
+      return bw.localeCompare(aw);
+    });
   }
   return groups;
 }
