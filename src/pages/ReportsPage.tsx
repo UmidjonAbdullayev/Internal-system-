@@ -87,6 +87,8 @@ export function ReportsPage() {
 
   const amazonTotal = sumAmazonPaid(rowsInRange);
   const driverTotal = sumDriverPaid(rowsInRange);
+  const estimatedCount = rowsInRange.filter((r) => r.estimatedWeek).length;
+  const invoiceWeekCount = rowsInRange.length - estimatedCount;
 
   const openEdit = (r: ReportLoadRow) => {
     setForm({
@@ -150,7 +152,7 @@ export function ReportsPage() {
     <div>
       <PageHeader
         title="Reports"
-        subtitle={`Ops sheet · ${week.label} · ${week.start} → ${week.end} (Sun–Sat, America/Los_Angeles) · first pickup`}
+        subtitle={`Ops sheet · ${week.label} · ${week.start} → ${week.end} (Sun–Sat LA) · MAIN invoice week when available, else estimated from pickup`}
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={refreshing}>
@@ -191,11 +193,12 @@ export function ReportsPage() {
         </span>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-5">
         <Stat label="Tours" value={String(rowsInRange.length)} />
         <Stat label="Amazon Paid" value={formatCurrency(amazonTotal)} />
         <Stat label="Driver Paid" value={formatCurrency(driverTotal)} />
-        <Stat label="Source" value="report_loads" />
+        <Stat label="Invoice week" value={String(invoiceWeekCount)} />
+        <Stat label="Estimated week" value={String(estimatedCount)} />
       </div>
 
       {!dataReady ? (
@@ -346,8 +349,24 @@ function GroupRows({
           <td className="px-2 py-1.5 text-right tabular-nums text-xs">
             {r.rpm || computeRpm(r.amazonPaid, r.mile) || '—'}
           </td>
-          <td className="px-2 py-1.5 text-xs max-w-[100px] truncate" title={r.comment || r.weekLabel}>
+          <td
+            className="px-2 py-1.5 text-xs max-w-[140px] truncate"
+            title={
+              r.estimatedWeek
+                ? `Estimated week from pickup (${r.weekLabel})`
+                : `Invoice week ${r.weekLabel}${r.invoiceId ? ` · ${r.invoiceId}` : ''}`
+            }
+          >
             {r.comment || r.weekLabel}
+            {r.estimatedWeek ? (
+              <span className="ml-1 rounded bg-amber-100 px-1 py-0.5 text-[10px] font-semibold text-amber-800">
+                est
+              </span>
+            ) : (
+              <span className="ml-1 rounded bg-emerald-100 px-1 py-0.5 text-[10px] font-semibold text-emerald-800">
+                inv
+              </span>
+            )}
           </td>
           <td className="px-2 py-1.5 text-xs">{r.dispatch || '—'}</td>
           <td className="px-2 py-1.5">

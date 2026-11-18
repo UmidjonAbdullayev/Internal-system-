@@ -147,8 +147,13 @@ export function DataChecksPage() {
           <p>
             <span className="font-medium">Difference:</span> {formatCurrency(invoiceDelta)}{' '}
             <span className="text-text-secondary">
-              (missing Relay sync coverage and/or tours outside first-pickup LA window)
+              (currently all weeks are pickup-estimated; MAIN invoice override via{' '}
+              <code>money_invoice_tour_weeks</code> when payments agent wires invoice_trips)
             </span>
+          </p>
+          <p className="text-xs text-text-secondary">
+            Week rule: MAIN invoice week wins when present; else pickup Sun–Sat America/Los_Angeles
+            with <code>estimated_week=true</code>.
           </p>
         </CardContent>
       </Card>

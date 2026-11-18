@@ -27,6 +27,11 @@ export interface ReportLoadRow {
   amazonWeek: number | null;
   amazonWeekYear: number | null;
   weekLabel: string;
+  /** True when week comes from pickup-date estimate (not MAIN invoice). */
+  estimatedWeek: boolean;
+  /** 'invoice_main' | 'pickup_estimate' */
+  weekSource: 'invoice_main' | 'pickup_estimate' | string;
+  invoiceId: string | null;
   mile: string;
   amazonPaid: number;
   driverPaid: number;
@@ -83,6 +88,9 @@ export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
     amazonWeek: row.amazon_week == null ? null : num(row.amazon_week),
     amazonWeekYear: row.amazon_week_year == null ? null : num(row.amazon_week_year),
     weekLabel: str(row.week_label),
+    estimatedWeek: row.estimated_week == null ? true : Boolean(row.estimated_week),
+    weekSource: str(row.week_source) || 'pickup_estimate',
+    invoiceId: strOrNull(row.invoice_id),
     mile: str(row.mile),
     amazonPaid: num(row.amazon_paid),
     driverPaid: num(row.driver_paid),
