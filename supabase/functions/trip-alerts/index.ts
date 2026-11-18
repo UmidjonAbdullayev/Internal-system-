@@ -5,6 +5,7 @@ import {
   runCronChecks,
   runDryRunWindow,
   sendAllTestAlerts,
+  sendReplayArrivedAlerts,
   type StatusEvent,
 } from "./alerts.ts";
 import {
@@ -188,6 +189,33 @@ Deno.serve(async (req: Request) => {
         chat_id: chatId,
         kill_switch: isTelegramAlertsEnabled(config),
         note: "TEST samples only; kill switch stays OFF until you enable TELEGRAM_ALERTS_ENABLED",
+      });
+    }
+
+    // Manual TEST REPLAY — one chat only; never resolves real driver_groups.
+    if (action === "replay") {
+      const chatId = String(body.chat_id || "").trim();
+      const stopIds = Array.isArray(body.stop_ids)
+        ? body.stop_ids.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+      if (!chatId) {
+        return json({ success: false, error: "chat_id required for replay" }, 400);
+      }
+      if (!stopIds.length) {
+        return json({ success: false, error: "stop_ids required for replay" }, 400);
+      }
+      const results = await sendReplayArrivedAlerts(sb, botToken, config, settings, {
+        chatId,
+        stopIds,
+      });
+      return json({
+        success: true,
+        replay: true,
+        chat_id: chatId,
+        stop_ids: stopIds,
+        results,
+        kill_switch: isTelegramAlertsEnabled(config),
+        note: "TEST REPLAY ARRIVED only to chat_id; real driver groups untouched",
       });
     }
 
