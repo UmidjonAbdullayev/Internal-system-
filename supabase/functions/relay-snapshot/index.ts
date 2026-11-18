@@ -396,12 +396,28 @@ Deno.serve(async (req: Request) => {
 
             for (const row of stale || []) {
               if (inSnapshot.has(row.trip_id)) continue;
+              // Do not wipe CANCELLED — TONU income needs cancel signal + payout > 0.
+              const { data: staleFull } = await sb
+                .from("relay_trips")
+                .select("status, execution_status, tour_state, payout")
+                .eq("trip_id", row.trip_id)
+                .maybeSingle();
+              const cancelBlob = `${staleFull?.status || ""} ${staleFull?.execution_status || ""} ${staleFull?.tour_state || ""}`.toLowerCase();
+              const keepCancel =
+                /cancel/.test(cancelBlob) ||
+                (Number(staleFull?.payout) > 0 &&
+                  /cancel/.test(String(staleFull?.execution_status || "").toLowerCase()));
+              const nextStatus = keepCancel
+                ? staleFull?.status && /cancel/i.test(String(staleFull.status))
+                  ? staleFull.status
+                  : "CANCELLED"
+                : "removed_from_relay";
               const { error } = await sb
                 .from("relay_trips")
                 .update({
-                  status: "removed_from_relay",
+                  status: nextStatus,
                   section: "HISTORY",
-                  needs_review: true,
+                  needs_review: !keepCancel,
                   updated_at: now,
                 })
                 .eq("trip_id", row.trip_id);
@@ -410,11 +426,12 @@ Deno.serve(async (req: Request) => {
                 snapshotRemoved += 1;
                 await recordTripEvent(sb, {
                   trip_id: row.trip_id,
-                  event_type: "removed_from_relay",
+                  event_type: keepCancel ? "cancelled_to_history" : "removed_from_relay",
                   from_section: section,
                   to_section: "HISTORY",
                   from_status: "moved_awaiting_section",
-                  to_status: "removed_from_relay",
+                  to_status: nextStatus != null ? String(nextStatus) : null,
+                  detail: { source: "stale_soft_remove", preserved_cancel: keepCancel },
                 });
               }
             }
