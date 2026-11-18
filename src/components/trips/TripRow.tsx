@@ -10,8 +10,10 @@ import {
   firstAndLastStop,
   formatLocalStopTime,
   leftBorderClass,
+  isLegCancelled,
   ratePerMile,
   relayTourUrl,
+  tripDisplayPayout,
   tripDriverName,
   tripDurationLabel,
   tripTractorId,
@@ -60,8 +62,9 @@ export function TripRow({
   const stops = allStops(trip);
   const extraStops = Math.max(0, stops.length - 2);
   const rpm = ratePerMile(trip);
-  const pay = trip.payout;
+  const pay = tripDisplayPayout(trip);
   const miles = trip.totalMiles;
+  const cancelledLegCount = trip.legs.filter(isLegCancelled).length;
 
   const tripActivity = useMemo(() => {
     const ids = new Set<string>([trip.tripId, ...trip.legs.map((l) => l.loadId)]);
@@ -120,6 +123,12 @@ export function TripRow({
             {trip.legs.length} leg{trip.legs.length === 1 ? '' : 's'}
             <span className="mx-1 text-border">·</span>
             {stops.length} stop{stops.length === 1 ? '' : 's'}
+            {cancelledLegCount > 0 && (
+              <>
+                <span className="mx-1 text-border">·</span>
+                <span className="text-slate-500">{cancelledLegCount} cancelled</span>
+              </>
+            )}
           </p>
         </div>
 
@@ -205,6 +214,7 @@ export function TripRow({
             <p className="font-mono text-sm font-bold text-primary">{trip.tripId}</p>
             <p className="text-[11px] text-text-secondary">
               {workTypeLabel(trip)} · {trip.legs.length} legs · {stops.length} stops
+              {cancelledLegCount > 0 ? ` · ${cancelledLegCount} cancelled` : ''}
             </p>
           </div>
           <ChevronDown

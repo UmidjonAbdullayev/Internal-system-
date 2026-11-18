@@ -50,7 +50,24 @@ export async function finalizeCatchUp(sb: SupabaseClient) {
   const missing: string[] = Array.isArray(cu.missing_trip_ids) ? cu.missing_trip_ids : [];
   const found: string[] = Array.isArray(cu.found_trip_ids) ? cu.found_trip_ids : [];
   const foundSet = new Set(found.map((id) => String(id).toUpperCase()));
-  const stillMissing = missing.filter((id) => !foundSet.has(String(id).toUpperCase()));
+
+  // Never remove trips Relay still lists on a live tab (IN_TRANSIT / UPCOMING snapshot).
+  const { data: liveSnaps } = await sb
+    .from("relay_section_snapshots")
+    .select("section, trip_ids")
+    .in("section", ["IN_TRANSIT", "UPCOMING"]);
+  const stillOnRelay = new Set<string>();
+  for (const snap of liveSnaps || []) {
+    for (const id of (snap.trip_ids as string[]) || []) {
+      const u = String(id || "").trim().toUpperCase();
+      if (u) stillOnRelay.add(u);
+    }
+  }
+
+  const stillMissing = missing.filter((id) => {
+    const u = String(id).toUpperCase();
+    return !foundSet.has(u) && !stillOnRelay.has(u);
+  });
   const removed: string[] = [];
 
   for (const tripId of stillMissing) {

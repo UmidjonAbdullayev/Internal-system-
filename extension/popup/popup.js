@@ -129,9 +129,13 @@ function render(state) {
       const countCls = mismatch || wrong ? 'mismatch' : 'ok-count';
       const src = meta.label || (meta.source === 'fallback' ? 'fallback' : meta.source || '—');
       const badgeCls = s.lastError || wrong || s.paused ? 'error' : 'collecting';
+      const countLabel =
+        tab === 'HISTORY'
+          ? `Relay: ${relayN} | CRM: ${crmN}`
+          : `Relay active: ${relayN} | CRM: ${crmN}`;
       return `<li><span>${tab}</span><span class="badge ${badgeCls}" title="${escapeAttr(
         title,
-      )}"><span class="${countCls}">Relay: ${relayN} | CRM: ${crmN}</span> · ${when} · ${src}${histExtra}${err}${paused}</span></li>`;
+      )}"><span class="${countCls}">${countLabel}</span> · ${when} · ${src}${histExtra}${err}${paused}</span></li>`;
     })
     .join('');
 

@@ -511,12 +511,14 @@ Deno.serve(async (req: Request) => {
 
       const nextDriver = sanitizeDriverName(trip.driver);
       let nextStatus = trip.status || trip.executionStatus || trip.tourState || null;
-      const cancelBlob = `${nextStatus || ""} ${trip.tourState || ""} ${trip.executionStatus || ""}`.toLowerCase();
+      // Fully cancelled → History only when tourState cancelled OR every load cancelled.
+      // Derived Delivered/status cancel blob alone must not leave a live Relay tab.
       const legs = (trip.legs as { executionStatus?: string; status?: string }[]) || [];
+      const tourCancelled = /cancel/.test(String(trip.tourState || "").toLowerCase());
       const allLegsCancel =
         legs.length > 0 &&
         legs.every((leg) => /cancel/.test(String(leg.executionStatus || leg.status || "").toLowerCase()));
-      const cancelled = /cancel/.test(cancelBlob) || allLegsCancel;
+      const cancelled = tourCancelled || allLegsCancel;
       if (cancelled) {
         section = "HISTORY";
         if (!nextStatus || !/cancel/i.test(String(nextStatus))) nextStatus = "CANCELLED";
