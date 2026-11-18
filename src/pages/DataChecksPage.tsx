@@ -7,7 +7,7 @@ import { formatCurrency } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
 import {
   filterReportLoadsByWeek,
-  sumAmazonPaid,
+  sumWeekIncomeReconciled,
 } from '@/lib/reportLoadMoney';
 
 /** Real AZNG W46 invoice total (exclude SMOKE/FIXTURE). Acceptance: $295,660.37. */
@@ -36,7 +36,7 @@ type StackedRow = {
 };
 
 export function DataChecksPage() {
-  const { reportLoads, loadOverrides, dataReady } = useData();
+  const { reportLoads, loadOverrides, invoices, invoiceTrips, dataReady } = useData();
   const [twins, setTwins] = useState<TwinRow[]>([]);
   const [stacked, setStacked] = useState<StackedRow[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -83,18 +83,30 @@ export function DataChecksPage() {
   }, []);
 
   const week45 = useMemo(() => {
-    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-01', '2026-11-07').filter(
-      (r) => r.amazonPaid > 0,
-    );
-    return { count: rows.length, amazon: sumAmazonPaid(rows) };
-  }, [reportLoads]);
+    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-01', '2026-11-07');
+    const rec = sumWeekIncomeReconciled(rows, invoices, '2026-11-01', '2026-11-07', invoiceTrips);
+    return {
+      count: rows.filter((r) => r.moneyBucket === 'income').length,
+      amazon: rec.total,
+      income: rec.income,
+      adjustments: rec.adjustments,
+      pending: rec.pending,
+      expected: rec.expected,
+    };
+  }, [invoiceTrips, invoices, reportLoads]);
 
   const week46 = useMemo(() => {
-    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-08', '2026-11-14').filter(
-      (r) => r.amazonPaid > 0,
-    );
-    return { count: rows.length, amazon: sumAmazonPaid(rows) };
-  }, [reportLoads]);
+    const rows = filterReportLoadsByWeek(reportLoads, '2026-11-08', '2026-11-14');
+    const rec = sumWeekIncomeReconciled(rows, invoices, '2026-11-08', '2026-11-14', invoiceTrips);
+    return {
+      count: rows.filter((r) => r.moneyBucket === 'income').length,
+      amazon: rec.total,
+      income: rec.income,
+      adjustments: rec.adjustments,
+      pending: rec.pending,
+      expected: rec.expected,
+    };
+  }, [invoiceTrips, invoices, reportLoads]);
 
   const twinExtra = twins.reduce((s, t) => s + t.double_counted_extra, 0);
   const stackedTripLevel = stacked.reduce((s, t) => s + t.trip_level_amazon, 0);
@@ -150,19 +162,25 @@ export function DataChecksPage() {
         </CardHeader>
         <CardContent className="text-sm space-y-2">
           <p>
-            <span className="font-medium">report_loads Week45:</span>{' '}
-            {week45.count} tours · {formatCurrency(week45.amazon)} · Δ{' '}
+            <span className="font-medium">Week45 income+adj:</span>{' '}
+            {week45.count} income tours · {formatCurrency(week45.amazon)} (income{' '}
+            {formatCurrency(week45.income)} + adj {formatCurrency(week45.adjustments)}) · Δ{' '}
             {formatCurrency(invoiceDelta45)} vs {formatCurrency(AMAZON_INVOICE_WEEK45)}
+            {week45.pending > 0 ? ` · pending ${formatCurrency(week45.pending)}` : ''}
+            {week45.expected > 0 ? ` · expected ${formatCurrency(week45.expected)}` : ''}
           </p>
           <p>
-            <span className="font-medium">report_loads Week46:</span>{' '}
-            {week46.count} tours · {formatCurrency(week46.amazon)} · Δ{' '}
+            <span className="font-medium">Week46 income+adj:</span>{' '}
+            {week46.count} income tours · {formatCurrency(week46.amazon)} (income{' '}
+            {formatCurrency(week46.income)} + adj {formatCurrency(week46.adjustments)}) · Δ{' '}
             {formatCurrency(invoiceDelta)} vs {formatCurrency(AMAZON_INVOICE_WEEK46)}
+            {week46.pending > 0 ? ` · pending ${formatCurrency(week46.pending)}` : ''}
+            {week46.expected > 0 ? ` · expected ${formatCurrency(week46.expected)}` : ''}
           </p>
           <p className="text-xs text-text-secondary">
-            Week rule: MAIN invoice week from <code>money_invoice_tour_weeks</code> (invoice_trips)
-            wins; else pickup Sun–Sat America/Los_Angeles with <code>estimated_week=true</code>.
-            Drivers / Gross Board / Reports share <code>report_loads</code>.
+            Income = completed/TONU on MAIN only. Adj invoices shown as lines (do not move trips).
+            Pending invoice / expected excluded from week income. See{' '}
+            <code>docs/week-invoice-reconciliation.md</code>.
           </p>
         </CardContent>
       </Card>
