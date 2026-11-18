@@ -13,4 +13,5 @@ console.log('- Eligible loads: Completed + Delivered only');
 console.log('- Gross by delivery date');
 console.log('- Cancelled/Rejected excluded');
 console.log('- Fee snapshots preserved on finalized settlements');
-console.log('OK — see browser smoke test for live totals.');
+console.log('OK — for invoice acceptance shape checks use: node scripts/smoke-invoices-safe.mjs');
+console.log('Never POST AZNG-SMOKE-* / FIXTURE-* to production.');
