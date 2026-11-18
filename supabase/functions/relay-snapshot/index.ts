@@ -271,47 +271,28 @@ Deno.serve(async (req: Request) => {
                 row.tour_state,
                 legsByTrip.get(row.trip_id) || [],
               );
-              // Exception: fully cancelled trips Relay returns on a live tab → History.
-              if (fullyCancelled) {
-                if (row.section !== "HISTORY" || row.status !== "CANCELLED") {
-                  const { error } = await sb
-                    .from("relay_trips")
-                    .update({
-                      section: "HISTORY",
-                      status: row.status && /cancel/i.test(String(row.status))
-                        ? row.status
-                        : "CANCELLED",
-                      updated_at: now,
-                    })
-                    .eq("trip_id", row.trip_id);
-                  if (error) {
-                    errors.push(`Snapshot cancel ${row.trip_id}: ${error.message}`);
-                  } else if (row.section !== "HISTORY") {
-                    await recordTripEvent(sb, {
-                      trip_id: row.trip_id,
-                      event_type: "cancelled_to_history",
-                      from_section: row.section,
-                      to_section: "HISTORY",
-                      from_status: row.status,
-                      to_status: "CANCELLED",
-                      detail: { source: "snapshot_membership", source_tab: section },
-                    });
-                  }
-                }
-                continue;
-              }
-
+              // Membership = Relay's latest live response — including cancelled tours
+              // still returned on UPCOMING / IN_TRANSIT. CRM UI hides cancelled on
+              // live tabs; do not force History while Relay still lists the ID.
               const needsRestore =
                 row.section !== section ||
                 row.status === "removed_from_relay" ||
                 row.status === "moved_awaiting_section";
               if (!needsRestore) continue;
 
-              const restoredStatus =
+              let restoredStatus: string | null =
                 row.status === "removed_from_relay" ||
                 row.status === "moved_awaiting_section"
                   ? String(row.execution_status || row.tour_state || section)
-                  : row.status;
+                  : row.status != null
+                    ? String(row.status)
+                    : null;
+              if (fullyCancelled) {
+                restoredStatus =
+                  restoredStatus && /cancel/i.test(restoredStatus)
+                    ? restoredStatus
+                    : "CANCELLED";
+              }
               const { error } = await sb
                 .from("relay_trips")
                 .update({
@@ -333,8 +314,12 @@ Deno.serve(async (req: Request) => {
                   from_section: row.section,
                   to_section: section,
                   from_status: row.status,
-                  to_status: restoredStatus != null ? String(restoredStatus) : null,
-                  detail: { source: "snapshot_membership_restore", source_tab: section },
+                  to_status: restoredStatus,
+                  detail: {
+                    source: "snapshot_membership_restore",
+                    source_tab: section,
+                    cancelled: fullyCancelled,
+                  },
                 });
               }
             }

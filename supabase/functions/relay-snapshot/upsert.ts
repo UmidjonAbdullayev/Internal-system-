@@ -2,8 +2,10 @@ import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import {
   isValidRelayId,
   isFullyCancelledTrip,
+  loadLiveTripSections,
   normalizeSection,
   recordTripEvent,
+  resolveTripSection,
   sanitizeDriverName,
 } from "./shared.ts";
 
@@ -41,6 +43,9 @@ export async function upsertTrips(
     cancelled: boolean;
   }> = [];
 
+  // Live snapshot IDs win over HISTORY / catch-up / cancelled→History demotions.
+  const liveSections = await loadLiveTripSections(sb);
+
   for (const trip of tripsIn as Record<string, unknown>[]) {
     const tripId = String(trip?.tripId || "").trim().toUpperCase();
     if (!tripId || !isValidRelayId(tripId)) {
@@ -48,18 +53,20 @@ export async function upsertTrips(
       continue;
     }
     const sourceTab = normalizeSection(trip.tab || trip.section);
-    let section = sourceTab;
-    if (opts.forceHistory || opts.catchUp) section = "HISTORY";
-
     const status = trip.status || trip.executionStatus || trip.tourState || null;
-    // Cancelled → History ONLY if tourState cancelled OR every load cancelled.
-    // Live-tab membership otherwise follows Relay's tab (sourceTab). Derived
-    // Delivered/complete must not leave UPCOMING/IN_TRANSIT while Relay lists it.
+    // Cancelled → History ONLY when Relay no longer lists the trip on a live tab.
+    // Membership = Relay's latest UPCOMING / IN_TRANSIT response (same as #44).
     const cancelled = isFullyCancelledTrip(
       trip.tourState,
       (trip.legs as { executionStatus?: unknown; status?: unknown }[]) || [],
     );
-    if (cancelled) section = "HISTORY";
+    const section = resolveTripSection({
+      sourceTab,
+      cancelled,
+      forceHistory: opts.forceHistory,
+      catchUp: opts.catchUp,
+      liveSection: liveSections.get(tripId) || null,
+    });
     if (!section) {
       errors.push(`Invalid section for trip ${tripId}`);
       continue;
@@ -211,7 +218,10 @@ export async function upsertTrips(
       if (prev && prev.section !== p.section) {
         await recordTripEvent(sb, {
           trip_id: p.tripId,
-          event_type: p.cancelled ? "cancelled_to_history" : "section_change",
+          event_type:
+            p.cancelled && p.section === "HISTORY"
+              ? "cancelled_to_history"
+              : "section_change",
           from_section: prev.section,
           to_section: p.section,
           from_status: prev.status,
