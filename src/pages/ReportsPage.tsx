@@ -13,10 +13,15 @@ import {
   shiftAmazonWeek,
 } from '@/lib/amazonWeek';
 import {
+  adjustmentInvoicesForWeek,
   filterReportLoadsByWeek,
+  filterWeekExpected,
+  filterWeekIncome,
+  filterWeekPendingInvoice,
   groupReportLoadsByWeekLabel,
   sumAmazonPaid,
   sumDriverPaid,
+  sumWeekIncomeReconciled,
   type ReportLoadRow,
   type ReportSortKey,
 } from '@/lib/reportLoadMoney';
@@ -83,7 +88,15 @@ function rowToCsv(r: ReportLoadRow): (string | number)[] {
 }
 
 export function ReportsPage() {
-  const { reportLoads, drivers, refreshData, upsertLoadOverride, dataReady } = useData();
+  const {
+    reportLoads,
+    drivers,
+    invoices,
+    invoiceTrips,
+    refreshData,
+    upsertLoadOverride,
+    dataReady,
+  } = useData();
 
   const today = laTodayISO();
   const [weekAnchor, setWeekAnchor] = useState(today);
@@ -110,17 +123,30 @@ export function ReportsPage() {
     );
   }, [reportLoads, week.end, week.start]);
 
-  const groups = useMemo(
-    () => groupReportLoadsByWeekLabel(rowsInRange, sortKey, sortDir),
-    [rowsInRange, sortDir, sortKey],
+  const incomeRows = useMemo(() => filterWeekIncome(rowsInRange), [rowsInRange]);
+  const expectedRows = useMemo(() => filterWeekExpected(rowsInRange), [rowsInRange]);
+  const pendingRows = useMemo(() => filterWeekPendingInvoice(rowsInRange), [rowsInRange]);
+  const adjInvoices = useMemo(
+    () => adjustmentInvoicesForWeek(invoices, week.start, week.end),
+    [invoices, week.end, week.start],
+  );
+  const reconciled = useMemo(
+    () => sumWeekIncomeReconciled(rowsInRange, invoices, week.start, week.end, invoiceTrips),
+    [invoiceTrips, invoices, rowsInRange, week.end, week.start],
   );
 
-  const amazonTotal = sumAmazonPaid(rowsInRange);
-  const driverTotal = sumDriverPaid(rowsInRange);
-  const estimatedCount = rowsInRange.filter((r) => r.estimatedWeek).length;
-  const invoiceWeekCount = rowsInRange.length - estimatedCount;
-  const paidCount = rowsInRange.filter((r) => /paid/i.test(r.paidStatus)).length;
-  const pendingCount = rowsInRange.filter((r) => /pend/i.test(r.paidStatus)).length;
+  const groups = useMemo(
+    () => groupReportLoadsByWeekLabel(incomeRows, sortKey, sortDir),
+    [incomeRows, sortDir, sortKey],
+  );
+
+  // Week income = SUM of trip payouts only (never invoice amounts).
+  const amazonTotal = reconciled.income;
+  const driverTotal = sumDriverPaid(incomeRows);
+  const estimatedCount = pendingRows.length;
+  const invoiceWeekCount = reconciled.incomeTripCount;
+  const paidCount = incomeRows.filter((r) => /paid/i.test(r.paidStatus)).length;
+  const pendingCount = incomeRows.filter((r) => /pend/i.test(r.paidStatus)).length;
 
   const toggleSort = (key: ReportSortKey) => {
     if (sortKey === key) setSortDir((d) => (d === 'desc' ? 'asc' : 'desc'));
@@ -159,7 +185,7 @@ export function ReportsPage() {
     downloadCSV(
       `reports-${week.label}-${week.start}.csv`,
       [...REPORT_HEADERS],
-      rowsInRange.map(rowToCsv),
+      incomeRows.map(rowToCsv),
     );
   };
 
@@ -177,13 +203,13 @@ export function ReportsPage() {
     <div>
       <PageHeader
         title="Reports"
-        subtitle={`${week.header} · Sun–Sat LA · invoice week when linked, else estimated pickup · one row per tour`}
+        subtitle={`${week.header} · income = Σ trip payouts (completed/TONU on MAIN) · invoices comparison-only · one row per tour`}
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={refreshing}>
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> Refresh
             </Button>
-            <Button variant="outline" size="sm" onClick={exportCSV} disabled={!rowsInRange.length}>
+            <Button variant="outline" size="sm" onClick={exportCSV} disabled={!incomeRows.length}>
               <Download className="h-4 w-4" /> Export
             </Button>
           </>
@@ -219,11 +245,11 @@ export function ReportsPage() {
       </div>
 
       <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-6">
-        <Stat label="Tours" value={String(rowsInRange.length)} />
-        <Stat label="Amazon Paid" value={formatCurrency(amazonTotal)} />
+        <Stat label="Income trips" value={String(invoiceWeekCount)} />
+        <Stat label="Week income (Σ payouts)" value={formatCurrency(amazonTotal)} />
         <Stat label="Driver Paid" value={formatCurrency(driverTotal)} />
-        <Stat label="Invoice week" value={String(invoiceWeekCount)} />
-        <Stat label="Estimated" value={String(estimatedCount)} />
+        <Stat label="Adj invoices (compare)" value={formatCurrency(reconciled.adjustments)} />
+        <Stat label="Pending invoice" value={`${estimatedCount} · ${formatCurrency(reconciled.pending)}`} />
         <Stat
           label="Paid status"
           value={
@@ -234,12 +260,37 @@ export function ReportsPage() {
         />
       </div>
 
+      {(adjInvoices.length > 0 || expectedRows.length > 0 || pendingRows.length > 0) && (
+        <div className="mb-4 rounded-xl border border-border bg-white px-4 py-3 text-sm space-y-1">
+          {adjInvoices.map((inv) => (
+            <p key={inv.invoiceId}>
+              <span className="font-medium">Adj invoice (comparison only)</span>{' '}
+              {inv.invoiceId.slice(0, 12)}… {formatCurrency(inv.amount)} · {inv.status} — not in
+              week income
+            </p>
+          ))}
+          {pendingRows.length > 0 && (
+            <p className="text-text-secondary">
+              Pending invoice (completed/TONU, estimated by final delivery): {pendingRows.length}{' '}
+              tours · {formatCurrency(sumAmazonPaid(pendingRows))} — excluded from week income
+            </p>
+          )}
+          {expectedRows.filter((r) => r.amazonPaid > 0).length > 0 && (
+            <p className="text-text-secondary">
+              Expected (in-transit/upcoming):{' '}
+              {expectedRows.filter((r) => r.amazonPaid > 0).length} tours ·{' '}
+              {formatCurrency(sumAmazonPaid(expectedRows))} — separate from income
+            </p>
+          )}
+        </div>
+      )}
+
       {!dataReady ? (
         <EmptyState title="Loading…" description="Hydrating report_loads" />
-      ) : rowsInRange.length === 0 ? (
+      ) : incomeRows.length === 0 ? (
         <EmptyState
-          title="No tours this Amazon week"
-          description="One row per Relay tour. Week = MAIN invoice week when linked; else first pickup Sun–Sat America/Los_Angeles."
+          title="No income tours this Amazon week"
+          description="Week income = completed/TONU on MAIN invoice. Expected and pending-invoice tours are listed above when present."
         />
       ) : (
         <div className="overflow-hidden rounded-xl border border-border bg-white">

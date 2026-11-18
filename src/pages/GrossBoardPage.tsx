@@ -367,7 +367,7 @@ export function GrossBoardPage() {
         {weeklyRoster.length === 0 ? (
           <EmptyState
             title="No tours in this Amazon week"
-            description="Gross Board uses report_loads (one row per Relay tour), assigned by first pickup in America/Los_Angeles (Sun–Sat)."
+            description="Gross Board uses report_loads income (completed/TONU on MAIN invoice week). Expected and pending-invoice tours are excluded from week gross."
           />
         ) : (
           <div className="overflow-x-auto">

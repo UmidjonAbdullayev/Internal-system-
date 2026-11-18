@@ -1,10 +1,19 @@
 /**
  * Money math for Drivers / Gross Board / Reports — all from report_loads.
  * Do not use getLoadFinalGross / loads.rate_gross for these pages.
+ *
+ * Week income = SUM of trip payouts for COMPLETED/TONU on MAIN only (never invoice $).
+ * Invoices are comparison-only; adjustment lines are shown separately, not added to income.
+ * Expected = in-transit/upcoming/planned. Pending invoice = completed/TONU not yet on MAIN.
+ * Estimated week (no MAIN) = final delivery LA Sun–Sat (week_source=delivery_estimate).
  */
 import type { Driver, GrossAdjustment } from '@/types';
 import { getDriverFullName, roundMoney } from '@/lib/utils';
 import { inAmazonWeek } from '@/lib/amazonWeek';
+import type { InvoiceRow, InvoiceTripRow } from '@/lib/invoiceMoney';
+import { excludeFixtureInvoices, normalizeTourId } from '@/lib/invoiceMoney';
+
+export type MoneyBucket = 'income' | 'expected' | 'pending_invoice';
 
 export interface ReportLoadRow {
   tripUuid: string;
@@ -29,8 +38,8 @@ export interface ReportLoadRow {
   weekLabel: string;
   /** True when week comes from pickup-date estimate (not MAIN invoice). */
   estimatedWeek: boolean;
-  /** 'invoice_main' | 'pickup_estimate' */
-  weekSource: 'invoice_main' | 'pickup_estimate' | string;
+  /** 'invoice_main' | 'delivery_estimate' (legacy: pickup_estimate) */
+  weekSource: 'invoice_main' | 'delivery_estimate' | 'pickup_estimate' | string;
   invoiceId: string | null;
   /** Paid / Pending from MAIN invoice when week_source=invoice_main. */
   paidStatus: string;
@@ -48,6 +57,10 @@ export interface ReportLoadRow {
   /** True only when load_overrides.source = 'manual'. */
   hasOverride: boolean;
   overrideSource: string;
+  /** CANCELLED with payout or explicit TONU marker. */
+  isTonu: boolean;
+  /** income | expected | pending_invoice */
+  moneyBucket: MoneyBucket | string;
 }
 
 export interface LoadOverrideRow {
@@ -93,7 +106,7 @@ export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
     amazonWeekYear: row.amazon_week_year == null ? null : num(row.amazon_week_year),
     weekLabel: str(row.week_label),
     estimatedWeek: row.estimated_week == null ? true : Boolean(row.estimated_week),
-    weekSource: str(row.week_source) || 'pickup_estimate',
+    weekSource: str(row.week_source) || 'delivery_estimate',
     invoiceId: strOrNull(row.invoice_id),
     paidStatus: str(row.paid_status),
     mile: str(row.mile),
@@ -109,6 +122,122 @@ export function mapReportLoad(row: Record<string, unknown>): ReportLoadRow {
     updatedAt: strOrNull(row.updated_at),
     hasOverride: Boolean(row.has_override),
     overrideSource: str(row.override_source),
+    isTonu: Boolean(row.is_tonu),
+    moneyBucket: (str(row.money_bucket) || deriveMoneyBucketFallback(row)) as MoneyBucket,
+  };
+}
+
+/** Client fallback if view columns not yet migrated. */
+function deriveMoneyBucketFallback(row: Record<string, unknown>): MoneyBucket {
+  const status = String(row.status || '').toUpperCase();
+  const exec = String(row.execution_status || '').toUpperCase();
+  const mile = String(row.mile || '').toUpperCase();
+  const paid = Number(row.amazon_paid) || 0;
+  const isTonu =
+    status.includes('TONU') ||
+    exec.includes('TONU') ||
+    mile.includes('TONU') ||
+    (status === 'CANCELLED' && paid > 0);
+  const isIncome = status === 'COMPLETED' || isTonu;
+  if (!isIncome) return 'expected';
+  const weekSource = String(row.week_source || '');
+  return weekSource === 'invoice_main' ? 'income' : 'pending_invoice';
+}
+
+function isEstimatedWeekSource(weekSource: string): boolean {
+  return weekSource !== 'invoice_main';
+}
+
+export function isIncomeStatus(row: ReportLoadRow): boolean {
+  if (row.moneyBucket === 'income' || row.moneyBucket === 'pending_invoice') return true;
+  if (row.isTonu) return true;
+  const status = (row.status || '').toUpperCase();
+  return status === 'COMPLETED' || status.includes('TONU');
+}
+
+export function isWeekIncomeRow(row: ReportLoadRow): boolean {
+  return row.moneyBucket === 'income' || (isIncomeStatus(row) && row.weekSource === 'invoice_main');
+}
+
+export function isExpectedRow(row: ReportLoadRow): boolean {
+  return row.moneyBucket === 'expected' || (!isIncomeStatus(row) && row.moneyBucket !== 'pending_invoice');
+}
+
+export function isPendingInvoiceRow(row: ReportLoadRow): boolean {
+  return (
+    row.moneyBucket === 'pending_invoice' ||
+    (isIncomeStatus(row) && isEstimatedWeekSource(row.weekSource))
+  );
+}
+
+/** Week income rows for Amazon-compare totals (MAIN completed/TONU). */
+export function filterWeekIncome(rows: ReportLoadRow[]): ReportLoadRow[] {
+  return rows.filter(isWeekIncomeRow);
+}
+
+export function filterWeekExpected(rows: ReportLoadRow[]): ReportLoadRow[] {
+  return rows.filter(isExpectedRow);
+}
+
+export function filterWeekPendingInvoice(rows: ReportLoadRow[]): ReportLoadRow[] {
+  return rows.filter(isPendingInvoiceRow);
+}
+
+/** Non-MAIN invoices for a week (adjustment lines). */
+export function adjustmentInvoicesForWeek(
+  invoices: InvoiceRow[],
+  weekStart: string,
+  _weekEnd?: string,
+): InvoiceRow[] {
+  const real = excludeFixtureInvoices(invoices).filter((i) =>
+    /^AZNG[0-9A-F]/i.test(i.invoiceId),
+  );
+  const inWeek = real.filter((i) => i.weekStart === weekStart);
+  if (!inWeek.length) return [];
+  const mainId = [...inWeek].sort(
+    (a, b) => b.amount - a.amount || a.invoiceId.localeCompare(b.invoiceId),
+  )[0]?.invoiceId;
+  return inWeek.filter((i) => i.invoiceId !== mainId);
+}
+
+export function sumAdjustmentInvoices(invoices: InvoiceRow[]): number {
+  return roundMoney(invoices.reduce((s, i) => s + i.amount, 0));
+}
+
+/**
+ * Week income = SUM of trip payouts (completed/TONU on MAIN) only.
+ * `adjustments` = adj invoice amounts for comparison display — NEVER added into income/total.
+ * Invoices are comparison-only.
+ */
+export function sumWeekIncomeReconciled(
+  weekRows: ReportLoadRow[],
+  invoices: InvoiceRow[],
+  weekStart: string,
+  weekEnd: string,
+  _invoiceTrips: InvoiceTripRow[] = [],
+): {
+  income: number;
+  adjustments: number;
+  pending: number;
+  expected: number;
+  /** Same as income — trip payout sum only. */
+  total: number;
+  incomeTripCount: number;
+} {
+  const incomeRows = filterWeekIncome(weekRows);
+  const income = sumAmazonPaid(incomeRows);
+  const pending = sumAmazonPaid(filterWeekPendingInvoice(weekRows));
+  const expected = sumAmazonPaid(filterWeekExpected(weekRows));
+  // Comparison-only: sum of adj invoice amounts for the week (not mixed into income).
+  const adjustments = sumAdjustmentInvoices(adjustmentInvoicesForWeek(invoices, weekStart, weekEnd));
+  void _invoiceTrips;
+  return {
+    income,
+    adjustments,
+    pending,
+    expected,
+    total: income,
+    incomeTripCount: incomeRows.length,
   };
 }
 
@@ -187,7 +316,11 @@ export function reportLoadsForDriver(
   if (!driver) return [];
   const full = normalizePersonName(getDriverFullName(driver.firstName, driver.lastName));
   return rows.filter((r) => {
-    if (weekStart && weekEnd && !inAmazonWeek(r.tourStartLa, weekStart, weekEnd)) return false;
+    // Prefer assigned week (MAIN invoice week, else pickup estimate) — not raw pickup alone.
+    if (weekStart && weekEnd) {
+      const key = r.weekStart || r.tourStartLa;
+      if (!inAmazonWeek(key, weekStart, weekEnd)) return false;
+    }
     const matched = matchDriverToName(drivers, r.driverName);
     if (matched) return matched.id === driverId;
     // fallback: raw name equals
@@ -203,7 +336,7 @@ export function getDriverAmazonGross(
   weekEnd?: string,
   adjustments: GrossAdjustment[] = [],
 ): number {
-  const list = reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd);
+  const list = filterWeekIncome(reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd));
   const gross = sumAmazonPaid(list);
   const adj = adjustments
     .filter(
@@ -222,7 +355,7 @@ export function getFleetAmazonGross(
 ): number {
   const list =
     weekStart && weekEnd ? filterReportLoadsByWeek(rows, weekStart, weekEnd) : rows;
-  return sumAmazonPaid(list);
+  return sumAmazonPaid(filterWeekIncome(list));
 }
 
 /** Mon=0 … Sun=6 daily buckets using tour_start_la (Amazon week Sun–Sat still). */
@@ -234,10 +367,11 @@ export function getDailyAmazonByWeekday(
   weekEnd: string,
 ): number[] {
   const daily = [0, 0, 0, 0, 0, 0, 0];
-  const list = reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd);
+  const list = filterWeekIncome(reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd));
   for (const r of list) {
-    if (!r.tourStartLa) continue;
-    const asLocal = parseISONoon(r.tourStartLa);
+    const dayKey = r.tourStartLa || r.pickupDate;
+    if (!dayKey) continue;
+    const asLocal = parseISONoon(dayKey);
     const day = asLocal.getDay(); // 0=Sun
     const idx = day === 0 ? 6 : day - 1; // Mon=0 … Sun=6 board columns
     daily[idx] += r.amazonPaid;
