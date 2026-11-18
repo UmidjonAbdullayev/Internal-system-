@@ -3,14 +3,15 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import {
   processStatusEvents,
   runCronChecks,
+  runDryRunWindow,
   sendAllTestAlerts,
   type StatusEvent,
 } from "./alerts.ts";
 import {
   chatSourcesPresent,
+  isTelegramAlertsEnabled,
   loadConfig,
   loadSettings,
-  resolveChatId,
 } from "./send.ts";
 
 const corsHeaders = {
@@ -36,7 +37,6 @@ function authOk(req: Request, cronSecret: string): boolean {
   const expected = Deno.env.get("RELAY_EXTENSION_API_KEY");
   const provided = req.headers.get("X-Relay-Extension-Key") || "";
   if (expected && provided && provided === expected) return true;
-  // Service role bearer (internal sync invoke)
   const auth = req.headers.get("Authorization") || "";
   const service = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
   if (service && auth === `Bearer ${service}`) return true;
@@ -77,12 +77,15 @@ Deno.serve(async (req: Request) => {
     if (action === "diagnose") {
       return json({
         success: true,
+        rebuild: "arrived_not_at_stop_only",
         bootstrapped: config.bootstrapped,
-        default_chat_id_set: Boolean(config.default_chat_id),
-        resolved_chat: Boolean(resolveChatId("trip_booked", settings, config)),
+        alerts_enabled_db: config.alerts_enabled,
+        kill_switch: isTelegramAlertsEnabled(config),
         env_chat_sources: chatSourcesPresent(),
-        sync_stale_notified: config.sync_stale_notified,
-        settings_count: settings.size,
+        settings: Object.fromEntries(
+          [...settings.entries()].map(([k, v]) => [k, { enabled: v.enabled }]),
+        ),
+        note: "TELEGRAM_ALERTS_ENABLED stays OFF until user approves step 6",
       });
     }
 
@@ -98,36 +101,42 @@ Deno.serve(async (req: Request) => {
       return json({ success: true, bootstrapped: true });
     }
 
-    if (action === "set_default_chat") {
-      const chatId = String(body.chat_id || "").trim();
-      if (!chatId) return json({ success: false, error: "chat_id required" }, 400);
-      // Only accept chats already known in DB (driver groups or prior history) — never invent
-      const { data: knownGroup } = await sb
-        .from("driver_telegram_groups")
-        .select("telegram_chat_id")
-        .eq("telegram_chat_id", chatId)
-        .maybeSingle();
-      const { data: knownHist } = await sb
-        .from("telegram_notification_history")
-        .select("telegram_chat_id")
-        .eq("telegram_chat_id", chatId)
-        .limit(1)
-        .maybeSingle();
-      if (!knownGroup && !knownHist && chatId !== config.default_chat_id) {
-        // Allow if it matches an env value the server already has (we cannot read values back as "known"
-        // beyond equality with resolve) — still require explicit body from authenticated caller.
-        // Authenticated edge caller + explicit chat_id from /setdispatch in that group is trusted.
+    if (action === "dry_run") {
+      const hours = Number(body.window_hours || url.searchParams.get("window_hours") || 1);
+      // Fresh window only — never accumulate / never seed
+      await sb.from("dry_run_alerts").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      const out = await runDryRunWindow(sb, botToken, config, settings, hours);
+      const { data: preview, count } = await sb
+        .from("dry_run_alerts")
+        .select(
+          "id, trip_id, stop_id, alert_type, chat_id, driver_id, reason, sync_basis, would_send_at, html, meta",
+          { count: "exact" },
+        )
+        .order("would_send_at", { ascending: false })
+        .limit(200);
+      const grouped: Record<string, number> = {};
+      for (const row of preview || []) {
+        const key = `${row.trip_id}|${row.stop_id}|${row.alert_type}|${row.chat_id || "(none)"}`;
+        grouped[key] = (grouped[key] || 0) + 1;
       }
-      await sb
-        .from("telegram_alert_config")
-        .update({ default_chat_id: chatId, updated_at: new Date().toISOString() })
-        .eq("id", 1);
-      return json({ success: true, default_chat_id: chatId });
+      const dupes = Object.entries(grouped).filter(([, n]) => n > 1);
+      return json({
+        success: true,
+        dry_run: true,
+        kill_switch: isTelegramAlertsEnabled(config),
+        window_hours: hours,
+        evaluated: out.count,
+        preview_count: count,
+        unique_keys: Object.keys(grouped).length,
+        duplicate_keys: dupes.length,
+        preview: preview || [],
+        results: out.results,
+        note: "No Telegram messages sent. Table cleared then rebuilt from live 1h window. Never seed prod.",
+      });
     }
 
     if (action === "status") {
       const events = (Array.isArray(body.events) ? body.events : []) as StatusEvent[];
-      // Auto-bootstrap on first status call after install (no spam)
       if (!config.bootstrapped) {
         await sb
           .from("telegram_alert_config")
@@ -144,28 +153,63 @@ Deno.serve(async (req: Request) => {
           note: "First sync after install — baseline only, no status alerts",
         });
       }
-      const results = await processStatusEvents(sb, botToken, { ...config, bootstrapped: true }, settings, events);
-      return json({ success: true, results });
-    }
-
-    if (action === "test") {
-      const chatId = String(body.chat_id || "").trim();
-      const results = await sendAllTestAlerts(sb, botToken, config, settings, {
-        chatIds: chatId ? [chatId] : undefined,
+      // Kill switch OFF: do not accumulate dry_run on every sync (explicit dry_run only)
+      if (!isTelegramAlertsEnabled(config)) {
+        return json({
+          success: true,
+          skipped: true,
+          reason: "kill_switch_off",
+          events_seen: events.length,
+          kill_switch: false,
+          note: "Status edges ignored for send/dry_run while OFF. Use action=dry_run.",
+        });
+      }
+      const results = await processStatusEvents(sb, botToken, config, settings, events, {
+        dryRun: false,
       });
       return json({
         success: true,
         results,
-        resolved_chat: chatId || resolveChatId("trip_booked", settings, config),
-        env_chat_sources: chatSourcesPresent(),
-        kill_switch: chatSourcesPresent().TELEGRAM_ALERTS_ENABLED,
-        note: "TEST bypasses kill switch; leave TELEGRAM_ALERTS_ENABLED OFF until confirmed",
+        kill_switch: true,
+      });
+    }
+
+    if (action === "test") {
+      const chatId = String(body.chat_id || "").trim();
+      if (!chatId) {
+        return json({ success: false, error: "chat_id required for /test" }, 400);
+      }
+      const results = await sendAllTestAlerts(sb, botToken, config, settings, {
+        chatIds: [chatId],
+      });
+      return json({
+        success: true,
+        results,
+        chat_id: chatId,
+        kill_switch: isTelegramAlertsEnabled(config),
+        note: "TEST samples only; kill switch stays OFF until you enable TELEGRAM_ALERTS_ENABLED",
       });
     }
 
     if (action === "cron") {
-      const results = await runCronChecks(sb, botToken, config, settings);
-      return json({ success: true, ...results });
+      // Kill switch OFF → no send and no dry_run spam (use action=dry_run for preview)
+      if (!isTelegramAlertsEnabled(config)) {
+        return json({
+          success: true,
+          skipped: true,
+          reason: "kill_switch_off",
+          kill_switch: false,
+          note: "Cron idle while OFF. Run action=dry_run for a fresh 1h preview.",
+        });
+      }
+      const results = await runCronChecks(sb, botToken, config, settings, {
+        dryRun: false,
+      });
+      return json({
+        success: true,
+        ...results,
+        kill_switch: true,
+      });
     }
 
     return json({ success: false, error: `Unknown action: ${action}` }, 400);

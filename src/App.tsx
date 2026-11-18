@@ -16,6 +16,7 @@ import { SettlementsChargesPage } from '@/pages/SettlementsChargesPage';
 import { ReportsPage } from '@/pages/ReportsPage';
 import { DataChecksPage } from '@/pages/DataChecksPage';
 import { SettingsPage } from '@/pages/SettingsPage';
+import { AlertPreviewPage } from '@/pages/AlertPreviewPage';
 
 export default function App() {
   return (
@@ -35,6 +36,7 @@ export default function App() {
               <Route path="settlements" element={<SettlementsChargesPage />} />
               <Route path="reports" element={<ReportsPage />} />
               <Route path="data-checks" element={<DataChecksPage />} />
+              <Route path="alert-preview" element={<AlertPreviewPage />} />
               <Route path="settings" element={<SettingsPage />} />
             </Route>
           </Routes>

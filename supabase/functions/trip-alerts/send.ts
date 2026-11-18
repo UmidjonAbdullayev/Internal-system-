@@ -16,9 +16,6 @@ export type AlertSetting = {
   alert_type: string;
   chat_id: string | null;
   enabled: boolean;
-  quiet_hours_start: string | null;
-  quiet_hours_end: string | null;
-  timezone: string | null;
 };
 
 /** Env TELEGRAM_ALERTS_ENABLED default OFF. Unset/false → no automatic sends. */
@@ -26,14 +23,10 @@ export function isTelegramAlertsEnabled(config?: AlertConfig | null): boolean {
   const v = (Deno.env.get("TELEGRAM_ALERTS_ENABLED") || "").trim().toLowerCase();
   const envOn = v === "1" || v === "true" || v === "yes" || v === "on";
   if (!envOn) return false;
-  // DB mirror also defaults false; both must allow automatic sends.
   if (config && config.alerts_enabled === false) return false;
   return true;
 }
 
-const ALWAYS_ALERT = new Set(["not_at_stop", "cpt_risk"]);
-
-/** Per-chat send throttle: max 1 msg / 3s. */
 const lastSendAtByChat = new Map<string, number>();
 const MIN_GAP_MS = 3000;
 
@@ -56,135 +49,19 @@ export async function loadSettings(sb: SupabaseClient): Promise<Map<string, Aler
   const { data } = await sb.from("telegram_alert_settings").select("*");
   const map = new Map<string, AlertSetting>();
   for (const row of data || []) {
-    map.set(row.alert_type, row as AlertSetting);
+    map.set(row.alert_type, {
+      alert_type: row.alert_type,
+      chat_id: row.chat_id ?? null,
+      enabled: Boolean(row.enabled),
+    });
   }
   return map;
 }
 
-/** Fallback dispatch chat (legacy). Prefer driver_groups. */
-export function resolveChatId(
-  alertType: string,
-  settings: Map<string, AlertSetting>,
-  config: AlertConfig,
-): string | null {
-  const row = settings.get(alertType);
-  const fromRow = row?.chat_id?.trim();
-  if (fromRow) return fromRow;
-  if (config.default_chat_id?.trim()) return config.default_chat_id.trim();
-  const env =
-    Deno.env.get("TELEGRAM_DISPATCH_CHAT_ID") ||
-    Deno.env.get("TELEGRAM_OPS_CHAT_ID") ||
-    Deno.env.get("TELEGRAM_CHAT_ID") ||
-    "";
-  return env.trim() || null;
-}
-
 export function chatSourcesPresent(): Record<string, boolean> {
   return {
-    TELEGRAM_DISPATCH_CHAT_ID: Boolean(Deno.env.get("TELEGRAM_DISPATCH_CHAT_ID")),
-    TELEGRAM_OPS_CHAT_ID: Boolean(Deno.env.get("TELEGRAM_OPS_CHAT_ID")),
-    TELEGRAM_CHAT_ID: Boolean(Deno.env.get("TELEGRAM_CHAT_ID")),
     TELEGRAM_ALERTS_ENABLED: isTelegramAlertsEnabled(),
   };
-}
-
-/** Resolve chat_ids for a trip from driver_groups (Relay driverList[].id). */
-export async function resolveDriverGroupChats(
-  sb: SupabaseClient,
-  relayDriverIds: string[],
-): Promise<string[]> {
-  const ids = [...new Set(relayDriverIds.map((x) => String(x || "").trim()).filter(Boolean))];
-  if (!ids.length) return [];
-  const { data } = await sb
-    .from("driver_groups")
-    .select("chat_id, relay_driver_id")
-    .in("relay_driver_id", ids)
-    .eq("active", true);
-  return [...new Set((data || []).map((r) => String(r.chat_id)).filter(Boolean))];
-}
-
-function parseHHMM(t: string | null | undefined): number | null {
-  if (!t) return null;
-  const m = String(t).match(/^(\d{1,2}):(\d{2})/);
-  if (!m) return null;
-  return Number(m[1]) * 60 + Number(m[2]);
-}
-
-export function inQuietHours(
-  alertType: string,
-  settings: Map<string, AlertSetting>,
-  config: AlertConfig,
-  now = new Date(),
-): boolean {
-  if (ALWAYS_ALERT.has(alertType)) return false;
-  const row = settings.get(alertType);
-  const start = parseHHMM(row?.quiet_hours_start ?? config.quiet_hours_start);
-  const end = parseHHMM(row?.quiet_hours_end ?? config.quiet_hours_end);
-  if (start == null || end == null) return false;
-  const tz = row?.timezone || config.timezone || "America/Chicago";
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(now);
-  const hour = Number(parts.find((p) => p.type === "hour")?.value || 0);
-  const minute = Number(parts.find((p) => p.type === "minute")?.value || 0);
-  const mins = hour * 60 + minute;
-  if (start <= end) return mins >= start && mins < end;
-  return mins >= start || mins < end;
-}
-
-export async function isMuted(
-  sb: SupabaseClient,
-  tripId: string,
-  chatId: string,
-): Promise<boolean> {
-  const { data } = await sb
-    .from("telegram_trip_mutes")
-    .select("muted_until")
-    .eq("trip_id", tripId)
-    .eq("chat_id", chatId)
-    .maybeSingle();
-  if (!data?.muted_until) return false;
-  return new Date(data.muted_until).getTime() > Date.now();
-}
-
-export async function alreadySent(
-  sb: SupabaseClient,
-  tripId: string,
-  stopId: string,
-  alertType: string,
-  level: string,
-  chatId: string,
-): Promise<boolean> {
-  const { data } = await sb
-    .from("alerts_sent")
-    .select("id")
-    .eq("trip_id", tripId)
-    .eq("stop_id", stopId || "")
-    .eq("alert_type", alertType)
-    .eq("level", level)
-    .eq("chat_id", chatId || "")
-    .maybeSingle();
-  return Boolean(data);
-}
-
-export async function lastTripMessageId(
-  sb: SupabaseClient,
-  tripId: string,
-  chatId: string,
-): Promise<number | null> {
-  const { data } = await sb
-    .from("alerts_sent")
-    .select("telegram_message_id")
-    .eq("trip_id", tripId)
-    .eq("chat_id", chatId)
-    .not("telegram_message_id", "is", null)
-    .order("sent_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  return data?.telegram_message_id != null ? Number(data.telegram_message_id) : null;
 }
 
 export function crmUrl(config: AlertConfig, tripId: string): string {
@@ -193,9 +70,54 @@ export function crmUrl(config: AlertConfig, tripId: string): string {
 }
 
 export function openCrmKeyboard(url: string) {
+  return { inline_keyboard: [[{ text: "Open in CRM", url }]] };
+}
+
+export type DriverGroupChat = {
+  chat_id: string;
+  driver_id: string | null;
+  relay_driver_id: string | null;
+  driver_name: string | null;
+  group_title: string | null;
+  alerts_enabled: boolean;
+  quiet: boolean;
+};
+
+function mapGroupRow(r: Record<string, unknown>): DriverGroupChat {
   return {
-    inline_keyboard: [[{ text: "Open in CRM", url }]],
+    chat_id: String(r.chat_id),
+    driver_id: r.driver_id ? String(r.driver_id) : null,
+    relay_driver_id: r.relay_driver_id ? String(r.relay_driver_id) : null,
+    driver_name: r.driver_name ? String(r.driver_name) : null,
+    group_title: r.group_title ? String(r.group_title) : null,
+    alerts_enabled: Boolean(r.alerts_enabled),
+    quiet: Boolean(r.quiet),
   };
+}
+
+/** Resolve linked groups for CRM driver ids and/or Relay driver ids. */
+export async function resolveDriverGroupChats(
+  sb: SupabaseClient,
+  opts: { crmDriverIds?: string[]; relayDriverIds?: string[] },
+): Promise<DriverGroupChat[]> {
+  const crm = [...new Set((opts.crmDriverIds || []).map((x) => String(x || "").trim()).filter(Boolean))];
+  const relay = [...new Set((opts.relayDriverIds || []).map((x) => String(x || "").trim()).filter(Boolean))];
+  const out = new Map<string, DriverGroupChat>();
+  const cols = "chat_id, driver_id, relay_driver_id, driver_name, group_title, alerts_enabled, quiet";
+
+  if (crm.length) {
+    const { data } = await sb.from("driver_groups").select(cols).in("driver_id", crm).eq("active", true);
+    for (const r of data || []) out.set(String(r.chat_id), mapGroupRow(r as Record<string, unknown>));
+  }
+  if (relay.length) {
+    const { data } = await sb
+      .from("driver_groups")
+      .select(cols)
+      .in("relay_driver_id", relay)
+      .eq("active", true);
+    for (const r of data || []) out.set(String(r.chat_id), mapGroupRow(r as Record<string, unknown>));
+  }
+  return [...out.values()];
 }
 
 async function throttleChat(chatId: string): Promise<void> {
@@ -204,17 +126,23 @@ async function throttleChat(chatId: string): Promise<void> {
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
 }
 
-export async function sendTelegramHtml(
+export type SendTelegramOpts = {
+  replyTo?: number | null;
+  replyMarkup?: Record<string, unknown>;
+  /** /test samples only — bypasses kill switch. */
+  force?: boolean;
+  config?: AlertConfig | null;
+};
+
+/**
+ * ONLY alert send path. Kill switch checked here.
+ * Webhook command replies use a separate reply() helper (not alerts).
+ */
+export async function sendTelegram(
   botToken: string,
   chatId: string,
   html: string,
-  opts?: {
-    replyTo?: number | null;
-    replyMarkup?: Record<string, unknown>;
-    /** Bypass kill switch (interactive /test only). */
-    force?: boolean;
-    config?: AlertConfig | null;
-  },
+  opts?: SendTelegramOpts,
 ): Promise<{ ok: boolean; messageId?: number; error?: string; skipped?: boolean }> {
   if (!opts?.force && !isTelegramAlertsEnabled(opts?.config)) {
     return { ok: false, skipped: true, error: "TELEGRAM_ALERTS_ENABLED is OFF" };
@@ -267,102 +195,235 @@ export async function sendTelegramHtml(
   return attempt();
 }
 
+/** @deprecated alias — all alert code must use sendTelegram */
+export const sendTelegramHtml = sendTelegram;
+
 export type OutgoingAlert = {
   tripId: string;
   stopId?: string;
-  alertType: string;
-  level: string;
+  alertType: "arrived" | "not_at_stop" | string;
   html: string;
-  emoji?: string;
   meta?: Record<string, unknown>;
   force?: boolean;
-  /** Relay driverList[].id values — team trips fan out to each linked group. */
+  dryRun?: boolean;
+  reason?: string;
+  syncBasis?: string;
+  crmDriverIds?: string[];
   relayDriverIds?: string[];
-  /** Explicit chat override (e.g. /test in a linked group). */
   chatIds?: string[];
+  /** Reply to prior not_at_stop for this stop when sending arrived. */
+  replyToStopAlert?: boolean;
 };
+
+async function claimAlertSlot(
+  sb: SupabaseClient,
+  tripId: string,
+  stopId: string,
+  alertType: string,
+  chatId: string,
+  meta: Record<string, unknown>,
+): Promise<{ claimed: boolean; id?: string }> {
+  const { data, error } = await sb
+    .from("alerts_sent")
+    .insert({
+      trip_id: tripId,
+      stop_id: stopId || "",
+      alert_type: alertType,
+      level: "0",
+      chat_id: chatId,
+      meta,
+      sent_at: new Date().toISOString(),
+    })
+    .select("id")
+    .maybeSingle();
+  if (error) {
+    // unique violation → already claimed
+    if (String(error.code) === "23505" || /duplicate|unique/i.test(error.message || "")) {
+      return { claimed: false };
+    }
+    return { claimed: false };
+  }
+  return { claimed: Boolean(data?.id), id: data?.id ? String(data.id) : undefined };
+}
+
+async function notAtStopMessageId(
+  sb: SupabaseClient,
+  tripId: string,
+  stopId: string,
+  chatId: string,
+): Promise<number | null> {
+  const { data } = await sb
+    .from("alerts_sent")
+    .select("telegram_message_id")
+    .eq("trip_id", tripId)
+    .eq("stop_id", stopId || "")
+    .eq("alert_type", "not_at_stop")
+    .eq("chat_id", chatId)
+    .not("telegram_message_id", "is", null)
+    .order("sent_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return data?.telegram_message_id != null ? Number(data.telegram_message_id) : null;
+}
+
+/**
+ * At most one dry-run row per (trip, stop, alert_type, chat).
+ * chat_id null = unlinked candidate (still one row).
+ */
+export async function writeDryRun(
+  sb: SupabaseClient,
+  row: {
+    tripId: string;
+    stopId?: string;
+    alertType: string;
+    chatId?: string | null;
+    driverId?: string | null;
+    html: string;
+    meta?: Record<string, unknown>;
+    reason?: string;
+    syncBasis?: string;
+  },
+): Promise<{ written: boolean }> {
+  const stopId = row.stopId || "";
+  const chatId = row.chatId || null;
+  let q = sb
+    .from("dry_run_alerts")
+    .select("id")
+    .eq("trip_id", row.tripId)
+    .eq("stop_id", stopId)
+    .eq("alert_type", row.alertType)
+    .limit(1);
+  q = chatId == null ? q.is("chat_id", null) : q.eq("chat_id", chatId);
+  const { data: existing } = await q.maybeSingle();
+  if (existing?.id) return { written: false };
+
+  const { error } = await sb.from("dry_run_alerts").insert({
+    trip_id: row.tripId,
+    stop_id: stopId,
+    alert_type: row.alertType,
+    chat_id: chatId,
+    driver_id: row.driverId || null,
+    html: row.html,
+    meta: row.meta || {},
+    reason: row.reason || null,
+    sync_basis: row.syncBasis || null,
+    would_send_at: new Date().toISOString(),
+  });
+  if (error) {
+    if (String(error.code) === "23505" || /duplicate|unique/i.test(error.message || "")) {
+      return { written: false };
+    }
+  }
+  return { written: !error };
+}
 
 async function sendOneChat(
   sb: SupabaseClient,
   botToken: string,
   config: AlertConfig,
-  settings: Map<string, AlertSetting>,
   alert: OutgoingAlert,
-  chatId: string,
-): Promise<{ status: string; error?: string; messageId?: number; chatId?: string }> {
-  if (!alert.force && inQuietHours(alert.alertType, settings, config)) {
-    return { status: "quiet_hours", chatId };
+  group: DriverGroupChat | {
+    chat_id: string;
+    driver_id?: string | null;
+    driver_name?: string | null;
+    group_title?: string | null;
+    alerts_enabled?: boolean;
+    quiet?: boolean;
+  },
+): Promise<{ status: string; error?: string; messageId?: number; chatId?: string; dryRun?: boolean }> {
+  const chatId = group.chat_id;
+  if (group.quiet && !alert.force) {
+    return { status: "quiet", chatId };
   }
-  if (await isMuted(sb, alert.tripId, chatId)) {
-    return { status: "muted", chatId };
+
+  const previewMeta = {
+    ...(alert.meta || {}),
+    driver: group.driver_name || alert.meta?.driver || null,
+    group_title: group.group_title || null,
+    chat_id: chatId,
+  };
+
+  // Dry-run or kill switch OFF → log would-send, never Bot API (except /test force)
+  const killOff = !isTelegramAlertsEnabled(config);
+  if (alert.dryRun || (killOff && !alert.force)) {
+    const wr = await writeDryRun(sb, {
+      tripId: alert.tripId,
+      stopId: alert.stopId,
+      alertType: alert.alertType,
+      chatId,
+      driverId: group.driver_id || null,
+      html: alert.html,
+      meta: previewMeta,
+      reason: alert.reason || (killOff ? "kill_switch_off" : "dry_run"),
+      syncBasis: alert.syncBasis,
+    });
+    return { status: wr.written ? "dry_run" : "deduped", chatId, dryRun: true };
   }
-  if (
-    !alert.force &&
-    (await alreadySent(sb, alert.tripId, alert.stopId || "", alert.alertType, alert.level, chatId))
-  ) {
+
+  // Live send also requires per-group enable (pilot) unless force/test
+  if (!alert.force && group.alerts_enabled === false) {
+    await writeDryRun(sb, {
+      tripId: alert.tripId,
+      stopId: alert.stopId,
+      alertType: alert.alertType,
+      chatId,
+      driverId: group.driver_id || null,
+      html: alert.html,
+      meta: { ...previewMeta, blocked: "group_disabled" },
+      reason: "group_alerts_disabled",
+      syncBasis: alert.syncBasis,
+    });
+    return { status: "group_disabled", chatId };
+  }
+
+  const claim = await claimAlertSlot(
+    sb,
+    alert.tripId,
+    alert.stopId || "",
+    alert.alertType,
+    chatId,
+    alert.meta || {},
+  );
+  if (!claim.claimed && !alert.force) {
     return { status: "deduped", chatId };
   }
 
-  const replyTo = await lastTripMessageId(sb, alert.tripId, chatId);
-  const sent = await sendTelegramHtml(botToken, chatId, alert.html, {
+  let replyTo: number | null = null;
+  if (alert.replyToStopAlert && alert.alertType === "arrived") {
+    replyTo = await notAtStopMessageId(sb, alert.tripId, alert.stopId || "", chatId);
+  }
+
+  const sent = await sendTelegram(botToken, chatId, alert.html, {
     replyTo,
     replyMarkup: openCrmKeyboard(crmUrl(config, alert.tripId)),
     force: alert.force,
     config,
   });
+
   if (sent.skipped) {
     return { status: "kill_switch_off", chatId, error: sent.error };
   }
   if (!sent.ok) {
-    await sb.from("telegram_notification_history").insert({
-      telegram_chat_id: chatId,
-      driver_id: null,
-      event_type: `trip_alert:${alert.alertType}`,
-      dedupe_key: `${alert.alertType}:${alert.tripId}:${alert.stopId || ""}:${alert.level}`.slice(0, 200),
-      message: alert.html,
-      status: "failed",
-      error: sent.error,
-      meta: alert.meta || {},
-    });
     return { status: "failed", error: sent.error, chatId };
   }
 
-  if (!alert.force) {
-    await sb.from("alerts_sent").upsert(
-      {
-        trip_id: alert.tripId,
-        stop_id: alert.stopId || "",
-        alert_type: alert.alertType,
-        level: alert.level,
-        sent_at: new Date().toISOString(),
-        telegram_message_id: sent.messageId ?? null,
-        chat_id: chatId,
-        meta: alert.meta || {},
-      },
-      { onConflict: "trip_id,stop_id,alert_type,level,chat_id" },
-    );
-  } else {
+  if (claim.id) {
+    await sb
+      .from("alerts_sent")
+      .update({ telegram_message_id: sent.messageId ?? null })
+      .eq("id", claim.id);
+  } else if (alert.force) {
     await sb.from("alerts_sent").insert({
       trip_id: alert.tripId,
       stop_id: alert.stopId || "",
       alert_type: alert.alertType,
       level: `test:${Date.now()}`,
-      sent_at: new Date().toISOString(),
-      telegram_message_id: sent.messageId ?? null,
       chat_id: chatId,
+      telegram_message_id: sent.messageId ?? null,
       meta: { ...(alert.meta || {}), test: true },
+      sent_at: new Date().toISOString(),
     });
   }
-
-  await sb.from("telegram_notification_history").insert({
-    telegram_chat_id: chatId,
-    driver_id: null,
-    event_type: `trip_alert:${alert.alertType}`,
-    dedupe_key: `${alert.alertType}:${alert.tripId}:${alert.level}:${sent.messageId}`.slice(0, 200),
-    message: alert.html,
-    status: "sent",
-    meta: { ...(alert.meta || {}), level: alert.level, test: Boolean(alert.force) },
-  });
 
   return { status: "sent", messageId: sent.messageId, chatId };
 }
@@ -379,29 +440,50 @@ export async function dispatchAlert(
     return { status: "disabled" };
   }
 
-  // Kill switch: block automatic sends; /test (force) still allowed.
-  if (!alert.force && !isTelegramAlertsEnabled(config)) {
-    return { status: "kill_switch_off", error: "TELEGRAM_ALERTS_ENABLED is OFF" };
+  let groups: Array<DriverGroupChat | { chat_id: string; driver_id?: string | null; alerts_enabled?: boolean; quiet?: boolean }> = [];
+
+  if (alert.chatIds?.length) {
+    groups = alert.chatIds.filter(Boolean).map((chat_id) => ({
+      chat_id,
+      driver_id: null,
+      alerts_enabled: true,
+      quiet: false,
+    }));
+  } else {
+    groups = await resolveDriverGroupChats(sb, {
+      crmDriverIds: alert.crmDriverIds,
+      relayDriverIds: alert.relayDriverIds,
+    });
   }
 
-  let chatIds: string[] = [];
-  if (alert.chatIds?.length) {
-    chatIds = [...new Set(alert.chatIds.filter(Boolean))];
-  } else if (alert.relayDriverIds?.length) {
-    chatIds = await resolveDriverGroupChats(sb, alert.relayDriverIds);
-  }
-  if (!chatIds.length) {
-    const fallback = resolveChatId(alert.alertType, settings, config);
-    if (fallback) chatIds = [fallback];
-  }
-  if (!chatIds.length) {
-    return { status: "no_chat", error: "No driver_groups chat and no fallback dispatch chat" };
+  if (!groups.length) {
+    // Still dry-run log with null chat so Alert preview shows unlinked candidates
+    if (alert.dryRun || !isTelegramAlertsEnabled(config)) {
+      const wr = await writeDryRun(sb, {
+        tripId: alert.tripId,
+        stopId: alert.stopId,
+        alertType: alert.alertType,
+        chatId: null,
+        driverId: alert.crmDriverIds?.[0] || null,
+        html: alert.html,
+        meta: {
+          ...(alert.meta || {}),
+          driver: alert.meta?.driver || null,
+          group_title: null,
+          chat_id: null,
+        },
+        reason: alert.reason || "no_linked_group",
+        syncBasis: alert.syncBasis,
+      });
+      return { status: wr.written ? "dry_run_no_chat" : "deduped" };
+    }
+    return { status: "no_chat", error: "No linked driver_groups for this trip" };
   }
 
   const results = [];
-  for (const chatId of chatIds) {
-    results.push(await sendOneChat(sb, botToken, config, settings, alert, chatId));
+  for (const g of groups) {
+    results.push(await sendOneChat(sb, botToken, config, alert, g));
   }
-  const firstOk = results.find((r) => r.status === "sent") || results[0];
+  const firstOk = results.find((r) => r.status === "sent" || r.status === "dry_run") || results[0];
   return { ...firstOk, results };
 }

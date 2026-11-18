@@ -6,12 +6,13 @@ Project ref: `iiyqkdjwxlnfqvlidbqr` → `https://iiyqkdjwxlnfqvlidbqr.supabase.c
 
 | Name | Auth | Purpose |
 |------|------|---------|
-| `relay-sync` | `X-Relay-Extension-Key` | Upsert CRM loads/trips/stops; emits **facility_arrived** (driver groups) + queues **dispatch trip-alerts** on live changes |
+| `relay-sync` | `X-Relay-Extension-Key` | Upsert CRM loads/trips/stops; queues **live ARRIVED** edges to trip-alerts only (kill switch OFF by default) |
 | `relay-snapshot` | same | Trip/leg/stop UPSERT + section snapshots; `sync_state`; HISTORY catch-up + one `sync_restored` summary |
 | `relay-retention` | same | Manual trigger for `run_relay_retention()` (pg_cron also 03:00) |
 | `relay-telegram` | same | Route **facility-arrival** alerts to the correct driver Telegram group |
-| `trip-alerts` | cron secret / extension key / service role | Dispatch-group status + 1-min time alerts; `action=status\|cron\|test\|bootstrap\|diagnose` |
-| `telegram-webhook` | `TELEGRAM_WEBHOOK_SECRET` | DM slash/menu (admin password + DRV); groups: `/link` `/unlink` + `/late` `/status <tripId>` `/mute` `/setdispatch` |
+| `trip-alerts` | cron secret / extension key / service role | Rebuild: **arrived** + **not_at_stop** only; `dry_run` / `cron` / `status` / `test` / `diagnose`. Kill switch default OFF. |
+| `telegram-webhook` | `TELEGRAM_WEBHOOK_SECRET` | DM password (`bot_users` + CRM bcrypt); groups: `/link` `/unlink` `/whoami` `/test` `/mute` `/unmute` |
+| `relay-telegram` | extension key | **Disabled** — use trip-alerts `sendTelegram()` only |
 | `telegram-driver-digest` | `X-Relay-Extension-Key` | No-op (digests disabled; facility-arrival-only policy) |
 
 Bot token lives **only** in Edge Function secrets (`TELEGRAM_BOT_TOKEN`). Never in the extension or git.
