@@ -15,6 +15,7 @@ import {
   relayTourUrl,
   tripDisplayPayout,
   tripDriverName,
+  tripDriverNames,
   tripDurationLabel,
   tripTractorId,
   tripTrailerId,
@@ -55,7 +56,8 @@ export const TripRow = memo(function TripRow({
   activityLogs: ActivityLog[];
 }) {
   const driverName = tripDriverName(trip);
-  const driver = matchDriver(drivers, driverName);
+  const driverNames = tripDriverNames(trip);
+  const extraDrivers = driverNames.slice(1);
   const tractor = tripTractorId(trip);
   const trailer = tripTrailerId(trip);
   const { first, last } = firstAndLastStop(trip);
@@ -108,7 +110,11 @@ export const TripRow = memo(function TripRow({
             onToggle();
           }
         }}
-        className="hidden md:grid w-full cursor-pointer grid-cols-[minmax(9rem,1.1fr)_minmax(8rem,1fr)_minmax(12rem,1.4fr)_minmax(11rem,1.3fr)_minmax(7rem,0.9fr)_minmax(6.5rem,0.85fr)_2rem] items-start gap-3 px-3 py-3 text-left"
+        className={cn(
+          'hidden md:grid w-full cursor-pointer grid-cols-[minmax(9rem,1.1fr)_minmax(8rem,1fr)_minmax(12rem,1.4fr)_minmax(11rem,1.3fr)_minmax(7rem,0.9fr)_minmax(6.5rem,0.85fr)_2rem] items-start gap-3 px-3 py-3 text-left',
+          // Expanded: header stays pinned while scrolling through this trip's details.
+          expanded && 'sticky top-0 z-[5] border-b border-border bg-card shadow-sm',
+        )}
         aria-expanded={expanded}
       >
         <div className="min-w-0">
@@ -133,11 +139,16 @@ export const TripRow = memo(function TripRow({
         </div>
 
         <div className="min-w-0">
-          <div className="line-clamp-1 text-sm font-medium">
+          <div className="flex min-w-0 items-center gap-1 text-sm font-medium" title={driverNames.join(' → ')}>
             {driverName ? (
-              <span>{driverName}</span>
+              <span className="line-clamp-1">{driverName}</span>
             ) : (
               <span className="italic text-warning">No driver</span>
+            )}
+            {extraDrivers.length > 0 && (
+              <span className="shrink-0 rounded-full border border-secondary/40 bg-info-bg px-1.5 text-[10px] font-semibold text-primary">
+                +{extraDrivers.length}
+              </span>
             )}
           </div>
           <p className="mt-0.5 line-clamp-1 text-[11px] text-text-secondary">
@@ -206,7 +217,10 @@ export const TripRow = memo(function TripRow({
             onToggle();
           }
         }}
-        className="md:hidden w-full cursor-pointer space-y-2 px-3 py-3 text-left"
+        className={cn(
+          'md:hidden w-full cursor-pointer space-y-2 px-3 py-3 text-left',
+          expanded && 'sticky top-0 z-[5] border-b border-border bg-card shadow-sm',
+        )}
         aria-expanded={expanded}
       >
         <div className="flex items-start justify-between gap-2">
@@ -221,7 +235,9 @@ export const TripRow = memo(function TripRow({
             className={cn('h-4 w-4 shrink-0 text-text-secondary transition-transform', expanded && 'rotate-180')}
           />
         </div>
-        <p className="text-sm font-medium line-clamp-1">{driverName || 'No driver'}</p>
+        <p className="text-sm font-medium line-clamp-1">
+          {driverNames.length ? driverNames.join(' → ') : 'No driver'}
+        </p>
         <p className="text-xs text-text-secondary line-clamp-2">
           {facilityLabel(first)} → {facilityLabel(last)}
         </p>
@@ -260,21 +276,33 @@ export const TripRow = memo(function TripRow({
                     .join(' · ')}
                 />
               )}
-              {driver && (
+              {driverNames.length > 0 && (
                 <div className="min-w-[5.5rem]">
                   <p className="text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
-                    Driver
+                    {driverNames.length > 1 ? `Drivers (${driverNames.length})` : 'Driver'}
                   </p>
-                  <Link
-                    to={`/drivers/${driver.id}`}
-                    className="mt-0.5 inline-block font-medium text-primary hover:underline"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {driverName}
-                  </Link>
-                  {driver.phone ? (
-                    <p className="text-xs text-text-secondary">{driver.phone}</p>
-                  ) : null}
+                  <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                    {driverNames.map((name, i) => {
+                      const d = matchDriver(drivers, name);
+                      return (
+                        <span key={name} className="inline-flex items-center gap-1.5">
+                          {i > 0 && <span className="text-text-secondary">→</span>}
+                          {d ? (
+                            <Link
+                              to={`/drivers/${d.id}`}
+                              className="font-medium text-primary hover:underline"
+                              onClick={(e) => e.stopPropagation()}
+                              title={d.phone || undefined}
+                            >
+                              {name}
+                            </Link>
+                          ) : (
+                            <span className="font-medium">{name}</span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>

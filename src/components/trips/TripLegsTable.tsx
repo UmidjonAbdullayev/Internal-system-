@@ -1,9 +1,17 @@
 import type { RelayTrip } from '@/types';
 import { cn, formatCurrency } from '@/lib/utils';
-import { facilityLabel, isLegCancelled, legLoadTypeLabel } from '@/lib/relayTrips';
+import {
+  compareStops,
+  facilityLabel,
+  isLegCancelled,
+  legDriverName,
+  legLoadTypeLabel,
+  orderedLegs,
+} from '@/lib/relayTrips';
 
 export function TripLegsTable({ trip }: { trip: RelayTrip }) {
-  if (!trip.legs.length) {
+  const legs = orderedLegs(trip);
+  if (!legs.length) {
     return <p className="text-sm text-text-secondary">No legs synced for this trip.</p>;
   }
 
@@ -16,6 +24,7 @@ export function TripLegsTable({ trip }: { trip: RelayTrip }) {
             <tr className="border-b border-border text-left text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
               <th className="px-2 py-2">Load ID</th>
               <th className="px-2 py-2">From → To</th>
+              <th className="px-2 py-2">Driver</th>
               <th className="px-2 py-2 text-right">Miles</th>
               <th className="px-2 py-2 text-right">Pay</th>
               <th className="px-2 py-2">Status</th>
@@ -25,8 +34,8 @@ export function TripLegsTable({ trip }: { trip: RelayTrip }) {
             </tr>
           </thead>
           <tbody>
-            {trip.legs.map((leg) => {
-              const stops = [...leg.stops].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+            {legs.map((leg) => {
+              const stops = [...leg.stops].sort(compareStops);
               const first = stops[0];
               const last = stops[stops.length - 1];
               const cancelled = isLegCancelled(leg);
@@ -52,6 +61,7 @@ export function TripLegsTable({ trip }: { trip: RelayTrip }) {
                       → {facilityLabel(last)}
                     </div>
                   </td>
+                  <td className="px-2 py-2 text-xs">{legDriverName(trip, leg) || '—'}</td>
                   <td className="px-2 py-2 text-right tabular-nums text-xs">
                     {leg.miles != null ? Math.round(leg.miles) : '—'}
                   </td>
@@ -81,8 +91,8 @@ export function TripLegsTable({ trip }: { trip: RelayTrip }) {
 
       {/* Mobile cards */}
       <div className="space-y-2 md:hidden">
-        {trip.legs.map((leg) => {
-          const stops = [...leg.stops].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+        {legs.map((leg) => {
+          const stops = [...leg.stops].sort(compareStops);
           const first = stops[0];
           const last = stops[stops.length - 1] || first;
           const cancelled = isLegCancelled(leg);
@@ -115,6 +125,7 @@ export function TripLegsTable({ trip }: { trip: RelayTrip }) {
                 {facilityLabel(first)} → {facilityLabel(last)}
               </p>
               <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-text-secondary">
+                <span className="font-medium text-text">{legDriverName(trip, leg) || 'No driver'}</span>
                 <span>{leg.miles != null ? `${Math.round(leg.miles)} mi` : '— mi'}</span>
                 <span>{leg.payout != null ? formatCurrency(leg.payout) : '—'}</span>
                 <span className="font-mono">{leg.tractorId || 'No tractor'}</span>

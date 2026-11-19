@@ -10,7 +10,18 @@ export type AlertConfig = {
   quiet_hours_start: string | null;
   quiet_hours_end: string | null;
   alerts_enabled: boolean;
+  /** 'broadcast' = every driver's alerts go to broadcast_chat_id ("Driver Updates"). */
+  routing_mode: "driver_groups" | "broadcast";
+  broadcast_chat_id: string | null;
+  broadcast_title: string | null;
 };
+
+/** Shared "Driver Updates" group, when broadcast routing is on and a chat is set. */
+export function broadcastChatId(config: AlertConfig): string | null {
+  if (config.routing_mode !== "broadcast") return null;
+  const id = String(config.broadcast_chat_id || "").trim();
+  return id || null;
+}
 
 export type AlertSetting = {
   alert_type: string;
@@ -42,6 +53,9 @@ export async function loadConfig(sb: SupabaseClient): Promise<AlertConfig> {
     quiet_hours_start: data?.quiet_hours_start ?? null,
     quiet_hours_end: data?.quiet_hours_end ?? null,
     alerts_enabled: Boolean(data?.alerts_enabled),
+    routing_mode: data?.routing_mode === "broadcast" ? "broadcast" : "driver_groups",
+    broadcast_chat_id: data?.broadcast_chat_id ? String(data.broadcast_chat_id) : null,
+    broadcast_title: data?.broadcast_title ? String(data.broadcast_title) : null,
   };
 }
 
@@ -440,8 +454,9 @@ export async function dispatchAlert(
     return { status: "disabled" };
   }
 
-  let groups: Array<DriverGroupChat | { chat_id: string; driver_id?: string | null; alerts_enabled?: boolean; quiet?: boolean }> = [];
+  let groups: Array<DriverGroupChat | { chat_id: string; driver_id?: string | null; driver_name?: string | null; group_title?: string | null; alerts_enabled?: boolean; quiet?: boolean }> = [];
 
+  const broadcast = broadcastChatId(config);
   if (alert.chatIds?.length) {
     groups = alert.chatIds.filter(Boolean).map((chat_id) => ({
       chat_id,
@@ -449,6 +464,16 @@ export async function dispatchAlert(
       alerts_enabled: true,
       quiet: false,
     }));
+  } else if (broadcast) {
+    // Broadcast mode: ONE shared group for every driver. Per-driver groups get nothing.
+    groups = [{
+      chat_id: broadcast,
+      driver_id: alert.crmDriverIds?.[0] || null,
+      driver_name: (alert.meta?.driver as string | undefined) || null,
+      group_title: config.broadcast_title || "Driver Updates",
+      alerts_enabled: true,
+      quiet: false,
+    }];
   } else {
     groups = await resolveDriverGroupChats(sb, {
       crmDriverIds: alert.crmDriverIds,

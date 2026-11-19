@@ -45,27 +45,86 @@ export function tabToSection(tab: TripTab): RelaySection | null {
   return null;
 }
 
+function stopTypeRank(stop: RelayStop): number {
+  const t = String(stop.stopType || '').toUpperCase();
+  if (t.includes('DROP') || t.includes('DELIVER')) return 0;
+  if (t.includes('PICK')) return 1;
+  return 2;
+}
+
+function stopTimeKey(stop: RelayStop): number {
+  const t = stop.scheduledArrival ? Date.parse(stop.scheduledArrival) : NaN;
+  return Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Route order: seq, then (same seq = shared facility between legs) the previous leg's DROP
+ * before the next leg's PICKUP, then scheduled time.
+ */
+export function compareStops(a: RelayStop, b: RelayStop): number {
+  return (
+    (a.seq ?? 0) - (b.seq ?? 0) ||
+    stopTypeRank(a) - stopTypeRank(b) ||
+    stopTimeKey(a) - stopTimeKey(b)
+  );
+}
+
 export function allStops(trip: RelayTrip): RelayStop[] {
   const stops: RelayStop[] = [];
   for (const leg of trip.legs) {
     for (const s of leg.stops) stops.push(s);
   }
-  return stops.sort((a, b) => {
-    if (a.tripId !== b.tripId) return 0;
-    return (a.seq ?? 0) - (b.seq ?? 0);
+  return stops.sort(compareStops);
+}
+
+/** Legs in route order (by their first stop), not by load ID. */
+export function orderedLegs(trip: RelayTrip): RelayLeg[] {
+  const first = (leg: RelayLeg) => [...leg.stops].sort(compareStops)[0];
+  return [...trip.legs].sort((a, b) => {
+    const fa = first(a);
+    const fb = first(b);
+    if (!fa || !fb) return fa ? -1 : fb ? 1 : 0;
+    return compareStops(fa, fb);
   });
 }
 
+export function legForStop(trip: RelayTrip, stop: RelayStop): RelayLeg | null {
+  return trip.legs.find((l) => l.loadId === stop.loadId) || null;
+}
+
 export function primaryLeg(trip: RelayTrip): RelayLeg | null {
-  return trip.legs[0] || null;
+  return orderedLegs(trip)[0] || null;
+}
+
+/**
+ * Every distinct driver on the trip, in route order. Legs can be run by different drivers;
+ * cancelled legs only count when nothing else names a driver.
+ */
+export function tripDriverNames(trip: RelayTrip): string[] {
+  const legs = orderedLegs(trip);
+  const active = legs.filter((l) => !isLegCancelled(l));
+  const pick = (ls: RelayLeg[]) => {
+    const out: string[] = [];
+    for (const l of ls) {
+      const n = (l.driverNameRaw || '').trim();
+      if (n && !out.some((x) => x.toLowerCase() === n.toLowerCase())) out.push(n);
+    }
+    return out;
+  };
+  const names = pick(active);
+  if (names.length) return names;
+  const any = pick(legs);
+  if (any.length) return any;
+  return trip.driverNameRaw ? [trip.driverNameRaw] : [];
 }
 
 export function tripDriverName(trip: RelayTrip): string {
-  if (trip.driverNameRaw) return trip.driverNameRaw;
-  for (const leg of trip.legs) {
-    if (leg.driverNameRaw) return leg.driverNameRaw;
-  }
-  return '';
+  return tripDriverNames(trip)[0] || '';
+}
+
+/** Driver for one leg (falls back to the trip driver). */
+export function legDriverName(trip: RelayTrip, leg: RelayLeg | null): string {
+  return (leg?.driverNameRaw || '').trim() || tripDriverName(trip);
 }
 
 export function tripTractorId(trip: RelayTrip): string {
@@ -99,7 +158,9 @@ export function formatLocalStopTime(
   timeZone?: string | null,
   localFallback?: string | null,
 ): string {
-  if (localFallback) return localFallback;
+  if (!iso || !timeZone) {
+    if (localFallback) return localFallback;
+  }
   if (!iso) return '—';
   try {
     const d = new Date(iso);
@@ -116,7 +177,7 @@ export function formatLocalStopTime(
     if (timeZone) opts.timeZone = timeZone;
     return new Intl.DateTimeFormat('en-US', opts).format(d).replace(/\u202f/g, ' ');
   } catch {
-    return '—';
+    return localFallback || '—';
   }
 }
 
@@ -208,8 +269,18 @@ export function isStopLate(stop: RelayStop, now = Date.now()): boolean {
   return now > scheduled + 5 * 60 * 1000;
 }
 
+/** Stops on cancelled legs never count toward progress / "next stop". */
+export function isStopOnCancelledLeg(trip: RelayTrip, stop: RelayStop): boolean {
+  const leg = legForStop(trip, stop);
+  return Boolean(leg && isLegCancelled(leg));
+}
+
+export function activeStops(trip: RelayTrip): RelayStop[] {
+  return allStops(trip).filter((s) => !isStopOnCancelledLeg(trip, s));
+}
+
 export function buildStopProgress(trip: RelayTrip, now = Date.now()): StopProgressNode[] {
-  const stops = allStops(trip);
+  const stops = activeStops(trip);
   return stops.map((stop) => {
     const late = isStopLate(stop, now);
     let state: StopProgressState = 'not_reached';
@@ -289,7 +360,7 @@ export function needsAttention(trip: RelayTrip, now = Date.now()): boolean {
 }
 
 export function plainEnglishStatus(trip: RelayTrip, now = Date.now()): string {
-  const stops = allStops(trip);
+  const stops = activeStops(trip);
   const progress = buildStopProgress(trip, now);
   if (!stops.length) {
     return trip.status || trip.executionStatus || trip.tourState || 'No stop details yet';
@@ -321,6 +392,17 @@ export function plainEnglishStatus(trip: RelayTrip, now = Date.now()): string {
     const nextCode = next.stop.facilityCode || `stop ${next.stop.seq ?? nextIdx + 1}`;
     if (lastDoneIdx != null) {
       const from = progress[lastDoneIdx].stop.facilityCode || 'last stop';
+      if (from === nextCode) {
+        // Dropped one leg and picks up the next at the same facility.
+        const when = formatLocalStopTime(
+          next.stop.scheduledArrival,
+          next.stop.timeZone,
+          next.stop.scheduledArrivalLocal,
+        );
+        return next.late
+          ? `Dropped at ${from} · next pickup here is late (due ${when})`
+          : `Dropped at ${from} · next pickup here ${when}`;
+      }
       if (next.late) {
         const reason = tripLateReason(trip);
         return reason
@@ -746,4 +828,184 @@ export function firstAndLastStop(trip: RelayTrip): { first: RelayStop | null; la
   const stops = allStops(trip);
   if (!stops.length) return { first: null, last: null };
   return { first: stops[0], last: stops[stops.length - 1] };
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-stop status for the expanded trip view                          */
+/* ------------------------------------------------------------------ */
+
+export type StopStatusKind =
+  | 'done' //        departed
+  | 'at_stop' //     arrived, not departed
+  | 'next' //        driver is heading here, still on time
+  | 'next_late' //   should be here by now, not arrived
+  | 'upcoming' //    later stop
+  | 'cancelled'; //  stop on a cancelled leg
+
+export interface StopStatus {
+  kind: StopStatusKind;
+  /** Short word shown next to PICKUP / DROP. */
+  label: string;
+  /** One plain-English line under the stop. */
+  line: string;
+  /** Arrival vs schedule: 'early' | 'on_time' | 'late' (only when arrived). */
+  arrivalTiming: 'early' | 'on_time' | 'late' | null;
+}
+
+/** Same ±15 min rule as the Telegram alerts. */
+const STOP_GRACE_MS = 15 * 60 * 1000;
+
+function humanMinutes(totalMin: number): string {
+  const m = Math.abs(Math.round(totalMin));
+  if (m >= 60 * 24) {
+    const d = Math.floor(m / (60 * 24));
+    const h = Math.floor((m % (60 * 24)) / 60);
+    return h ? `${d}d ${h}h` : `${d}d`;
+  }
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const r = m % 60;
+    return r ? `${h}h ${r}m` : `${h}h`;
+  }
+  return `${m} min`;
+}
+
+/** Clock time + zone only ("20:28 MST"), for one-line summaries. */
+export function shortStopTime(iso: string | null | undefined, timeZone?: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  try {
+    const opts: Intl.DateTimeFormatOptions = {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      timeZoneName: 'short',
+    };
+    if (timeZone) opts.timeZone = timeZone;
+    return new Intl.DateTimeFormat('en-US', opts).format(d).replace(/ /g, ' ');
+  } catch {
+    return '—';
+  }
+}
+
+function dayAndTime(iso: string | null | undefined, timeZone?: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  try {
+    const opts: Intl.DateTimeFormatOptions = {
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      timeZoneName: 'short',
+    };
+    if (timeZone) opts.timeZone = timeZone;
+    return new Intl.DateTimeFormat('en-US', opts).format(d).replace(/ /g, ' ');
+  } catch {
+    return '—';
+  }
+}
+
+function arrivalTiming(stop: RelayStop): { kind: 'early' | 'on_time' | 'late'; text: string } | null {
+  const a = ms(stop.actualArrival);
+  const s = ms(stop.scheduledArrival);
+  if (a == null || s == null) return null;
+  const diff = a - s;
+  if (diff > STOP_GRACE_MS) return { kind: 'late', text: `${humanMinutes(diff / 60000)} late` };
+  if (diff < -STOP_GRACE_MS) return { kind: 'early', text: `${humanMinutes(diff / 60000)} early` };
+  return { kind: 'on_time', text: 'on time' };
+}
+
+/**
+ * Where each stop stands right now. "Next" = the first stop not yet reached after the
+ * last stop with any check-in/out (cancelled legs skipped).
+ */
+export function buildStopStatuses(trip: RelayTrip, now = Date.now()): Map<RelayStop, StopStatus> {
+  const out = new Map<RelayStop, StopStatus>();
+  const ordered = allStops(trip);
+  const active = ordered.filter((s) => !isStopOnCancelledLeg(trip, s));
+  let lastTouched = -1;
+  active.forEach((s, i) => {
+    if (s.actualArrival || s.actualDeparture) lastTouched = i;
+  });
+  const nextIdx = active.findIndex(
+    (s, i) => i > lastTouched && !s.actualArrival && !s.actualDeparture,
+  );
+  const history = trip.section === 'HISTORY';
+
+  for (const stop of ordered) {
+    if (isStopOnCancelledLeg(trip, stop)) {
+      out.set(stop, { kind: 'cancelled', label: 'Cancelled', line: 'Leg cancelled', arrivalTiming: null });
+      continue;
+    }
+    const tz = stop.timeZone;
+    const timing = arrivalTiming(stop);
+    const i = active.indexOf(stop);
+
+    if (stop.actualDeparture || (history && stop.actualArrival)) {
+      const parts: string[] = [];
+      if (stop.actualArrival) {
+        parts.push(`Arrived ${shortStopTime(stop.actualArrival, tz)}${timing ? ` (${timing.text})` : ''}`);
+      }
+      if (stop.actualDeparture) {
+        parts.push(`${parts.length ? 'departed' : 'Departed'} ${shortStopTime(stop.actualDeparture, tz)}`);
+      }
+      out.set(stop, {
+        kind: 'done',
+        label: 'Done',
+        line: parts.join(' · ') || 'Completed',
+        arrivalTiming: timing?.kind ?? null,
+      });
+      continue;
+    }
+
+    if (stop.actualArrival) {
+      const since = now - (ms(stop.actualArrival) ?? now);
+      const parts = [
+        `At stop since ${shortStopTime(stop.actualArrival, tz)}${timing ? ` (${timing.text})` : ''}`,
+      ];
+      const schDep = ms(stop.scheduledDeparture);
+      if (schDep != null) {
+        parts.push(
+          now > schDep + STOP_GRACE_MS
+            ? `departure ${humanMinutes((now - schDep) / 60000)} overdue`
+            : `departs ${shortStopTime(stop.scheduledDeparture, tz)}`,
+        );
+      }
+      if (since > 0) parts.push(`there ${humanMinutes(since / 60000)}`);
+      out.set(stop, { kind: 'at_stop', label: 'At stop', line: parts.join(' · '), arrivalTiming: timing?.kind ?? null });
+      continue;
+    }
+
+    const sch = ms(stop.scheduledArrival);
+    const eta = ms(stop.eta);
+    if (!history && i === nextIdx) {
+      if (sch != null && now > sch + STOP_GRACE_MS) {
+        const parts = [`Not arrived · ${humanMinutes((now - sch) / 60000)} overdue`];
+        parts.push(`was due ${shortStopTime(stop.scheduledArrival, tz)}`);
+        if (eta != null && eta > now) parts.push(`ETA ${shortStopTime(stop.eta, tz)}`);
+        out.set(stop, { kind: 'next_late', label: 'Late', line: parts.join(' · '), arrivalTiming: null });
+      } else {
+        const parts = [`Next stop · due ${dayAndTime(stop.scheduledArrival, tz)}`];
+        if (sch != null && sch > now) parts.push(`in ${humanMinutes((sch - now) / 60000)}`);
+        if (eta != null && sch != null && eta - sch > STOP_GRACE_MS) {
+          parts.push(`ETA ${shortStopTime(stop.eta, tz)} (${humanMinutes((eta - sch) / 60000)} behind)`);
+        }
+        out.set(stop, { kind: 'next', label: 'Next', line: parts.join(' · '), arrivalTiming: null });
+      }
+      continue;
+    }
+
+    out.set(stop, {
+      kind: 'upcoming',
+      label: history ? 'No check-in' : 'Upcoming',
+      line: history
+        ? 'No arrival recorded in Relay'
+        : `Upcoming · due ${dayAndTime(stop.scheduledArrival, tz)}`,
+      arrivalTiming: null,
+    });
+  }
+  return out;
 }

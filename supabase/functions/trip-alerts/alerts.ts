@@ -180,9 +180,17 @@ function stopIsNext(
   return later.length === 0;
 }
 
+type LegInfo = {
+  driver: string | null;
+  tractor: string | null;
+  trailer: string | null;
+};
+
 type TripCtx = {
   trip: Record<string, unknown>;
   stops: Array<Record<string, unknown>>;
+  /** Per-load driver / tractor / trailer (legs can have different drivers). */
+  legs: Map<string, LegInfo>;
   cancelledLoadIds: Set<string>;
   crmDriverIds: string[];
   relayDriverIds: string[];
@@ -202,6 +210,7 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
   const tripIds = (trips || []).map((t) => t.trip_id);
   let stops: Array<Record<string, unknown>> = [];
   const cancelledByTrip = new Map<string, Set<string>>();
+  const legsByTrip = new Map<string, Map<string, LegInfo>>();
   if (tripIds.length) {
     const { data: stopRows } = await sb
       .from("relay_stops")
@@ -214,10 +223,20 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
 
     const { data: legRows } = await sb
       .from("relay_legs")
-      .select("trip_id, load_id, execution_status")
+      .select("trip_id, load_id, execution_status, driver_name_raw, tractor_id, trailer_id")
       .in("trip_id", tripIds)
       .eq("archived", false);
     for (const leg of legRows || []) {
+      const tid0 = String(leg.trip_id || "");
+      const lid0 = String(leg.load_id || "").trim();
+      if (tid0 && lid0) {
+        if (!legsByTrip.has(tid0)) legsByTrip.set(tid0, new Map());
+        legsByTrip.get(tid0)!.set(lid0, {
+          driver: leg.driver_name_raw ? String(leg.driver_name_raw) : null,
+          tractor: leg.tractor_id ? String(leg.tractor_id) : null,
+          trailer: leg.trailer_id ? String(leg.trailer_id) : null,
+        });
+      }
       if (!isCancelledStatus(leg.execution_status)) continue;
       const tid = String(leg.trip_id || "");
       const lid = String(leg.load_id || "").trim();
@@ -228,9 +247,7 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
   }
 
   for (const trip of trips || []) {
-    const tripStops = stops
-      .filter((s) => String(s.trip_id) === trip.trip_id)
-      .sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
+    const tripStops = orderStops(stops.filter((s) => String(s.trip_id) === trip.trip_id));
     const cancelledLoadIds = new Set<string>([
       ...extractCancelledLoadIdsFromRaw(trip.raw),
       ...(cancelledByTrip.get(trip.trip_id) || []),
@@ -241,6 +258,7 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
     map.set(trip.trip_id, {
       trip: trip as Record<string, unknown>,
       stops: tripStops,
+      legs: legsByTrip.get(trip.trip_id) || new Map(),
       cancelledLoadIds,
       crmDriverIds,
       relayDriverIds,
@@ -248,6 +266,40 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
     });
   }
   return map;
+}
+
+/** Seq order; at the same seq a DROP comes before the next leg's PICKUP; then scheduled time. */
+export function orderStops<T extends Record<string, unknown>>(rows: T[]): T[] {
+  const typeRank = (s: Record<string, unknown>) =>
+    /drop|deliver/i.test(String(s.stop_type || "")) ? 0 : /pick/i.test(String(s.stop_type || "")) ? 1 : 2;
+  const t = (s: Record<string, unknown>) => {
+    const v = new Date(String(s.scheduled_arrival || "")).getTime();
+    return Number.isNaN(v) ? Number.MAX_SAFE_INTEGER : v;
+  };
+  return [...rows].sort(
+    (a, b) =>
+      Number(a.seq ?? 0) - Number(b.seq ?? 0) ||
+      typeRank(a) - typeRank(b) ||
+      t(a) - t(b),
+  );
+}
+
+/** Driver / tractor / trailer for the leg this stop belongs to (falls back to trip level). */
+function stopPeople(ctx: TripCtx, stop: Record<string, unknown>) {
+  const leg = ctx.legs.get(String(stop.load_id || "").trim());
+  const tripDriver = ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null;
+  return {
+    driver: leg?.driver || tripDriver,
+    tractor: leg?.tractor || ctx.tractor,
+    trailer: trailerFromStopRaw(stop.raw, leg?.trailer || null),
+  };
+}
+
+/** 1-based position of the stop among alertable stops (seq can repeat across legs). */
+function stopPosition(ctx: TripCtx, stop: Record<string, unknown>): { pos: number; count: number } {
+  const eligible = alertableStops(ctx);
+  const idx = eligible.findIndex((s) => String(s.stop_id) === String(stop.stop_id));
+  return { pos: idx >= 0 ? idx + 1 : Number(stop.seq ?? 1), count: Math.max(1, eligible.length) };
 }
 
 function buildArrivedAlert(
@@ -262,11 +314,10 @@ function buildArrivedAlert(
   const tz = String(stop.time_zone || "America/Los_Angeles");
   const facility = String(stop.facility_code || stop.stop_type || "Stop");
   const loadId = String(stop.load_id || stop.trip_id);
-  const eligible = alertableStops(ctx);
-  const stopCount = Math.max(1, eligible.length);
-  const seq = Number(stop.seq ?? 1);
-  const trailer = trailerFromStopRaw(stop.raw, null);
-  const driverName = ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null;
+  const { pos: seq, count: stopCount } = stopPosition(ctx, stop);
+  const people = stopPeople(ctx, stop);
+  const trailer = people.trailer;
+  const driverName = people.driver;
   const html = formatArrivedHtml({
     facility,
     city: stop.city ? String(stop.city) : null,
@@ -279,9 +330,10 @@ function buildArrivedAlert(
     actualAt: actual,
     plannedAt: planned,
     timeZone: tz,
-    tractor: ctx.tractor,
+    tractor: people.tractor,
     trailer,
     timeSource: stop.arrival_time_source ? String(stop.arrival_time_source) : null,
+    driver: driverName,
     test: opts.test,
   });
   return {
@@ -297,7 +349,7 @@ function buildArrivedAlert(
       planned,
       source: stop.arrival_time_source,
       driver: driverName,
-      tractor: ctx.tractor,
+      tractor: people.tractor,
       trailer: trailer || "Bobtail",
       stop_seq: seq,
       stop_type: stop.stop_type || null,
@@ -332,10 +384,10 @@ function buildNotAtStopAlert(
   const tz = String(stop.time_zone || "America/Los_Angeles");
   const facility = String(stop.facility_code || stop.stop_type || "Stop");
   const loadId = String(stop.load_id || stop.trip_id);
-  const stopCount = Math.max(1, eligible.length);
-  const seq = Number(stop.seq ?? 1);
-  const trailer = trailerFromStopRaw(stop.raw, null);
-  const driverName = ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null;
+  const { pos: seq, count: stopCount } = stopPosition(ctx, stop);
+  const people = stopPeople(ctx, stop);
+  const trailer = people.trailer;
+  const driverName = people.driver;
   const html = formatNotAtStopHtml({
     facility,
     city: stop.city ? String(stop.city) : null,
@@ -349,8 +401,9 @@ function buildNotAtStopAlert(
     overdueMinutes: Math.round(overdue / MS_MIN),
     timeZone: tz,
     eta: stop.eta ? String(stop.eta) : null,
-    tractor: ctx.tractor,
+    tractor: people.tractor,
     trailer,
+    driver: driverName,
     test: opts.test,
   });
   return {
@@ -367,7 +420,7 @@ function buildNotAtStopAlert(
       actual: null,
       eta: stop.eta || null,
       driver: driverName,
-      tractor: ctx.tractor,
+      tractor: people.tractor,
       trailer: trailer || "Bobtail",
       stop_seq: seq,
       stop_type: stop.stop_type || null,
@@ -576,6 +629,7 @@ export async function sendAllTestAlerts(
     tractor: "PXG8590",
     trailer: "ST510031",
     timeSource: "YMS",
+    driver: "Sample Driver",
     test: true,
   });
   const sampleNotAt = formatNotAtStopHtml({
@@ -593,6 +647,7 @@ export async function sendAllTestAlerts(
     eta: new Date(Date.now() + 20 * MS_MIN).toISOString(),
     tractor: "PXG7943",
     trailer: "SV2200891",
+    driver: "Sample Driver",
     test: true,
   });
 

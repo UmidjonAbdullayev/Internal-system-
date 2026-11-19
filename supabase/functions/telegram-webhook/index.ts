@@ -26,6 +26,7 @@ import {
   linkDriverKeyboard,
   linkDriverGroup,
   deleteMessage,
+  isTelegramGroupAdmin,
 } from "./helpers.ts";
 
 Deno.serve(async (req: Request) => {
@@ -69,6 +70,47 @@ Deno.serve(async (req: Request) => {
     const cmdBase = cmd.replace(/@\w+$/i, "").toLowerCase();
 
     if (isGroupChat(chat)) {
+      // /setupdates — make THIS group the shared "Driver Updates" group for ALL drivers.
+      // Only a Telegram admin/creator of this group can do it.
+      if (cmdBase === "/setupdates" || cmdBase === "/updatesoff") {
+        const isAdmin = userId != null && (await isTelegramGroupAdmin(botToken, chatId, userId));
+        if (!isAdmin) {
+          await reply(botToken, chatId, "Only an admin of this Telegram group can change where alerts go.");
+          return json({ success: true, set: false, reason: "not_group_admin" });
+        }
+        const now = new Date().toISOString();
+        if (cmdBase === "/setupdates") {
+          const { error } = await sb
+            .from("telegram_alert_config")
+            .update({
+              routing_mode: "broadcast",
+              broadcast_chat_id: chatId,
+              broadcast_title: chatTitle,
+              broadcast_set_by: String(userId),
+              broadcast_set_at: now,
+              updated_at: now,
+            })
+            .eq("id", 1);
+          if (error) {
+            await reply(botToken, chatId, `Could not set: ${error.message}`);
+            return json({ success: false, error: error.message }, 500);
+          }
+          await reply(
+            botToken,
+            chatId,
+            "✅ This group is now <b>Driver Updates</b>.\nARRIVED and NOT AT STOP alerts for <b>all drivers</b> come here. Per-driver groups get nothing.\n/test · /updatesoff",
+            undefined,
+            "HTML",
+          );
+          return json({ success: true, broadcast: chatId });
+        }
+        await sb
+          .from("telegram_alert_config")
+          .update({ routing_mode: "driver_groups", updated_at: now })
+          .eq("id", 1);
+        await reply(botToken, chatId, "Driver Updates turned off. Alerts go back to per-driver linked groups.");
+        return json({ success: true, broadcast: null });
+      }
       // /link — CRM driver buttons (name + DRV id)
       if (cmdBase === "/link") {
         const arg = text.replace(/^\/link(?:@\w+)?\s*/i, "").trim();
@@ -133,6 +175,15 @@ Deno.serve(async (req: Request) => {
         return json({ success: true, unlinked: true });
       }
       if (cmdBase === "/whoami") {
+        const { data: cfg } = await sb
+          .from("telegram_alert_config")
+          .select("routing_mode, broadcast_chat_id")
+          .eq("id", 1)
+          .maybeSingle();
+        if (cfg?.routing_mode === "broadcast" && String(cfg.broadcast_chat_id || "") === chatId) {
+          await reply(botToken, chatId, "This group is <b>Driver Updates</b>: alerts for all drivers.", undefined, "HTML");
+          return json({ success: true, whoami: "broadcast" });
+        }
         const { data: g } = await sb
           .from("driver_groups")
           .select("driver_id, relay_driver_id, driver_name, active, group_title, alerts_enabled, quiet")
@@ -157,7 +208,13 @@ Deno.serve(async (req: Request) => {
           .select("relay_driver_id, active")
           .eq("chat_id", chatId)
           .maybeSingle();
-        if (!g?.active) {
+        const { data: bc } = await sb
+          .from("telegram_alert_config")
+          .select("broadcast_chat_id")
+          .eq("id", 1)
+          .maybeSingle();
+        const isBroadcast = String(bc?.broadcast_chat_id || "") === chatId;
+        if (!g?.active && !isBroadcast) {
           await reply(botToken, chatId, "Link this group with /link before /test.");
           return json({ success: true, test: false });
         }
@@ -177,7 +234,7 @@ Deno.serve(async (req: Request) => {
           botToken,
           chatId,
           res.ok
-            ? "[TEST] samples queued to this group only. Kill switch stays OFF until you enable TELEGRAM_ALERTS_ENABLED."
+            ? "[TEST] samples sent to this group only."
             : `Test failed: ${JSON.stringify(body).slice(0, 400)}`,
         );
         return json({ success: res.ok, test: true, body });
@@ -218,7 +275,7 @@ Deno.serve(async (req: Request) => {
         await reply(
           botToken,
           chatId,
-          "Menus are disabled in groups. Open a private chat with @inter_sysbot, unlock with the CRM bot password.\nGroup cmds: /link /unlink /whoami /test /mute /unmute /status <tripId>",
+          "Menus are disabled in groups. Open a private chat with @inter_sysbot, unlock with the CRM bot password.\nGroup cmds: /setupdates /updatesoff /whoami /test /status <tripId> (driver groups: /link /unlink /mute /unmute)",
         );
         return json({ success: true, redirected: "dm_only" });
       }
