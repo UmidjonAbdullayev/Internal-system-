@@ -666,9 +666,10 @@ export function LoadsPage() {
         )}
       </Card>
 
-      <Card className="overflow-hidden">
-        {/* Sticky header — desktop */}
-        <div className="sticky top-0 z-10 hidden md:grid grid-cols-[minmax(9rem,1.1fr)_minmax(8rem,1fr)_minmax(12rem,1.4fr)_minmax(11rem,1.3fr)_minmax(7rem,0.9fr)_minmax(6.5rem,0.85fr)_2rem] gap-3 border-b border-border bg-bg/95 px-3 py-2.5 text-[10px] font-semibold uppercase tracking-wide text-text-secondary backdrop-blur">
+      {/* overflow-clip (not hidden): hidden would break the sticky headers below. */}
+      <Card className="overflow-clip">
+        {/* Column header — pinned under the top bar (h-16), fixed h-9 so rows can pin below it */}
+        <div className="sticky top-16 z-20 hidden md:grid h-9 items-center grid-cols-[minmax(9rem,1.1fr)_minmax(8rem,1fr)_minmax(12rem,1.4fr)_minmax(11rem,1.3fr)_minmax(7rem,0.9fr)_minmax(6.5rem,0.85fr)_2rem] gap-3 border-b border-border bg-bg px-3 text-[10px] font-semibold uppercase tracking-wide text-text-secondary backdrop-blur">
           <div>Trip</div>
           <div>Driver</div>
           <div>Route</div>
@@ -689,8 +690,8 @@ export function LoadsPage() {
             aria-label="Trips list"
           >
             <VirtualList
+              windowScroll
               items={filtered}
-              height={Math.min(720, Math.max(320, filtered.length * 72))}
               estimateSize={() => (expandedId ? 220 : 72)}
               getKey={(trip) => trip.id || trip.tripId}
               renderRow={(trip, index) => (

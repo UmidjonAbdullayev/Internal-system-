@@ -112,8 +112,8 @@ export const TripRow = memo(function TripRow({
         }}
         className={cn(
           'hidden md:grid w-full cursor-pointer grid-cols-[minmax(9rem,1.1fr)_minmax(8rem,1fr)_minmax(12rem,1.4fr)_minmax(11rem,1.3fr)_minmax(7rem,0.9fr)_minmax(6.5rem,0.85fr)_2rem] items-start gap-3 px-3 py-3 text-left',
-          // Expanded: header stays pinned while scrolling through this trip's details.
-          expanded && 'sticky top-0 z-[5] border-b border-border bg-card shadow-sm',
+          // Expanded: pinned under top bar (64px) + column header (36px) while scrolling this trip.
+          expanded && 'sticky top-[100px] z-10 border-b border-border bg-card shadow-sm',
         )}
         aria-expanded={expanded}
       >
@@ -219,7 +219,7 @@ export const TripRow = memo(function TripRow({
         }}
         className={cn(
           'md:hidden w-full cursor-pointer space-y-2 px-3 py-3 text-left',
-          expanded && 'sticky top-0 z-[5] border-b border-border bg-card shadow-sm',
+          expanded && 'sticky top-16 z-10 border-b border-border bg-card shadow-sm',
         )}
         aria-expanded={expanded}
       >
