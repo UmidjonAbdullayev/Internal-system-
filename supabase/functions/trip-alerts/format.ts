@@ -82,8 +82,15 @@ export type ArrivedInput = {
   tractor?: string | null;
   trailer?: string | null;
   timeSource?: string | null;
+  /** Driver on THIS stop's leg (shared group: dispatchers scan by name). */
+  driver?: string | null;
   test?: boolean;
 };
+
+function driverHead(driver: string | null | undefined): string {
+  const d = String(driver || "").trim();
+  return d ? `<b>${esc(d)}</b>` : "<b>Driver —</b>";
+}
 
 export function formatArrivedHtml(input: ArrivedInput): string {
   const place = [input.city, input.state].filter(Boolean).join(", ");
@@ -92,7 +99,7 @@ export function formatArrivedHtml(input: ArrivedInput): string {
   const trailer = input.trailer?.trim() || "Bobtail";
   const prefix = input.test ? "[TEST] " : "";
   const lines = [
-    `${prefix}📍 <b>Arrived · ${esc(input.facility)}</b>${place ? ` (${esc(place)})` : ""}`,
+    `${prefix}📍 ${driverHead(input.driver)} · Arrived <b>${esc(input.facility)}</b>${place ? ` (${esc(place)})` : ""}`,
     `Trip <b>${esc(input.tripId)}</b> · Load ${esc(input.loadId)} · Stop ${input.stopSeq} of ${input.stopCount}${stopType}`,
     `Arrived <b>${esc(formatTimeAbbr(input.actualAt, input.timeZone))}</b>` +
       (input.plannedAt
@@ -120,6 +127,7 @@ export type NotAtStopInput = {
   eta?: string | null;
   tractor?: string | null;
   trailer?: string | null;
+  driver?: string | null;
   test?: boolean;
 };
 
@@ -129,7 +137,7 @@ export function formatNotAtStopHtml(input: NotAtStopInput): string {
   const trailer = input.trailer?.trim() || "Bobtail";
   const prefix = input.test ? "[TEST] " : "";
   const lines = [
-    `${prefix}⏰ <b>Not at stop · ${esc(input.facility)}</b>${place ? ` (${esc(place)})` : ""}`,
+    `${prefix}⏰ ${driverHead(input.driver)} · NOT at <b>${esc(input.facility)}</b>${place ? ` (${esc(place)})` : ""}`,
     `Trip <b>${esc(input.tripId)}</b> · Load ${esc(input.loadId)} · Stop ${input.stopSeq} of ${input.stopCount}${stopType}`,
     `Scheduled <b>${esc(formatTimeAbbr(input.plannedAt, input.timeZone))}</b> · now <b>${esc(formatDurationMinutes(input.overdueMinutes))}</b> overdue`,
   ];

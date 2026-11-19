@@ -1,20 +1,73 @@
-import { Copy, ExternalLink, MapPin } from 'lucide-react';
+import { Copy, ExternalLink, MapPin, User } from 'lucide-react';
 import { toast } from 'sonner';
-import type { RelayLeg, RelayStop, RelayTrip } from '@/types';
+import type { RelayStop, RelayTrip } from '@/types';
+import { cn } from '@/lib/utils';
 import {
+  allStops,
+  buildStopStatuses,
   cptWarning,
   formatLocalStopTime,
+  legDriverName,
+  legForStop,
   mapsUrl,
   minutesLate,
   stopAddressLine,
   stopTypeLabel,
   timeSourceLabel,
+  tripDriverNames,
   tripLateReason,
+  type StopStatus,
+  type StopStatusKind,
 } from '@/lib/relayTrips';
 
-function legForStop(trip: RelayTrip, stop: RelayStop): RelayLeg | null {
-  return trip.legs.find((l) => l.loadId === stop.loadId) || null;
-}
+/** Colours per stop state — same meaning as the progress bar (see Legend). */
+const STATE_STYLE: Record<
+  StopStatusKind,
+  { circle: string; badge: string; word: string; line: string }
+> = {
+  done: {
+    circle: 'border-success bg-success text-white',
+    badge: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    word: 'text-emerald-700',
+    line: 'text-emerald-800',
+  },
+  at_stop: {
+    circle: 'border-info bg-info text-white ring-2 ring-info/40 ring-offset-1',
+    badge: 'border-blue-300 bg-blue-50 text-blue-700',
+    word: 'text-blue-700',
+    line: 'text-blue-800 font-medium',
+  },
+  next: {
+    circle: 'border-2 border-info bg-card text-info',
+    badge: 'border-blue-200 bg-white text-blue-700',
+    word: 'text-blue-700',
+    line: 'text-text',
+  },
+  next_late: {
+    circle: 'border-2 border-danger bg-danger-bg text-danger',
+    badge: 'border-red-200 bg-red-50 text-red-700',
+    word: 'text-red-700',
+    line: 'text-red-700 font-medium',
+  },
+  upcoming: {
+    circle: 'border-slate-300 bg-card text-text-secondary',
+    badge: 'border-border bg-bg text-text-secondary',
+    word: 'text-text-secondary',
+    line: 'text-text-secondary',
+  },
+  cancelled: {
+    circle: 'border-dashed border-slate-300 bg-slate-50 text-slate-400',
+    badge: 'border-slate-200 bg-slate-50 text-slate-400 line-through',
+    word: 'text-slate-400',
+    line: 'text-slate-400',
+  },
+};
+
+const TIMING_STYLE = {
+  early: 'text-blue-700',
+  on_time: 'text-emerald-700',
+  late: 'text-red-700',
+} as const;
 
 function copyText(label: string, value: string) {
   void navigator.clipboard.writeText(value).then(
@@ -32,13 +85,19 @@ function StopBlock({
   stop,
   index,
   isLast,
+  status,
+  showDriver,
 }: {
   trip: RelayTrip;
   stop: RelayStop;
   index: number;
   isLast: boolean;
+  status: StopStatus;
+  showDriver: boolean;
 }) {
   const leg = legForStop(trip, stop);
+  const style = STATE_STYLE[status.kind];
+  const driver = legDriverName(trip, leg);
   const address = stopAddressLine(stop);
   // CPT only when no CHECKOUT actual and CPT already passed (see cptWarning).
   const showCpt =
@@ -66,25 +125,60 @@ function StopBlock({
   const etaArr = formatLocalStopTime(stop.eta, stop.timeZone, stop.etaLocal);
 
   return (
-    <li className="relative flex gap-3 pb-5 last:pb-0">
+    <li
+      className={cn('relative flex gap-3 pb-5 last:pb-0', status.kind === 'cancelled' && 'opacity-70')}
+      data-stop-state={status.kind}
+    >
       {!isLast && (
         <span
-          className="absolute left-[15px] top-8 bottom-0 w-px border-l border-dashed border-border"
+          className={cn(
+            'absolute left-[15px] top-8 bottom-0 w-px border-l',
+            status.kind === 'done' ? 'border-solid border-success' : 'border-dashed border-border',
+          )}
           aria-hidden
         />
       )}
-      <div className="relative z-[1] flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-secondary bg-info-bg text-xs font-semibold text-primary">
-        {stop.seq ?? index + 1}
+      <div
+        className={cn(
+          'relative z-[1] flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-xs font-semibold',
+          style.circle,
+        )}
+        title={status.label}
+      >
+        {index + 1}
       </div>
       <div className="min-w-0 flex-1 space-y-2">
-        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className="font-mono text-sm font-semibold text-text">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span
+            className={cn(
+              'font-mono text-sm font-semibold',
+              status.kind === 'cancelled' ? 'text-slate-400 line-through' : 'text-text',
+            )}
+          >
             {stop.facilityCode || `Stop ${stop.seq ?? index + 1}`}
           </span>
-          <span className="rounded border border-border bg-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
+          <span
+            className={cn(
+              'rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+              style.badge,
+            )}
+          >
             {stopTypeLabel(stop)}
           </span>
+          <span className={cn('text-[11px] font-semibold uppercase tracking-wide', style.word)}>
+            {status.label}
+          </span>
+          {showDriver && driver && (
+            <span className="inline-flex items-center gap-1 rounded-md bg-bg px-1.5 py-0.5 text-[11px] text-text-secondary">
+              <User className="h-3 w-3" aria-hidden />
+              {driver}
+            </span>
+          )}
+          {stop.loadId && (
+            <span className="font-mono text-[10px] text-text-secondary">Load {stop.loadId}</span>
+          )}
         </div>
+        <p className={cn('text-xs', style.line)}>{status.line}</p>
         {address && (
           <div className="flex flex-wrap items-center gap-2 text-xs text-text-secondary">
             <MapPin className="h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -121,7 +215,12 @@ function StopBlock({
               <p className="mt-0.5 text-text-secondary">Sch —</p>
             )}
             {actArr !== '—' ? (
-              <p className="mt-0.5 font-medium text-text">
+              <p
+                className={cn(
+                  'mt-0.5 font-medium',
+                  status.arrivalTiming ? TIMING_STYLE[status.arrivalTiming] : 'text-text',
+                )}
+              >
                 Actual {actArr}
                 {lateSuffix(arrLate)}
               </p>
@@ -166,10 +265,12 @@ function StopBlock({
 }
 
 export function TripStopTimeline({ trip }: { trip: RelayTrip }) {
-  const stops = trip.legs.flatMap((l) => l.stops).sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  const stops = allStops(trip);
   if (!stops.length) {
     return <p className="text-sm text-text-secondary">No stops synced for this trip.</p>;
   }
+  const statuses = buildStopStatuses(trip);
+  const multiDriver = tripDriverNames(trip).length > 1;
   return (
     <ul className="space-y-0">
       {stops.map((stop, i) => (
@@ -179,6 +280,8 @@ export function TripStopTimeline({ trip }: { trip: RelayTrip }) {
           stop={stop}
           index={i}
           isLast={i === stops.length - 1}
+          status={statuses.get(stop)!}
+          showDriver={multiDriver}
         />
       ))}
     </ul>

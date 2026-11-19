@@ -983,3 +983,21 @@ export async function handleCallback(
     await reply(botToken, chatId, await buildTourText(sb, session.selected_driver_id), mainMenuKeyboard());
   }
 }
+
+/** True if the Telegram user is creator/administrator of the group. */
+export async function isTelegramGroupAdmin(
+  botToken: string,
+  chatId: string,
+  userId: number,
+): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${botToken}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${userId}`,
+    );
+    const body = await res.json().catch(() => ({}));
+    const status = String(body?.result?.status || "");
+    return status === "creator" || status === "administrator";
+  } catch {
+    return false;
+  }
+}
