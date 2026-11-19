@@ -84,6 +84,8 @@ export type ArrivedInput = {
   timeSource?: string | null;
   /** Driver on THIS stop's leg (shared group: dispatchers scan by name). */
   driver?: string | null;
+  /** Minutes between the check-in and when we saw it (Relay/YMS can post late). */
+  reportedAfterMinutes?: number | null;
   test?: boolean;
 };
 
@@ -109,6 +111,9 @@ export function formatArrivedHtml(input: ArrivedInput): string {
     `🚛 Tractor <b>${esc(input.tractor || "—")}</b> · Trailer <b>${esc(trailer)}</b>`,
     `Source: ${esc(sourceLabel(input.timeSource))}`,
   ];
+  if (input.reportedAfterMinutes != null && input.reportedAfterMinutes >= 10) {
+    lines.push(`<i>Check-in showed up in Relay ${esc(formatDurationMinutes(input.reportedAfterMinutes))} later</i>`);
+  }
   return lines.join("\n");
 }
 

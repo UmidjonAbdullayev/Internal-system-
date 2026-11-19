@@ -14,6 +14,8 @@ export type AlertConfig = {
   routing_mode: "driver_groups" | "broadcast";
   broadcast_chat_id: string | null;
   broadcast_title: string | null;
+  /** Arrivals checked in before this are never alerted (no flood on switch-on). */
+  arrival_alerts_since: string | null;
 };
 
 /** Shared "Driver Updates" group, when broadcast routing is on and a chat is set. */
@@ -56,6 +58,7 @@ export async function loadConfig(sb: SupabaseClient): Promise<AlertConfig> {
     routing_mode: data?.routing_mode === "broadcast" ? "broadcast" : "driver_groups",
     broadcast_chat_id: data?.broadcast_chat_id ? String(data.broadcast_chat_id) : null,
     broadcast_title: data?.broadcast_title ? String(data.broadcast_title) : null,
+    arrival_alerts_since: data?.arrival_alerts_since ? String(data.arrival_alerts_since) : null,
   };
 }
 
