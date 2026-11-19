@@ -20,6 +20,8 @@ import {
   filterWeekIncome,
   filterWeekPendingInvoice,
   groupReportLoadsByWeekLabel,
+  moneyBucketLabel,
+  sortReportLoads,
   sumAmazonPaid,
   sumDriverPaid,
   sumWeekIncomeReconciled,
@@ -28,6 +30,7 @@ import {
 } from '@/lib/reportLoadMoney';
 import { computeRpm, formatSheetDate } from '@/lib/reportRows';
 import { toast } from 'sonner';
+import type { LoadReport } from '@/types';
 
 /** Excel + screen columns (exact sheet headers). */
 const REPORT_HEADERS = [
@@ -71,6 +74,13 @@ type EditForm = {
 
 function rowToCsv(r: ReportLoadRow): (string | number)[] {
   return [
+    ...rowToSheet(r),
+    moneyBucketLabel(r),
+  ];
+}
+
+function rowToSheet(r: ReportLoadRow): (string | number)[] {
+  return [
     r.broker,
     r.tripDisplay,
     r.loadIds,
@@ -91,6 +101,7 @@ function rowToCsv(r: ReportLoadRow): (string | number)[] {
 export function ReportsPage() {
   const {
     reportLoads,
+    loadReports,
     drivers,
     invoices,
     invoiceTrips,
@@ -142,12 +153,33 @@ export function ReportsPage() {
     () => groupReportLoadsByWeekLabel(incomeRows, sortKey, sortDir),
     [incomeRows, sortDir, sortKey],
   );
+  const pendingSorted = useMemo(
+    () => sortReportLoads(pendingRows, sortKey, sortDir),
+    [pendingRows, sortDir, sortKey],
+  );
+  const expectedSorted = useMemo(
+    () => sortReportLoads(expectedRows, sortKey, sortDir),
+    [expectedRows, sortDir, sortKey],
+  );
+  // Manual rows (non-Relay loads added via Quick Add → Manual). Shown, not counted in Relay totals.
+  const manualRows = useMemo(
+    () =>
+      loadReports.filter((r) => {
+        if (r.source !== 'manual') return false;
+        const d = (r.pickupDate || r.deliveryDate || '').slice(0, 10);
+        return Boolean(d) && d >= week.start && d <= week.end;
+      }),
+    [loadReports, week.end, week.start],
+  );
 
   // Week income = SUM of trip payouts only (never invoice amounts).
   const amazonTotal = reconciled.income;
-  const driverTotal = sumDriverPaid(incomeRows);
-  const estimatedCount = pendingRows.length;
+  const pendingTotal = sumAmazonPaid(pendingRows);
+  const expectedTotal = sumAmazonPaid(expectedRows);
+  const driverTotal = sumDriverPaid([...incomeRows, ...pendingRows]);
   const invoiceWeekCount = reconciled.incomeTripCount;
+  const anyRows =
+    incomeRows.length + pendingRows.length + expectedRows.length + manualRows.length > 0;
   const paidCount = incomeRows.filter((r) => /paid/i.test(r.paidStatus)).length;
   const pendingCount = incomeRows.filter((r) => /pend/i.test(r.paidStatus)).length;
 
@@ -187,8 +219,13 @@ export function ReportsPage() {
   const exportCSV = () => {
     downloadCSV(
       `reports-${week.label}-${week.start}.csv`,
-      [...REPORT_HEADERS],
-      incomeRows.map(rowToCsv),
+      [...REPORT_HEADERS, 'Status'],
+      [
+        ...sortReportLoads(incomeRows, sortKey, sortDir).map(rowToCsv),
+        ...pendingSorted.map(rowToCsv),
+        ...expectedSorted.map(rowToCsv),
+        ...manualRows.map((m) => [...manualToSheet(m), 'Manual (not from Relay)']),
+      ],
     );
   };
 
@@ -206,13 +243,13 @@ export function ReportsPage() {
     <div>
       <PageHeader
         title="Reports"
-        subtitle={`${week.header} · income = Σ trip payouts (completed/TONU on MAIN) · invoices comparison-only · one row per tour`}
+        subtitle={`${week.header} · one row per tour · income is confirmed when Amazon's weekly invoice arrives (usually Mon–Tue after the week ends)`}
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={refreshing}>
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> Refresh
             </Button>
-            <Button variant="outline" size="sm" onClick={exportCSV} disabled={!incomeRows.length}>
+            <Button variant="outline" size="sm" onClick={exportCSV} disabled={!anyRows}>
               <Download className="h-4 w-4" /> Export
             </Button>
           </>
@@ -253,11 +290,31 @@ export function ReportsPage() {
         </div>
       ) : (
         <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-6">
-          <Stat label="Income trips" value={String(invoiceWeekCount)} />
-          <Stat label="Week income (Σ payouts)" value={formatCurrency(amazonTotal)} />
-          <Stat label="Driver Paid" value={formatCurrency(driverTotal)} />
-          <Stat label="Adj invoices (compare)" value={formatCurrency(reconciled.adjustments)} />
-          <Stat label="Pending invoice" value={`${estimatedCount} · ${formatCurrency(reconciled.pending)}`} />
+          <Stat
+            label="Invoiced income"
+            value={formatCurrency(amazonTotal)}
+            hint={`${invoiceWeekCount} trips on Amazon's invoice`}
+          />
+          <Stat
+            label="Completed · awaiting invoice"
+            value={formatCurrency(pendingTotal)}
+            hint={`${pendingRows.length} trips delivered, not invoiced yet`}
+          />
+          <Stat
+            label="Week total so far"
+            value={formatCurrency(amazonTotal + pendingTotal)}
+            hint="Invoiced + awaiting invoice"
+          />
+          <Stat
+            label="In progress"
+            value={formatCurrency(expectedTotal)}
+            hint={`${expectedRows.length} trips not delivered yet`}
+          />
+          <Stat
+            label="Driver paid"
+            value={formatCurrency(driverTotal)}
+            hint="Invoiced + awaiting invoice"
+          />
           <Stat
             label="Paid status"
             value={
@@ -281,28 +338,15 @@ export function ReportsPage() {
         <p className="mb-2 text-xs text-text-secondary">Updating in background…</p>
       )}
 
-      {(adjInvoices.length > 0 || expectedRows.length > 0 || pendingRows.length > 0) && (
-        <div className="mb-4 rounded-xl border border-border bg-white px-4 py-3 text-sm space-y-1">
+      {adjInvoices.length > 0 && (
+        <div className="mb-4 space-y-1 rounded-xl border border-border bg-white px-4 py-3 text-sm">
           {adjInvoices.map((inv) => (
             <p key={inv.invoiceId}>
-              <span className="font-medium">Adj invoice (comparison only)</span>{' '}
+              <span className="font-medium">Adjustment invoice (comparison only)</span>{' '}
               {inv.invoiceId.slice(0, 12)}… {formatCurrency(inv.amount)} · {inv.status} — not in
               week income
             </p>
           ))}
-          {pendingRows.length > 0 && (
-            <p className="text-text-secondary">
-              Pending invoice (completed/TONU, estimated by final delivery): {pendingRows.length}{' '}
-              tours · {formatCurrency(sumAmazonPaid(pendingRows))} — excluded from week income
-            </p>
-          )}
-          {expectedRows.filter((r) => r.amazonPaid > 0).length > 0 && (
-            <p className="text-text-secondary">
-              Expected (in-transit/upcoming):{' '}
-              {expectedRows.filter((r) => r.amazonPaid > 0).length} tours ·{' '}
-              {formatCurrency(sumAmazonPaid(expectedRows))} — separate from income
-            </p>
-          )}
         </div>
       )}
 
@@ -310,10 +354,10 @@ export function ReportsPage() {
         <div className="overflow-hidden rounded-xl border border-border bg-white">
           <TableSkeleton rows={12} cols={8} />
         </div>
-      ) : incomeRows.length === 0 ? (
+      ) : !anyRows ? (
         <EmptyState
-          title="No income tours this Amazon week"
-          description="Week income = completed/TONU on MAIN invoice. Expected and pending-invoice tours are listed above when present."
+          title="No trips this Amazon week"
+          description="Nothing delivered, in progress or invoiced for this Sunday–Saturday week."
         />
       ) : (
         <div className="overflow-hidden rounded-xl border border-border bg-white">
@@ -353,9 +397,65 @@ export function ReportsPage() {
                 </tr>
               </thead>
               <tbody>
+                {incomeRows.length > 0 && (
+                  <SectionRow
+                    tone="income"
+                    title="Invoiced by Amazon"
+                    rows={incomeRows}
+                    note="Confirmed income"
+                  />
+                )}
                 {groups.map((g) => (
                   <GroupRows key={g.week} week={g.week} rows={g.rows} onEdit={openEdit} />
                 ))}
+                {pendingSorted.length > 0 && (
+                  <>
+                    <SectionRow
+                      tone="pending"
+                      title="Completed — waiting for Amazon's invoice"
+                      rows={pendingSorted}
+                      note="Week is estimated from delivery date until the invoice confirms it"
+                    />
+                    {pendingSorted.map((r) => (
+                      <ReportLoadRowView key={r.tourId} r={r} onEdit={openEdit} />
+                    ))}
+                  </>
+                )}
+                {expectedSorted.length > 0 && (
+                  <>
+                    <SectionRow
+                      tone="expected"
+                      title="In progress — not delivered yet"
+                      rows={expectedSorted}
+                      note="Not income yet"
+                    />
+                    {expectedSorted.map((r) => (
+                      <ReportLoadRowView key={r.tourId} r={r} onEdit={openEdit} />
+                    ))}
+                  </>
+                )}
+                {manualRows.length > 0 && (
+                  <>
+                    <tr className="bg-slate-100">
+                      <td colSpan={16} className="px-3 py-1.5 text-xs font-bold text-slate-700">
+                        Manual rows (not from Relay) · {manualRows.length} ·{' '}
+                        {formatCurrency(manualRows.reduce((s, m) => s + (Number(m.amazonPaid) || 0), 0))}
+                        <span className="ml-2 font-normal text-slate-500">not counted in the totals above</span>
+                      </td>
+                    </tr>
+                    {manualRows.map((m) => (
+                      <tr key={m.id} className="border-b border-border/60 text-slate-700">
+                        {manualToSheet(m).map((v, i) => (
+                          <td key={i} className="whitespace-nowrap px-2 py-1.5 text-xs">
+                            {typeof v === 'number' && (i === 9 || i === 10) ? formatCurrency(v) : String(v || '—')}
+                          </td>
+                        ))}
+                        <td className="px-2 py-1.5 text-xs">Manual</td>
+                        <td />
+                      </tr>
+                    ))}
+                  </>
+                )}
               </tbody>
             </table>
           </div>
@@ -427,12 +527,59 @@ export function ReportsPage() {
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="rounded-xl border border-border bg-white px-4 py-3">
       <p className="text-[11px] font-semibold uppercase tracking-wide text-text-secondary">{label}</p>
       <p className="mt-1 text-lg font-semibold tabular-nums">{value}</p>
+      {hint && <p className="mt-0.5 text-[11px] text-text-secondary">{hint}</p>}
     </div>
+  );
+}
+
+function manualToSheet(m: LoadReport): (string | number)[] {
+  return [
+    m.broker,
+    m.trip,
+    m.loadIds,
+    m.driverName,
+    formatSheetDate(m.pickupDate),
+    formatSheetDate(m.deliveryDate),
+    m.puLocation,
+    m.delLocation,
+    m.mile,
+    m.amazonPaid,
+    m.driverPaid,
+    m.rpm || computeRpm(m.amazonPaid, m.mile) || '',
+    m.comment,
+    m.dispatch,
+  ];
+}
+
+const SECTION_TONE = {
+  income: 'bg-emerald-50 text-emerald-800',
+  pending: 'bg-amber-50 text-amber-900',
+  expected: 'bg-blue-50 text-blue-800',
+} as const;
+
+function SectionRow({
+  tone,
+  title,
+  rows,
+  note,
+}: {
+  tone: keyof typeof SECTION_TONE;
+  title: string;
+  rows: ReportLoadRow[];
+  note: string;
+}) {
+  return (
+    <tr className={SECTION_TONE[tone]}>
+      <td colSpan={16} className="px-3 py-2 text-xs font-bold">
+        {title} · {rows.length} trips · {formatCurrency(sumAmazonPaid(rows))}
+        <span className="ml-2 font-normal opacity-80">{note}</span>
+      </td>
+    </tr>
   );
 }
 
@@ -497,7 +644,7 @@ const ReportLoadRowView = memo(function ReportLoadRowView({
             className="max-w-[140px] truncate px-2 py-1.5 text-xs"
             title={
               r.estimatedWeek
-                ? `Estimated week from pickup (${r.weekLabel})`
+                ? `Estimated week from delivery date (${r.weekLabel}); confirmed when the invoice arrives`
                 : `Invoice week ${r.weekLabel}${r.invoiceId ? ` · ${r.invoiceId}` : ''}`
             }
           >
@@ -514,7 +661,15 @@ const ReportLoadRowView = memo(function ReportLoadRowView({
           </td>
           <td className="px-2 py-1.5 text-xs">{r.dispatch || '—'}</td>
           <td className="whitespace-nowrap px-2 py-1.5 text-xs">
-            {r.paidStatus ? (
+            {r.moneyBucket === 'pending_invoice' ? (
+              <span className="rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-800">
+                Awaiting invoice
+              </span>
+            ) : r.moneyBucket === 'expected' ? (
+              <span className="rounded bg-blue-100 px-1.5 py-0.5 font-semibold text-blue-800">
+                In progress
+              </span>
+            ) : r.paidStatus ? (
               <span
                 className={
                   /paid/i.test(r.paidStatus)

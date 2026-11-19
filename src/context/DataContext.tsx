@@ -950,11 +950,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
       setLoadOverrides((prev) => {
         const next: LoadOverrideRow = {
           tourId: bare,
-          driverName: patch.driverName ?? prevOverride?.driverName ?? null,
-          driverPaid: patch.driverPaid ?? prevOverride?.driverPaid ?? null,
-          comment: patch.comment ?? prevOverride?.comment ?? null,
-          dispatch: patch.dispatch ?? prevOverride?.dispatch ?? null,
-          mile: patch.mile ?? prevOverride?.mile ?? null,
+          driverName: patch.driverName !== undefined ? patch.driverName : (prevOverride?.driverName ?? null),
+          driverPaid: patch.driverPaid !== undefined ? patch.driverPaid : (prevOverride?.driverPaid ?? null),
+          comment: patch.comment !== undefined ? patch.comment : (prevOverride?.comment ?? null),
+          dispatch: patch.dispatch !== undefined ? patch.dispatch : (prevOverride?.dispatch ?? null),
+          mile: patch.mile !== undefined ? patch.mile : (prevOverride?.mile ?? null),
           broker: patch.broker ?? prevOverride?.broker ?? 'Amazon',
           source: 'manual',
           legacyReportIds: prevOverride?.legacyReportIds ?? [],
@@ -989,14 +989,18 @@ export function DataProvider({ children }: { children: ReactNode }) {
         );
       }
 
+      // Merge with the existing override: saving one field (e.g. dispatch) must not
+      // wipe the others (driver paid, comment…). `undefined` = keep; `null` = clear.
+      const keep = <T,>(next: T | undefined, prev: T | null | undefined): T | null =>
+        next !== undefined ? next : (prev ?? null);
       const row = {
         tour_id: bare,
-        driver_name: patch.driverName ?? null,
-        driver_paid: patch.driverPaid ?? null,
-        comment: patch.comment ?? null,
-        dispatch: patch.dispatch ?? null,
-        mile: patch.mile ?? null,
-        broker: patch.broker ?? 'Amazon',
+        driver_name: keep(patch.driverName, prevOverride?.driverName),
+        driver_paid: keep(patch.driverPaid, prevOverride?.driverPaid),
+        comment: keep(patch.comment, prevOverride?.comment),
+        dispatch: keep(patch.dispatch, prevOverride?.dispatch),
+        mile: keep(patch.mile, prevOverride?.mile),
+        broker: keep(patch.broker, prevOverride?.broker) ?? 'Amazon',
         source: 'manual',
         updated_at: ts,
       };

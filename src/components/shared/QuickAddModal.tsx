@@ -1,15 +1,25 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Modal } from '@/components/ui/Modal';
 import { Button } from '@/components/ui/Button';
 import { Field, Input, Select } from '@/components/ui/Input';
 import { useData } from '@/context/DataContext';
+import { computeRpm, formatSheetDate } from '@/lib/reportRows';
 import {
-  buildReportFromLoad,
-  findLoadsByLookup,
-} from '@/lib/reportRows';
-import { formatCurrency, formatDate } from '@/lib/utils';
-import type { Load, LoadReport } from '@/types';
+  findReportLoads,
+  moneyBucketLabel,
+  type ReportLoadRow,
+} from '@/lib/reportLoadMoney';
+import {
+  compareStops,
+  facilityLabel,
+  isLegCancelled,
+  legDriverName,
+  orderedLegs,
+  tripDriverNames,
+} from '@/lib/relayTrips';
+import { cn, formatCurrency } from '@/lib/utils';
+import type { LoadReport, RelayTrip } from '@/types';
 import { toast } from 'sonner';
 
 type Mode = 'auto' | 'manual';
@@ -55,18 +65,22 @@ export function QuickAddModal({
 }) {
   const navigate = useNavigate();
   const {
-    loads,
-    drivers,
     loadReports,
     addLoadReport,
-    updateLoadReport,
+    reportLoads,
+    relayTrips,
+    ensureTripStops,
+    upsertLoadOverride,
   } = useData();
 
   const [mode, setMode] = useState<Mode>('auto');
   const [loadQuery, setLoadQuery] = useState('');
   const [dispatch, setDispatch] = useState('');
   const [lookupError, setLookupError] = useState<string | null>(null);
-  const [matched, setMatched] = useState<Load[]>([]);
+  const [matched, setMatched] = useState<ReportLoadRow[]>([]);
+  const [pickedTour, setPickedTour] = useState<string | null>(null);
+  const [comment, setComment] = useState('');
+  const [saving, setSaving] = useState(false);
   const [manual, setManual] = useState<ManualForm>(emptyManual);
 
   const dispatchOptions = useMemo(() => {
@@ -74,8 +88,11 @@ export function QuickAddModal({
     for (const r of loadReports) {
       if (r.dispatch.trim()) set.add(r.dispatch.trim());
     }
+    for (const r of reportLoads) {
+      if (r.dispatch.trim()) set.add(r.dispatch.trim());
+    }
     return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [loadReports]);
+  }, [loadReports, reportLoads]);
 
   const reset = () => {
     setMode('auto');
@@ -83,6 +100,8 @@ export function QuickAddModal({
     setDispatch('');
     setLookupError(null);
     setMatched([]);
+    setPickedTour(null);
+    setComment('');
     setManual(emptyManual());
   };
 
@@ -91,48 +110,46 @@ export function QuickAddModal({
     onClose();
   };
 
+  const selectTour = (row: ReportLoadRow | undefined) => {
+    setPickedTour(row?.tourId ?? null);
+    // Prefill with what's already saved for this tour.
+    setDispatch(row?.dispatch || '');
+    setComment(row?.comment || '');
+    const trip = row ? relayTrips.find((t) => tourKey(t.tripId) === row.tourId) : null;
+    if (trip) void ensureTripStops([trip.tripId]);
+  };
+
   const runLookup = () => {
     setLookupError(null);
-    const hits = findLoadsByLookup(loads, loadQuery);
+    const hits = findReportLoads(reportLoads, loadQuery);
+    setMatched(hits);
     if (!hits.length) {
-      setMatched([]);
+      selectTour(undefined);
       setLookupError(
-        `No synced tour found for “${loadQuery.trim()}”. Switch to Manual or check the Load ID.`,
+        `No synced tour found for “${loadQuery.trim()}”. Check the ID, or use Manual for a non-Relay load.`,
       );
       return;
     }
-    // Prefer assigned / in-transit over bare spot bookings with same id
-    const ranked = [...hits].sort((a, b) => {
-      const score = (l: Load) => {
-        let s = 0;
-        if (l.driverId || (l.driverNameRaw && !/^spot/i.test(l.driverNameRaw))) s += 2;
-        if (l.tripBucket === 'in_transit' || l.loadStatus === 'In Transit') s += 1;
-        if (l.parentTripId) s += 1;
-        return s;
-      };
-      return score(b) - score(a);
-    });
-    setMatched(ranked);
+    selectTour(hits[0]);
   };
 
-  const saveFromLoad = (load: Load) => {
+  const saveTour = async (row: ReportLoadRow) => {
     if (!dispatch.trim()) {
       toast.error('Dispatch name is required');
       return;
     }
-    const payload = buildReportFromLoad(load, drivers, dispatch.trim(), 'auto');
-    const existing = loadReports.find((r) => r.loadUuid === load.id);
-    if (existing) {
-      updateLoadReport(existing.id, {
-        ...payload,
+    setSaving(true);
+    try {
+      // Relay tours are already in Reports automatically; this only stores the manual fields.
+      await upsertLoadOverride(row.tourId, {
         dispatch: dispatch.trim(),
-        source: 'auto',
+        comment: comment.trim() || null,
       });
-    } else {
-      addLoadReport(payload);
+      handleClose();
+      navigate('/reports');
+    } finally {
+      setSaving(false);
     }
-    handleClose();
-    navigate('/reports');
   };
 
   const saveManual = () => {
@@ -175,8 +192,9 @@ export function QuickAddModal({
     navigate('/reports');
   };
 
-  const preview = matched[0]
-    ? buildReportFromLoad(matched[0], drivers, dispatch.trim() || '—', 'auto')
+  const preview = matched.find((m) => m.tourId === pickedTour) || null;
+  const previewTrip = preview
+    ? relayTrips.find((t) => tourKey(t.tripId) === preview.tourId) || null
     : null;
 
   return (
@@ -192,10 +210,10 @@ export function QuickAddModal({
           </Button>
           {mode === 'auto' ? (
             <Button
-              disabled={!matched[0] || !dispatch.trim()}
-              onClick={() => matched[0] && saveFromLoad(matched[0])}
+              disabled={!preview || !dispatch.trim() || saving}
+              onClick={() => preview && void saveTour(preview)}
             >
-              Add to Reports
+              Save to Reports
             </Button>
           ) : (
             <Button onClick={saveManual}>Add to Reports</Button>
@@ -234,18 +252,20 @@ export function QuickAddModal({
       {mode === 'auto' ? (
         <div className="space-y-4">
           <p className="text-xs text-text-secondary">
-            Enter a Load ID (or trip id). We fill the report row from synced Relay tours.
+            Enter a trip ID (T-…) or any load ID. Relay tours are already in Reports automatically;
+            here you check the tour and set its Dispatch / Comment.
           </p>
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Load ID">
+            <Field label="Trip or Load ID">
               <Input
                 value={loadQuery}
                 onChange={(e) => {
                   setLoadQuery(e.target.value);
                   setLookupError(null);
                   setMatched([]);
+                  setPickedTour(null);
                 }}
-                placeholder="e.g. 112B7NG3F or T-112B7NG3F"
+                placeholder="e.g. T-1133L9DZ1 or 115M168Z4"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     e.preventDefault();
@@ -297,32 +317,33 @@ export function QuickAddModal({
             </div>
           )}
 
-          {preview && (
-            <div className="rounded-lg border border-border bg-bg p-3 text-xs space-y-1.5">
-              <p className="text-sm font-semibold text-text">Preview</p>
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
-                <span><span className="text-text-secondary">Trip</span> {preview.trip || '—'}</span>
-                <span><span className="text-text-secondary">Load</span> {preview.loadIds || '—'}</span>
-                <span><span className="text-text-secondary">Driver</span> {preview.driverName || '—'}</span>
-                <span><span className="text-text-secondary">PU</span> {formatDate(preview.pickupDate, 'dd.MM.yyyy')}</span>
-                <span><span className="text-text-secondary">Del</span> {formatDate(preview.deliveryDate, 'dd.MM.yyyy')}</span>
-                <span><span className="text-text-secondary">Mile</span> {preview.mile || '—'}</span>
-                <span><span className="text-text-secondary">Amazon</span> {formatCurrency(preview.amazonPaid)}</span>
-                <span><span className="text-text-secondary">RPM</span> {formatCurrency(preview.rpm)}</span>
-                <span><span className="text-text-secondary">Week</span> {preview.comment || '—'}</span>
-                <span className="col-span-2"><span className="text-text-secondary">From</span> {preview.puLocation || '—'}</span>
-                <span className="col-span-2"><span className="text-text-secondary">To</span> {preview.delLocation || '—'}</span>
-              </div>
-              {matched.length > 1 && (
-                <p className="pt-1 text-text-secondary">
-                  {matched.length} matches — using best ranked tour. Others:{' '}
-                  {matched
-                    .slice(1, 4)
-                    .map((m) => m.loadId)
-                    .join(', ')}
-                </p>
-              )}
+          {matched.length > 1 && (
+            <div className="flex flex-wrap items-center gap-1.5 text-xs">
+              <span className="text-text-secondary">{matched.length} tours match:</span>
+              {matched.slice(0, 8).map((m) => (
+                <button
+                  key={m.tourId}
+                  type="button"
+                  onClick={() => selectTour(m)}
+                  className={cn(
+                    'rounded-md border px-2 py-0.5 font-mono',
+                    m.tourId === pickedTour
+                      ? 'border-primary bg-info-bg text-primary'
+                      : 'border-border bg-white text-text-secondary hover:text-text',
+                  )}
+                >
+                  {m.tripDisplay}
+                </button>
+              ))}
             </div>
+          )}
+
+          {preview && <TourPreview row={preview} trip={previewTrip} />}
+
+          {preview && (
+            <Field label="Comment (optional)">
+              <Input value={comment} onChange={(e) => setComment(e.target.value)} />
+            </Field>
           )}
         </div>
       ) : (
@@ -434,5 +455,122 @@ export function QuickAddModal({
         </div>
       )}
     </Modal>
+  );
+}
+
+function tourKey(id: string): string {
+  return id.trim().toUpperCase().replace(/^T-/, '');
+}
+
+function PreviewItem({ label, children, wide }: { label: string; children: ReactNode; wide?: boolean }) {
+  return (
+    <div className={cn('min-w-0', wide && 'sm:col-span-2')}>
+      <p className="text-[10px] font-semibold uppercase tracking-wide text-text-secondary">{label}</p>
+      <p className="mt-0.5 break-words text-sm text-text">{children}</p>
+    </div>
+  );
+}
+
+/** Whole-tour preview: same numbers as the Reports row, plus every leg. */
+function TourPreview({ row, trip }: { row: ReportLoadRow; trip: RelayTrip | null }) {
+  const drivers = trip ? tripDriverNames(trip) : [];
+  const legs = trip ? orderedLegs(trip) : [];
+  const bucket = moneyBucketLabel(row);
+  const rpm = row.rpm || computeRpm(row.amazonPaid, row.mile);
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-bg p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-base font-bold text-primary">{row.tripDisplay}</span>
+        <span
+          className={cn(
+            'rounded-md border px-2 py-0.5 text-[11px] font-semibold',
+            row.moneyBucket === 'income'
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+              : row.moneyBucket === 'pending_invoice'
+                ? 'border-amber-200 bg-amber-50 text-amber-800'
+                : 'border-blue-200 bg-blue-50 text-blue-700',
+          )}
+        >
+          {bucket}
+        </span>
+        {row.isTonu && (
+          <span className="rounded-md border border-red-200 bg-red-50 px-2 py-0.5 text-[11px] font-semibold text-red-700">
+            TONU
+          </span>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4">
+        <PreviewItem label="Amazon pay">{formatCurrency(row.amazonPaid)}</PreviewItem>
+        <PreviewItem label="Miles">{row.mile || '—'}</PreviewItem>
+        <PreviewItem label="RPM">{rpm ? `$${Number(rpm).toFixed(2)}` : '—'}</PreviewItem>
+        <PreviewItem label="Driver paid">{formatCurrency(row.driverPaid)}</PreviewItem>
+        <PreviewItem label="Pick up" wide>
+          {row.puLocation || '—'} · {formatSheetDate(row.pickupDate) || '—'}
+        </PreviewItem>
+        <PreviewItem label="Delivery" wide>
+          {row.delLocation || '—'} · {formatSheetDate(row.deliveryDate) || '—'}
+        </PreviewItem>
+        <PreviewItem label={drivers.length > 1 ? `Drivers (${drivers.length})` : 'Driver'} wide>
+          {(drivers.length ? drivers : [row.driverName || '—']).join(' → ')}
+        </PreviewItem>
+        <PreviewItem label="Week">
+          {row.weekLabel} {row.estimatedWeek ? '(estimated)' : '(from invoice)'}
+        </PreviewItem>
+        <PreviewItem label="Paid">{row.paidStatus || '—'}</PreviewItem>
+        <PreviewItem label="Loads" wide>
+          <span className="font-mono text-xs">{row.loadIds || '—'}</span>
+        </PreviewItem>
+        <PreviewItem label="Saved dispatch">{row.dispatch || '—'}</PreviewItem>
+        <PreviewItem label="Saved comment">{row.comment || '—'}</PreviewItem>
+      </div>
+
+      {legs.length > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[560px] text-xs">
+            <thead>
+              <tr className="border-b border-border text-left text-[10px] font-semibold uppercase tracking-wide text-text-secondary">
+                <th className="py-1 pr-2">Load</th>
+                <th className="py-1 pr-2">From → To</th>
+                <th className="py-1 pr-2">Driver</th>
+                <th className="py-1 pr-2">Tractor / Trailer</th>
+                <th className="py-1 pr-2">Status</th>
+                <th className="py-1 text-right">Leg pay</th>
+              </tr>
+            </thead>
+            <tbody>
+              {legs.map((leg) => {
+                const stops = [...leg.stops].sort(compareStops);
+                const cancelled = isLegCancelled(leg);
+                return (
+                  <tr
+                    key={leg.loadId}
+                    className={cn('border-b border-border/60', cancelled && 'text-slate-400 line-through')}
+                  >
+                    <td className="py-1 pr-2 font-mono">{leg.loadId}</td>
+                    <td className="py-1 pr-2">
+                      {stops.length
+                        ? `${facilityLabel(stops[0])} → ${facilityLabel(stops[stops.length - 1])}`
+                        : leg.facilitySequence || '—'}
+                    </td>
+                    <td className="py-1 pr-2">{trip ? legDriverName(trip, leg) || '—' : '—'}</td>
+                    <td className="py-1 pr-2 font-mono">
+                      {leg.tractorId || '—'} / {leg.trailerId || '—'}
+                    </td>
+                    <td className="py-1 pr-2">{cancelled ? 'Cancelled' : leg.executionStatus || '—'}</td>
+                    <td className="py-1 text-right tabular-nums">
+                      {leg.payout != null ? formatCurrency(leg.payout) : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          <p className="mt-1 text-[11px] text-text-secondary">
+            Amazon pay above is the whole tour (what Amazon pays); leg pay is shown for reference.
+          </p>
+        </div>
+      )}
+    </div>
   );
 }

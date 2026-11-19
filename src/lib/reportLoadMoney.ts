@@ -577,3 +577,36 @@ export function groupReportLoadsByWeekLabel(
   }
   return groups;
 }
+
+/** Plain-English status of a tour's money for Reports / lookups. */
+export function moneyBucketLabel(row: Pick<ReportLoadRow, 'moneyBucket' | 'paidStatus'>): string {
+  if (row.moneyBucket === 'income') return row.paidStatus ? `Invoiced · ${row.paidStatus}` : 'Invoiced';
+  if (row.moneyBucket === 'pending_invoice') return 'Completed · awaiting invoice';
+  return 'In progress';
+}
+
+function lookupKey(s: string): string {
+  return s.trim().toUpperCase().replace(/^T-/, '').replace(/[^A-Z0-9]/g, '');
+}
+
+/**
+ * Find tours in report_loads by tour ID (with or without "T-") or by any of its load IDs.
+ * Exact tour matches first, then tours containing the load.
+ */
+export function findReportLoads(rows: ReportLoadRow[], query: string): ReportLoadRow[] {
+  const parts = query
+    .split(/[/,|\s]+/)
+    .map(lookupKey)
+    .filter(Boolean);
+  if (!parts.length) return [];
+  const byTour = rows.filter((r) => parts.includes(lookupKey(r.tourId)));
+  const byLoad = rows.filter(
+    (r) =>
+      !byTour.includes(r) &&
+      r.loadIds
+        .split('/')
+        .map(lookupKey)
+        .some((id) => parts.includes(id)),
+  );
+  return [...byTour, ...byLoad];
+}
