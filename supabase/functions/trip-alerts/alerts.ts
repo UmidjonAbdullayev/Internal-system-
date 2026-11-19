@@ -11,6 +11,8 @@ const MS_MIN = 60_000;
 const LATE_GRACE_MS = 15 * MS_MIN;
 const MAX_STOP_AGE_MS = 6 * 60 * MS_MIN;
 const SYNC_FRESH_MS = 5 * MS_MIN;
+/** Cron arrival sweep looks back this far (covers sync pauses / late YMS posts). */
+const ARRIVAL_LOOKBACK_MS = 3 * 60 * MS_MIN;
 const ALLOWED = new Set(["arrived", "not_at_stop"]);
 
 export type StatusEvent = {
@@ -305,7 +307,14 @@ function stopPosition(ctx: TripCtx, stop: Record<string, unknown>): { pos: numbe
 function buildArrivedAlert(
   ctx: TripCtx,
   stop: Record<string, unknown>,
-  opts: { test?: boolean; dryRun?: boolean; reason?: string; syncBasis?: string; force?: boolean },
+  opts: {
+    test?: boolean;
+    dryRun?: boolean;
+    reason?: string;
+    syncBasis?: string;
+    force?: boolean;
+    reportedAfterMinutes?: number | null;
+  },
 ): OutgoingAlert | null {
   if (isCancelledLoadStop(stop, ctx.cancelledLoadIds)) return null;
   const actual = stop.actual_arrival ? String(stop.actual_arrival) : null;
@@ -334,6 +343,7 @@ function buildArrivedAlert(
     trailer,
     timeSource: stop.arrival_time_source ? String(stop.arrival_time_source) : null,
     driver: driverName,
+    reportedAfterMinutes: opts.reportedAfterMinutes ?? null,
     test: opts.test,
   });
   return {
@@ -567,6 +577,30 @@ export async function runCronChecks(
             tripId: nextOnly.tripId,
             stopId: nextOnly.stopId,
           });
+        }
+      }
+
+      // ARRIVED sweep (live): trips sync through relay-snapshot, which sends no arrival
+      // events, so new check-ins are found here. alerts_sent dedupes (one per stop/chat).
+      // Only check-ins after arrival_alerts_since and within the look-back window.
+      if (!dryRun && isEnabled(config)) {
+        const sinceCfg = config.arrival_alerts_since ? new Date(config.arrival_alerts_since).getTime() : NaN;
+        const cutoff = Math.max(now - ARRIVAL_LOOKBACK_MS, Number.isNaN(sinceCfg) ? now - ARRIVAL_LOOKBACK_MS : sinceCfg);
+        for (const stop of alertableStops(ctx)) {
+          if (!stop.actual_arrival) continue;
+          const actual = new Date(String(stop.actual_arrival)).getTime();
+          if (Number.isNaN(actual) || actual < cutoff || actual > now + 5 * MS_MIN) continue;
+          const lagMin = Math.round((now - actual) / MS_MIN);
+          const arrived = buildArrivedAlert(ctx, stop, {
+            reason: "cron_arrival_sweep",
+            syncBasis: sync.lastAt || "cron",
+            reportedAfterMinutes: lagMin,
+          });
+          if (!arrived) continue;
+          const out = await dispatchAlert(sb, botToken, config, settings, arrived);
+          if (out.status !== "deduped") {
+            results.push({ ...out, alertType: "arrived", tripId: arrived.tripId, stopId: arrived.stopId });
+          }
         }
       }
 
