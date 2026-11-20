@@ -372,18 +372,161 @@ export function normalizePersonName(raw: string): string {
   return raw.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+/** Spelling-tolerant token: Yerat≈Erat, Bozdakhov≈Bozdakov, Kochkorbaev≈Kochkorbayev. */
+function phoneticToken(t: string): string {
+  return t
+    .toLowerCase()
+    .replace(/[^a-z]/g, '')
+    .replace(/^ye/, 'e')
+    .replace(/kh/g, 'k')
+    .replace(/aye/g, 'ae')
+    .replace(/iy/g, 'i')
+    .replace(/(.)\1+/g, '$1');
+}
+
+function nameTokens(raw: string): { full: string[]; initials: string[] } {
+  const parts = String(raw || '')
+    .split(/[\s.,]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const full: string[] = [];
+  const initials: string[] = [];
+  for (const p of parts) {
+    const t = phoneticToken(p);
+    if (!t) continue;
+    if (t.length === 1) initials.push(t);
+    else full.push(t);
+  }
+  return { full, initials };
+}
+
+/**
+ * Same person? Order-insensitive ("Abdiker Baidybek" = "Baidybek Abdiker"), spelling-tolerant,
+ * and an initial can stand for a first name ("F. Abdullaev" = "Farruhjon Abdullayev").
+ * Every full-name token must match — a shared last name alone is never enough.
+ */
+export function personNamesMatch(a: string, b: string): boolean {
+  const A = nameTokens(a);
+  const B = nameTokens(b);
+  if (!A.full.length || !B.full.length) return false;
+  const tryMatch = (x: typeof A, y: typeof B): boolean => {
+    const left = [...y.full];
+    for (const t of x.full) {
+      const i = left.indexOf(t);
+      if (i < 0) return false;
+      left.splice(i, 1);
+    }
+    // y may have extra full tokens only if x has initials for them.
+    const inits = [...x.initials];
+    for (const t of left) {
+      const i = inits.indexOf(t[0]);
+      if (i < 0) return false;
+      inits.splice(i, 1);
+    }
+    return true;
+  };
+  return A.full.length <= B.full.length ? tryMatch(A, B) : tryMatch(B, A);
+}
+
 export function matchDriverToName(drivers: Driver[], name: string): Driver | null {
   if (!name) return null;
   const n = normalizePersonName(name);
   if (!n || /^spot/i.test(n) || /starts/i.test(n)) return null;
-  return (
-    drivers.find((d) => normalizePersonName(getDriverFullName(d.firstName, d.lastName)) === n) ||
-    drivers.find((d) => {
-      const full = normalizePersonName(getDriverFullName(d.firstName, d.lastName));
-      return full.includes(n) || n.includes(full);
-    }) ||
-    null
-  );
+  const exact = drivers.find((d) => normalizePersonName(getDriverFullName(d.firstName, d.lastName)) === n);
+  if (exact) return exact;
+  const fuzzy = drivers.filter((d) => personNamesMatch(getDriverFullName(d.firstName, d.lastName), name));
+  return fuzzy.length === 1 ? fuzzy[0] : null;
+}
+
+export type DriverLinkReason = 'name' | 'relay_name' | 'learned' | 'none';
+
+export type DriverResolution = {
+  driver: Driver | null;
+  /** Name to show when not linked (Relay name if the saved name isn't a driver). */
+  displayName: string;
+  reason: DriverLinkReason;
+};
+
+type Resolver = (row: ReportLoadRow) => DriverResolution;
+
+const resolverCache = new WeakMap<ReportLoadRow[], { drivers: Driver[]; resolve: Resolver }>();
+
+/**
+ * Which CRM driver a tour belongs to:
+ * 1. saved name (Reports / Excel) if it is a driver;
+ * 2. else the Relay driver name if it is a driver (fixes city names like "Fort Worth" in the name column);
+ * 3. else what your own sheet usually assigns this Relay driver to (e.g. a team) — learned from
+ *    past tours: 3+ tours and 70%+ of them.
+ */
+export function getDriverResolver(drivers: Driver[], rows: ReportLoadRow[]): Resolver {
+  const cached = resolverCache.get(rows);
+  if (cached && cached.drivers === drivers) return cached.resolve;
+
+  const nameCache = new Map<string, Driver | null>();
+  const match = (name: string | null | undefined): Driver | null => {
+    const key = String(name || '').trim();
+    if (!key) return null;
+    if (!nameCache.has(key)) nameCache.set(key, matchDriverToName(drivers, key));
+    return nameCache.get(key)!;
+  };
+
+  const votes = new Map<string, Map<string, number>>();
+  for (const r of rows) {
+    const raw = String(r.driverNameRaw || '').trim();
+    const saved = String(r.driverName || '').trim();
+    if (!raw || !saved || normalizePersonName(raw) === normalizePersonName(saved)) continue;
+    if (match(raw)) continue; // Relay name is already a driver
+    const d = match(saved);
+    if (!d) continue;
+    const key = normalizePersonName(raw);
+    if (!votes.has(key)) votes.set(key, new Map());
+    const m = votes.get(key)!;
+    m.set(d.id, (m.get(d.id) || 0) + 1);
+  }
+  const learned = new Map<string, Driver>();
+  for (const [raw, m] of votes) {
+    const total = [...m.values()].reduce((a, b) => a + b, 0);
+    const [bestId, bestN] = [...m.entries()].sort((a, b) => b[1] - a[1])[0];
+    if (bestN >= 3 && bestN / total >= 0.7) {
+      const d = drivers.find((x) => x.id === bestId);
+      if (d) learned.set(raw, d);
+    }
+  }
+
+  const resolve: Resolver = (r) => {
+    const saved = String(r.driverName || '').trim();
+    const raw = String(r.driverNameRaw || '').trim();
+    const bySaved = match(saved);
+    if (bySaved) return { driver: bySaved, displayName: saved, reason: 'name' };
+    const byRaw = match(raw);
+    if (byRaw) return { driver: byRaw, displayName: raw, reason: 'relay_name' };
+    const byLearned = raw ? learned.get(normalizePersonName(raw)) : undefined;
+    if (byLearned) return { driver: byLearned, displayName: raw, reason: 'learned' };
+    // Not linked: prefer the Relay name when the saved name isn't a driver (often a city / note).
+    return { driver: null, displayName: raw || saved, reason: 'none' };
+  };
+  resolverCache.set(rows, { drivers, resolve });
+  return resolve;
+}
+
+/** Earned = completed or TONU (invoiced, or completed and waiting for the invoice). */
+export function isEarnedRow(row: ReportLoadRow): boolean {
+  return isWeekIncomeRow(row) || isPendingInvoiceRow(row);
+}
+
+/** Booked but not finished yet (in transit / planned with a price). */
+export function isInProgressRow(row: ReportLoadRow): boolean {
+  if (isEarnedRow(row)) return false;
+  return !/CANCEL/i.test(`${row.status || ''} ${row.executionStatus || ''}`);
+}
+
+export type RowStage = 'invoiced' | 'awaiting_invoice' | 'in_progress' | 'cancelled';
+
+export function rowStage(row: ReportLoadRow): RowStage {
+  if (isWeekIncomeRow(row)) return 'invoiced';
+  if (isPendingInvoiceRow(row)) return 'awaiting_invoice';
+  if (isInProgressRow(row)) return 'in_progress';
+  return 'cancelled';
 }
 
 export function filterReportLoadsByWeek(
@@ -416,17 +559,14 @@ export function reportLoadsForDriver(
 ): ReportLoadRow[] {
   const driver = drivers.find((d) => d.id === driverId);
   if (!driver) return [];
-  const full = normalizePersonName(getDriverFullName(driver.firstName, driver.lastName));
+  const resolve = getDriverResolver(drivers, rows);
   return rows.filter((r) => {
     // Prefer assigned week (MAIN invoice week, else pickup estimate) — not raw pickup alone.
     if (weekStart && weekEnd) {
       const key = r.weekStart || r.tourStartLa;
       if (!inAmazonWeek(key, weekStart, weekEnd)) return false;
     }
-    const matched = matchDriverToName(drivers, r.driverName);
-    if (matched) return matched.id === driverId;
-    // fallback: raw name equals
-    return normalizePersonName(r.driverName) === full;
+    return resolve(r).driver?.id === driverId;
   });
 }
 
@@ -450,6 +590,43 @@ export function getDriverAmazonGross(
   return roundMoney(gross + adj);
 }
 
+/** Driver earned (invoiced + completed awaiting invoice) incl. manual adjustments. */
+export function getDriverEarnedGross(
+  rows: ReportLoadRow[],
+  drivers: Driver[],
+  driverId: string,
+  weekStart?: string,
+  weekEnd?: string,
+  adjustments: GrossAdjustment[] = [],
+): number {
+  const list = reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd).filter(isEarnedRow);
+  const adj = adjustments
+    .filter(
+      (a) =>
+        a.driverId === driverId &&
+        (!weekStart || !weekEnd || (a.date >= weekStart && a.date <= weekEnd)),
+    )
+    .reduce((s, a) => s + a.amount, 0);
+  return roundMoney(sumAmazonPaid(list) + adj);
+}
+
+/** Fleet earned (invoiced + completed awaiting invoice) for a range. */
+export function getFleetEarned(rows: ReportLoadRow[], weekStart: string, weekEnd: string) {
+  const list = filterReportLoadsByWeek(rows, weekStart, weekEnd);
+  const invoiced = list.filter(isWeekIncomeRow);
+  const awaiting = list.filter((r) => !isWeekIncomeRow(r) && isPendingInvoiceRow(r));
+  const inProgress = list.filter(isInProgressRow);
+  return {
+    earned: roundMoney(sumAmazonPaid(invoiced) + sumAmazonPaid(awaiting)),
+    invoiced: sumAmazonPaid(invoiced),
+    awaiting: sumAmazonPaid(awaiting),
+    earnedTours: invoiced.length + awaiting.length,
+    inProgress: sumAmazonPaid(inProgress),
+    inProgressTours: inProgress.length,
+    inProgressUnpriced: inProgress.filter((r) => !(r.amazonPaid > 0)).length,
+  };
+}
+
 export function getFleetAmazonGross(
   rows: ReportLoadRow[],
   weekStart?: string,
@@ -467,9 +644,13 @@ export function getDailyAmazonByWeekday(
   driverId: string,
   weekStart: string,
   weekEnd: string,
+  /** true: invoiced + completed awaiting invoice; false: invoiced (MAIN) only. */
+  earnedOnly = false,
 ): number[] {
   const daily = [0, 0, 0, 0, 0, 0, 0];
-  const list = filterWeekIncome(reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd));
+  const list = reportLoadsForDriver(rows, drivers, driverId, weekStart, weekEnd).filter(
+    earnedOnly ? isEarnedRow : isWeekIncomeRow,
+  );
   for (const r of list) {
     const dayKey = r.tourStartLa || r.pickupDate;
     if (!dayKey) continue;

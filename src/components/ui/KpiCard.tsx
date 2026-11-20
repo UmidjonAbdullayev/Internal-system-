@@ -45,11 +45,14 @@ export function KpiCard({
           <p className="text-xs font-medium uppercase tracking-wide text-text-secondary">
             {title}
           </p>
-          <p className="mt-1.5 font-display text-xl font-bold text-text tabular-nums truncate">
+          <p
+            className="mt-1.5 font-display text-xl font-bold text-text tabular-nums truncate"
+            title={format === 'currency' ? formatCurrency(value) : formatNumber(value)}
+          >
             {format === 'currency' ? formatCurrency(value) : formatNumber(value)}
           </p>
           {subtitle && (
-            <p className="mt-1 text-xs text-text-secondary">{subtitle}</p>
+            <p className="mt-1 text-xs text-text-secondary line-clamp-2">{subtitle}</p>
           )}
           {trend !== undefined && (
             <p
