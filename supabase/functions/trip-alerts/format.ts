@@ -86,6 +86,8 @@ export type ArrivedInput = {
   driver?: string | null;
   /** Minutes between the check-in and when we saw it (Relay/YMS can post late). */
   reportedAfterMinutes?: number | null;
+  /** Our Relay sync was offline in that time (computer asleep / Chrome closed). */
+  syncGap?: { start: string; end: string; minutes: number } | null;
   test?: boolean;
 };
 
@@ -112,7 +114,14 @@ export function formatArrivedHtml(input: ArrivedInput): string {
     `Source: ${esc(sourceLabel(input.timeSource))}`,
   ];
   if (input.reportedAfterMinutes != null && input.reportedAfterMinutes >= 10) {
-    lines.push(`<i>Check-in showed up in Relay ${esc(formatDurationMinutes(input.reportedAfterMinutes))} later</i>`);
+    const late = esc(formatDurationMinutes(input.reportedAfterMinutes));
+    if (input.syncGap) {
+      lines.push(
+        `<i>⚠️ Sent ${late} late: CRM sync was offline ${esc(formatTimeAbbr(input.syncGap.start, input.timeZone))}–${esc(formatTimeAbbr(input.syncGap.end, input.timeZone))} (extension computer asleep or Chrome closed)</i>`,
+      );
+    } else {
+      lines.push(`<i>Relay posted this check-in ${late} after it happened</i>`);
+    }
   }
   return lines.join("\n");
 }
