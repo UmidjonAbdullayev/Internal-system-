@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Download, TrendingUp, DollarSign, Users, Package, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Download, DollarSign, Users, Package, ChevronLeft, ChevronRight, Truck } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
@@ -33,16 +33,32 @@ import {
 import {
   filterReportLoadsByWeek,
   getDailyAmazonByWeekday,
-  getDriverAmazonGross,
-  getFleetAmazonGross,
-  matchDriverToName,
+  getDriverEarnedGross,
+  getDriverResolver,
+  getFleetEarned,
+  isEarnedRow,
   reportLoadsForDriver,
+  rowStage,
   type ReportLoadRow,
+  type RowStage,
 } from '@/lib/reportLoadMoney';
 import type { Driver, DateRange } from '@/types';
 
 type ViewMode = 'daily' | 'weekly' | 'monthly' | 'custom';
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+const STAGE_LABEL: Record<RowStage, string> = {
+  invoiced: 'Invoiced',
+  awaiting_invoice: 'Done · awaiting invoice',
+  in_progress: 'In progress',
+  cancelled: 'Cancelled',
+};
+const STAGE_CLASS: Record<RowStage, string> = {
+  invoiced: 'bg-success-bg text-success',
+  awaiting_invoice: 'bg-info-bg text-info',
+  in_progress: 'bg-warning-bg text-warning',
+  cancelled: 'bg-bg text-text-secondary',
+};
 
 export function GrossBoardPage() {
   const { drivers, loads, reportLoads, grossAdjustments, dataReady, dataError, refreshData } =
@@ -64,10 +80,11 @@ export function GrossBoardPage() {
   const lastWeekStart = shiftAmazonWeek(thisWeek.start, -1);
   const lastWeek = amazonWeekRangeFromAnchor(lastWeekStart);
   const thisMonth = getMonthRange(todayStr);
-  const today = { start: todayStr, end: todayStr };
 
   const activeRange: DateRange =
     view === 'monthly' ? thisMonth : view === 'custom' ? customRange : { start: thisWeek.start, end: thisWeek.end };
+
+  const resolveDriver = useMemo(() => getDriverResolver(drivers, reportLoads), [drivers, reportLoads]);
 
   const rows = useMemo(() => {
     return drivers
@@ -80,8 +97,9 @@ export function GrossBoardPage() {
           driver.id,
           thisWeek.start,
           thisWeek.end,
+          true,
         );
-        const weeklyGross = getDriverAmazonGross(
+        const weeklyGross = getDriverEarnedGross(
           reportLoads,
           drivers,
           driver.id,
@@ -89,7 +107,7 @@ export function GrossBoardPage() {
           thisWeek.end,
           grossAdjustments,
         );
-        const prevWeekGross = getDriverAmazonGross(
+        const prevWeekGross = getDriverEarnedGross(
           reportLoads,
           drivers,
           driver.id,
@@ -97,7 +115,7 @@ export function GrossBoardPage() {
           lastWeek.end,
           grossAdjustments,
         );
-        const monthlyGross = getDriverAmazonGross(
+        const monthlyGross = getDriverEarnedGross(
           reportLoads,
           drivers,
           driver.id,
@@ -111,7 +129,7 @@ export function GrossBoardPage() {
           driver.id,
           thisWeek.start,
           thisWeek.end,
-        );
+        ).filter(isEarnedRow);
         return {
           driver,
           liveStatus,
@@ -138,22 +156,37 @@ export function GrossBoardPage() {
   const weeklyRoster = useMemo(() => {
     const inWeek = filterReportLoadsByWeek(reportLoads, thisWeek.start, thisWeek.end);
     return inWeek
-      .map((load) => ({
-        driver: matchDriverToName(drivers, load.driverName),
-        load,
-        pay: load.amazonPaid,
-      }))
+      .map((load) => {
+        const res = resolveDriver(load);
+        return {
+          driver: res.driver,
+          name: res.driver ? getDriverFullName(res.driver.firstName, res.driver.lastName) : res.displayName,
+          linkedVia: res.reason,
+          stage: rowStage(load),
+          load,
+          pay: load.amazonPaid,
+        };
+      })
+      // Cancelled with no pay is noise on a money board.
+      .filter((r) => !(r.stage === 'cancelled' && !(r.pay > 0)))
       .sort((a, b) => {
-        const an = a.driver
-          ? `${a.driver.lastName} ${a.driver.firstName}`
-          : a.load.driverName || 'zzz';
-        const bn = b.driver
-          ? `${b.driver.lastName} ${b.driver.firstName}`
-          : b.load.driverName || 'zzz';
+        const an = a.driver ? `0 ${a.name}` : a.name ? `1 ${a.name}` : '2';
+        const bn = b.driver ? `0 ${b.name}` : b.name ? `1 ${b.name}` : '2';
         if (an !== bn) return an.localeCompare(bn);
         return (a.load.tourStartLa || '').localeCompare(b.load.tourStartLa || '');
       });
-  }, [reportLoads, drivers, thisWeek]);
+  }, [reportLoads, thisWeek, resolveDriver]);
+
+  // Earned this week by tours not linked to any driver (so the table total matches the fleet total).
+  const unlinkedEarned = useMemo(
+    () =>
+      Math.round(
+        weeklyRoster
+          .filter((r) => !r.driver && (r.stage === 'invoiced' || r.stage === 'awaiting_invoice'))
+          .reduce((s, r) => s + r.pay, 0) * 100,
+      ) / 100,
+    [weeklyRoster],
+  );
 
   const sorted = useSort(rows, sortKey, sortDir, {
     name: (r) => getDriverFullName(r.driver.firstName, r.driver.lastName),
@@ -177,23 +210,35 @@ export function GrossBoardPage() {
       monthly += r.monthlyGross;
       loadsCompleted += r.loadsCompleted;
     }
+    const working = rows.filter((r) => r.weeklyGross > 0).length;
     return {
       daily: daily.map((v) => Math.round(v * 100) / 100),
       weekly: Math.round(weekly * 100) / 100,
       prev: Math.round(prev * 100) / 100,
       monthly: Math.round(monthly * 100) / 100,
       loadsCompleted,
-      avg: rows.length ? Math.round((weekly / rows.length) * 100) / 100 : 0,
+      working,
+      // Average over drivers who earned something this week (not every driver on file).
+      avg: working ? Math.round((weekly / working) * 100) / 100 : 0,
     };
   }, [rows]);
 
-  const kpis = {
-    fleetGross: getFleetAmazonGross(reportLoads, activeRange.start, activeRange.end),
-    todayGross: getFleetAmazonGross(reportLoads, today.start, today.end),
-    weekGross: getFleetAmazonGross(reportLoads, thisWeek.start, thisWeek.end),
-    lastWeekGross: getFleetAmazonGross(reportLoads, lastWeek.start, lastWeek.end),
-    monthGross: getFleetAmazonGross(reportLoads, thisMonth.start, thisMonth.end),
-  };
+  const kpis = useMemo(
+    () => ({
+      period: getFleetEarned(reportLoads, activeRange.start, activeRange.end),
+      week: getFleetEarned(reportLoads, thisWeek.start, thisWeek.end),
+      lastWeek: getFleetEarned(reportLoads, lastWeek.start, lastWeek.end),
+      month: getFleetEarned(reportLoads, thisMonth.start, thisMonth.end),
+    }),
+    [reportLoads, activeRange.start, activeRange.end, thisWeek, lastWeek, thisMonth],
+  );
+  const money = (v: number) => formatCurrency(v);
+  const periodLabel =
+    view === 'monthly'
+      ? 'This month'
+      : view === 'custom'
+        ? `${formatDate(customRange.start, 'MMM d')} – ${formatDate(customRange.end, 'MMM d')}`
+        : `${formatDate(thisWeek.start, 'MMM d')} – ${formatDate(thisWeek.end, 'MMM d')}`;
 
   const handleSort = (key: string) => {
     if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -224,13 +269,13 @@ export function GrossBoardPage() {
   const exportWeekLoads = () => {
     downloadCSV(
       `gross-week-${thisWeek.start}.csv`,
-      ['Driver', 'Driver ID', 'Tour', 'Tour start', 'Pickup', 'Delivery Loc', 'Amazon Paid', 'Week'],
+      ['Driver', 'Driver ID', 'Linked', 'Tour', 'Status', 'Tour start', 'Pickup', 'Delivery Loc', 'Amazon Paid', 'Week'],
       weeklyRoster.map((r) => [
-        r.driver
-          ? getDriverFullName(r.driver.firstName, r.driver.lastName)
-          : r.load.driverName || 'Unassigned',
+        r.name || 'Unassigned',
         r.driver?.driverId || '',
+        r.driver ? 'yes' : 'no',
         r.load.tripDisplay,
+        STAGE_LABEL[r.stage],
         r.load.tourStartLa || '',
         r.load.puLocation,
         r.load.delLocation,
@@ -249,10 +294,11 @@ export function GrossBoardPage() {
         activeRange.end,
       )
     : [];
+  const detailEarned = detailLoads.filter(isEarnedRow);
   const detailTrend = (() => {
     if (!selectedDriver) return [] as { date: string; gross: number }[];
     const map = new Map<string, number>();
-    for (const l of detailLoads) {
+    for (const l of detailEarned) {
       const key = l.tourStartLa || '';
       if (!key) continue;
       map.set(key, (map.get(key) || 0) + l.amazonPaid);
@@ -303,14 +349,57 @@ export function GrossBoardPage() {
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-7 mb-5">
-        <KpiCard title="Total Fleet Gross" value={kpis.fleetGross} icon={DollarSign} highlight />
-        <KpiCard title="Today's Gross" value={kpis.todayGross} icon={TrendingUp} accent="success" />
-        <KpiCard title="This Week" value={kpis.weekGross} accent="primary" />
-        <KpiCard title="Last Week" value={kpis.lastWeekGross} accent="info" />
-        <KpiCard title="This Month" value={kpis.monthGross} accent="primary" />
-        <KpiCard title="Avg Per Driver" value={totals.avg} accent="info" />
-        <KpiCard title="Completed Loads" value={totals.loadsCompleted} format="number" icon={Package} accent="success" />
+      {/* Earned = completed/TONU tours (invoiced, or done and waiting for the Amazon invoice). */}
+      <div className="mb-5 grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(13rem,1fr))]">
+        <KpiCard
+          title={view === 'weekly' ? 'Earned · selected week' : `Earned · ${periodLabel}`}
+          value={kpis.period.earned}
+          icon={DollarSign}
+          highlight
+          subtitle={`${kpis.period.earnedTours} tours · ${periodLabel}`}
+        />
+        <KpiCard
+          title="In progress"
+          value={kpis.week.inProgress}
+          icon={Truck}
+          accent="warning"
+          subtitle={`${kpis.week.inProgressTours} tours not finished${
+            kpis.week.inProgressUnpriced ? ` · ${kpis.week.inProgressUnpriced} no price yet` : ''
+          }`}
+        />
+        <KpiCard
+          title="Invoiced"
+          value={kpis.week.invoiced}
+          accent="success"
+          subtitle={`Awaiting invoice ${money(kpis.week.awaiting)}`}
+        />
+        <KpiCard
+          title="Previous week"
+          value={kpis.lastWeek.earned}
+          accent="info"
+          subtitle={`${formatDate(lastWeek.start, 'MMM d')} – ${formatDate(lastWeek.end, 'MMM d')}`}
+        />
+        <KpiCard
+          title="This month"
+          value={kpis.month.earned}
+          accent="primary"
+          subtitle={formatDate(thisMonth.start, 'MMMM yyyy')}
+        />
+        <KpiCard
+          title="Avg per driver"
+          value={totals.avg}
+          icon={Users}
+          accent="info"
+          subtitle={`${totals.working} drivers earned this week`}
+        />
+        <KpiCard
+          title="Completed tours"
+          value={kpis.week.earnedTours}
+          format="number"
+          icon={Package}
+          accent="success"
+          subtitle="Done or TONU, selected week"
+        />
       </div>
 
       <Card className="mb-4 p-3">
@@ -393,6 +482,7 @@ export function GrossBoardPage() {
                   <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Driver</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Tour</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Route</th>
+                  <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Status</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Tour start</th>
                   <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Amazon $</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Week</th>
@@ -406,24 +496,48 @@ export function GrossBoardPage() {
                         <Link
                           to={`/gross-by-driver?driver=${r.driver.id}`}
                           className="font-medium text-primary hover:underline"
+                          title={
+                            r.linkedVia === 'learned'
+                              ? `Relay driver ${r.load.driverNameRaw} — counted for ${r.name} (as in your sheet)`
+                              : undefined
+                          }
                         >
-                          {getDriverFullName(r.driver.firstName, r.driver.lastName)}
+                          {r.name}
                         </Link>
                       ) : (
-                        <span className="text-text-secondary italic">
-                          {r.load.driverName || 'Unassigned'}
+                        <span className="inline-flex items-center gap-1.5">
+                          <span className="text-text">{r.name || 'Unassigned'}</span>
+                          <span
+                            className="rounded bg-warning-bg px-1.5 py-0.5 text-[10px] font-semibold uppercase text-warning"
+                            title="This Relay name isn't matched to anyone on the Drivers page, so it's left out of per-driver totals. Add the driver (or a team) on the Drivers page."
+                          >
+                            Not linked
+                          </span>
                         </span>
+                      )}
+                      {r.linkedVia === 'learned' && r.load.driverNameRaw && (
+                        <span className="block text-[11px] text-text-secondary">Relay: {r.load.driverNameRaw}</span>
                       )}
                     </td>
                     <td className="px-3 py-2.5 font-medium tabular-nums">{r.load.tripDisplay}</td>
                     <td className="px-3 py-2.5 text-xs">
                       {r.load.puLocation} → {r.load.delLocation}
                     </td>
+                    <td className="px-3 py-2.5">
+                      <span className={cn('whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-medium', STAGE_CLASS[r.stage])}>
+                        {STAGE_LABEL[r.stage]}
+                      </span>
+                    </td>
                     <td className="px-3 py-2.5 text-xs whitespace-nowrap">
                       {r.load.tourStartLa ? formatDate(r.load.tourStartLa, 'MMM d') : '—'}
                     </td>
-                    <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
-                      {formatCurrency(r.pay)}
+                    <td
+                      className={cn(
+                        'px-3 py-2.5 text-right tabular-nums font-semibold',
+                        r.stage === 'in_progress' && 'text-text-secondary',
+                      )}
+                    >
+                      {r.pay > 0 ? formatCurrency(r.pay) : <span className="text-text-secondary" title="Relay hasn't priced this tour yet">No price yet</span>}
                     </td>
                     <td className="px-3 py-2.5 text-xs">{r.load.weekLabel}</td>
                   </tr>
@@ -431,12 +545,17 @@ export function GrossBoardPage() {
               </tbody>
               <tfoot>
                 <tr className="bg-primary/5 font-semibold">
-                  <td className="px-3 py-3" colSpan={4}>
-                    Week total ({weeklyRoster.length} tours)
+                  <td className="px-3 py-3" colSpan={5}>
+                    Earned ({kpis.week.earnedTours} tours: invoiced + awaiting invoice)
                   </td>
-                  <td className="px-3 py-3 text-right tabular-nums text-primary">
-                    {formatCurrency(weeklyRoster.reduce((s, r) => s + r.pay, 0))}
+                  <td className="px-3 py-3 text-right tabular-nums text-primary">{money(kpis.week.earned)}</td>
+                  <td />
+                </tr>
+                <tr className="text-text-secondary">
+                  <td className="px-3 py-2" colSpan={5}>
+                    In progress ({kpis.week.inProgressTours} tours, not counted yet)
                   </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{money(kpis.week.inProgress)}</td>
                   <td />
                 </tr>
               </tfoot>
@@ -497,6 +616,16 @@ export function GrossBoardPage() {
                   <td className="px-3 py-2.5 text-right tabular-nums font-medium">{formatCurrency(r.monthlyGross)}</td>
                 </tr>
               ))}
+              {unlinkedEarned > 0 && !search && !statusFilter && (
+                <tr className="border-b border-border/60 text-text-secondary">
+                  <td className="px-3 py-2.5" colSpan={4}>
+                    Not linked to a driver (see “Not linked” in the list above)
+                  </td>
+                  <td colSpan={7} />
+                  <td className="px-3 py-2.5 text-right tabular-nums">{formatCurrency(unlinkedEarned)}</td>
+                  <td colSpan={3} />
+                </tr>
+              )}
               <tr className="bg-primary/5 border-t-2 border-primary/20 font-semibold">
                 <td className="px-3 py-3" colSpan={3}>
                   <span className="flex items-center gap-2">
@@ -507,7 +636,9 @@ export function GrossBoardPage() {
                 {totals.daily.map((v, i) => (
                   <td key={i} className="px-2 py-3 text-right tabular-nums text-xs">{formatCurrency(v)}</td>
                 ))}
-                <td className="px-3 py-3 text-right tabular-nums text-primary">{formatCurrency(totals.weekly)}</td>
+                <td className="px-3 py-3 text-right tabular-nums text-primary">
+                  {formatCurrency(totals.weekly + (search || statusFilter ? 0 : unlinkedEarned))}
+                </td>
                 <td className="px-3 py-3 text-right tabular-nums">{formatCurrency(totals.prev)}</td>
                 <td className="px-3 py-3 text-right tabular-nums text-xs">{formatPercent(percentChange(totals.weekly, totals.prev))}</td>
                 <td className="px-3 py-3 text-right tabular-nums">{formatCurrency(totals.monthly)}</td>
@@ -536,7 +667,7 @@ export function GrossBoardPage() {
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <MiniKpi
                 label="Weekly"
-                value={getDriverAmazonGross(
+                value={getDriverEarnedGross(
                   reportLoads,
                   drivers,
                   selectedDriver.id,
@@ -547,7 +678,7 @@ export function GrossBoardPage() {
               />
               <MiniKpi
                 label="Monthly"
-                value={getDriverAmazonGross(
+                value={getDriverEarnedGross(
                   reportLoads,
                   drivers,
                   selectedDriver.id,
@@ -556,12 +687,12 @@ export function GrossBoardPage() {
                   grossAdjustments,
                 )}
               />
-              <MiniKpi label="Tours" value={detailLoads.length} currency={false} />
+              <MiniKpi label="Done tours" value={detailEarned.length} currency={false} />
               <MiniKpi
                 label="Avg/Tour"
                 value={
-                  detailLoads.length
-                    ? detailLoads.reduce((s, l) => s + l.amazonPaid, 0) / detailLoads.length
+                  detailEarned.length
+                    ? detailEarned.reduce((s, l) => s + l.amazonPaid, 0) / detailEarned.length
                     : 0
                 }
               />
@@ -594,7 +725,10 @@ export function GrossBoardPage() {
                         {l.tourStartLa ? formatDate(l.tourStartLa) : '—'} · {l.weekLabel}
                       </p>
                     </div>
-                    <p className="font-semibold tabular-nums">{formatCurrency(l.amazonPaid)}</p>
+                    <div className="text-right">
+                      <p className="font-semibold tabular-nums">{formatCurrency(l.amazonPaid)}</p>
+                      <p className="text-[11px] text-text-secondary">{STAGE_LABEL[rowStage(l)]}</p>
+                    </div>
                   </div>
                 ))}
                 {detailLoads.length === 0 && (
