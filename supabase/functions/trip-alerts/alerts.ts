@@ -127,6 +127,34 @@ async function inTransitSyncFresh(sb: SupabaseClient): Promise<{ fresh: boolean;
   return { fresh: Date.now() - new Date(ts).getTime() <= SYNC_FRESH_MS, lastAt: String(ts) };
 }
 
+/** Longest stretch with no Relay sync between two times (extension/computer offline). */
+async function longestSyncGap(
+  sb: SupabaseClient,
+  fromMs: number,
+  toMs: number,
+): Promise<{ start: string; end: string; minutes: number } | null> {
+  const { data } = await sb
+    .from("relay_sync_runs")
+    .select("started_at")
+    .gte("started_at", new Date(fromMs).toISOString())
+    .lte("started_at", new Date(toMs).toISOString())
+    .order("started_at", { ascending: true })
+    .limit(2000);
+  const times = [fromMs, ...(data || []).map((r) => new Date(String(r.started_at)).getTime()), toMs];
+  let best: { a: number; b: number } | null = null;
+  for (let i = 1; i < times.length; i++) {
+    const a = times[i - 1];
+    const b = times[i];
+    if (!best || b - a > best.b - best.a) best = { a, b };
+  }
+  if (!best || best.b - best.a < SYNC_FRESH_MS) return null;
+  return {
+    start: new Date(best.a).toISOString(),
+    end: new Date(best.b).toISOString(),
+    minutes: Math.round((best.b - best.a) / MS_MIN),
+  };
+}
+
 function isCancelledTrip(trip: Record<string, unknown>): boolean {
   const status = String(trip.status || trip.execution_status || trip.tour_state || "").toUpperCase();
   return /CANCEL/.test(status);
@@ -314,6 +342,7 @@ function buildArrivedAlert(
     syncBasis?: string;
     force?: boolean;
     reportedAfterMinutes?: number | null;
+    syncGap?: { start: string; end: string; minutes: number } | null;
   },
 ): OutgoingAlert | null {
   if (isCancelledLoadStop(stop, ctx.cancelledLoadIds)) return null;
@@ -344,6 +373,7 @@ function buildArrivedAlert(
     timeSource: stop.arrival_time_source ? String(stop.arrival_time_source) : null,
     driver: driverName,
     reportedAfterMinutes: opts.reportedAfterMinutes ?? null,
+    syncGap: opts.syncGap ?? null,
     test: opts.test,
   });
   return {
@@ -591,10 +621,13 @@ export async function runCronChecks(
           const actual = new Date(String(stop.actual_arrival)).getTime();
           if (Number.isNaN(actual) || actual < cutoff || actual > now + 5 * MS_MIN) continue;
           const lagMin = Math.round((now - actual) / MS_MIN);
+          // Late send: was our sync offline (computer asleep) or did Relay post it late?
+          const syncGap = lagMin >= 10 ? await longestSyncGap(sb, actual, now) : null;
           const arrived = buildArrivedAlert(ctx, stop, {
-            reason: "cron_arrival_sweep",
+            reason: syncGap ? "cron_arrival_sweep_after_sync_gap" : "cron_arrival_sweep",
             syncBasis: sync.lastAt || "cron",
             reportedAfterMinutes: lagMin,
+            syncGap,
           });
           if (!arrived) continue;
           const out = await dispatchAlert(sb, botToken, config, settings, arrived);
