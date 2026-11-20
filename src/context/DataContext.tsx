@@ -205,6 +205,9 @@ function now() {
   return new Date().toISOString();
 }
 
+const LIVE_REFRESH_MS = 30_000;
+const MONEY_REFRESH_MS = 5 * 60_000;
+
 export function DataProvider({ children }: { children: ReactNode }) {
   const [drivers, setDrivers] = useState<Driver[]>([]);
   const [loads, setLoads] = useState<Load[]>([]);
@@ -243,6 +246,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     all: 0,
   });
   const historyLoadedRef = useRef({ from: '', to: '', loaded: false });
+  const lastMoneyAtRef = useRef(0);
 
   const mergeTripsById = useCallback((prev: RelayTrip[], next: RelayTrip[]) => {
     const map = new Map<string, RelayTrip>();
@@ -286,8 +290,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
    * Wave B — money + invoices + lean loads in background (Reports/Gross)
    * History — on demand via ensureHistoryTrips (paged 100)
    */
-  const hydrate = useCallback(async (opts?: { soft?: boolean }) => {
+  const hydrate = useCallback(async (opts?: { soft?: boolean; money?: boolean }) => {
     const soft = Boolean(opts?.soft);
+    // Money tables (~2 MB) only on full loads or when asked — not on every 30 s refresh.
+    const withMoney = !soft || Boolean(opts?.money);
     setDataFetching(true);
     try {
       const [
@@ -380,7 +386,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
       void applyTripCounts();
 
       // Wave B — money + payments + lean loads (does not block first paint).
-      void (async () => {
+      if (withMoney) lastMoneyAtRef.current = Date.now();
+      if (withMoney) void (async () => {
         const [
           reportLoadsRes,
           loadOverridesRes,
@@ -624,13 +631,22 @@ export function DataProvider({ children }: { children: ReactNode }) {
     void hydrate().then(() => {
       if (cancelled) return;
     });
-    // Soft incremental refresh — live sections + money, keep History in memory.
-    const timer = window.setInterval(() => {
-      if (!cancelled) void hydrate({ soft: true });
-    }, 30_000);
+    // Soft refresh: live trips every 30 s, money every 5 min; nothing while the tab is
+    // hidden (each open tab used to re-download ~3 MB every 30 s = most of the egress quota).
+    const tick = () => {
+      if (cancelled || document.hidden) return;
+      const money = Date.now() - lastMoneyAtRef.current >= MONEY_REFRESH_MS;
+      void hydrate({ soft: true, money });
+    };
+    const timer = window.setInterval(tick, LIVE_REFRESH_MS);
+    const onVisible = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, [hydrate]);
 
