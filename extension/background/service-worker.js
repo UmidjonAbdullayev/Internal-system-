@@ -555,12 +555,16 @@ async function handleCapture(msg) {
     if (requestBody && typeof requestBody === 'object' && tab && tab !== '?') {
       // Per-tab overwrite only — never reuse another tab's filter body
       const existed = Boolean((await resolveTabTemplate(tab))?.body);
-      await saveTabRequestTemplate(tab, requestBody, headers, {
+      const saved = await saveTabRequestTemplate(tab, requestBody, headers, {
         at: capturedAt,
         pageUrl: msg.pageUrl || null,
       });
-      log(`request template ${existed ? 'updated' : 'seeded'} for`, tab);
-      if (state.live && !existed) void alwaysOnTick({ force: true });
+      if (saved) {
+        log(`request template ${existed ? 'updated' : 'seeded'} for`, tab);
+        if (state.live && !existed) void alwaysOnTick({ force: true });
+      } else {
+        log('ignored page request for', tab, '(search / filter, not the plain tab list)');
+      }
     }
 
     if (!state.live || !state.loggedIn) return;

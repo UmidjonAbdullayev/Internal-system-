@@ -115,12 +115,44 @@ export async function saveRequestTemplate(body, headers, meta = {}) {
   return false;
 }
 
+/** Forget the live-captured template for one tab (falls back to built-in / re-capture). */
+export async function dropLiveTemplate(tileCountTab) {
+  const tab = String(tileCountTab || '').toUpperCase();
+  const stored = await chrome.storage.local.get([REQUEST_TEMPLATES_KEY]);
+  const map = { ...(stored[REQUEST_TEMPLATES_KEY] || {}) };
+  if (!map[tab]) return false;
+  delete map[tab];
+  await chrome.storage.local.set({ [REQUEST_TEMPLATES_KEY]: map });
+  return true;
+}
+
+/**
+ * A Relay page request is only a usable template if it's the plain tab list: not a
+ * search-box / keyword lookup (e.g. searching one tour ID in History).
+ */
+export function isPlainTabRequest(body) {
+  for (const f of body?.filter || []) {
+    for (const cond of f?.query || []) {
+      if (!cond || typeof cond !== 'object') continue;
+      // Built-in tab lists only EXCLUDE keywords (operation 1, e.g. IGNORE_FOR_TRIP);
+      // an INCLUDE keyword match is a search for specific tours.
+      if (cond.field === 'dynamicSearchFields.keywords' && cond.operation !== 1) return false;
+      if (/search(term|text|query)/i.test(String(cond.field || ''))) return false;
+    }
+  }
+  for (const key of Object.keys(body || {})) {
+    if (/search(term|text|query)/i.test(key) && body[key]) return false;
+  }
+  return true;
+}
+
 /**
  * Store one full request body (+ headers) per tab. Never copies another tab's body.
  */
 export async function saveTabRequestTemplate(tileCountTab, body, headers, meta = {}) {
   const tab = String(tileCountTab || body?.tileCountTab || '').toUpperCase();
   if (!TABS.includes(tab) || !body || typeof body !== 'object') return false;
+  if (!isPlainTabRequest(body)) return false; // user's search on the Relay page — not a tab template
   const stored = await chrome.storage.local.get([REQUEST_TEMPLATES_KEY]);
   const map = { ...(stored[REQUEST_TEMPLATES_KEY] || {}) };
   const template = {
@@ -508,7 +540,7 @@ export async function fetchEntitiesPage(
   tileCountTab,
   from,
   size = PAGE_SIZE,
-  { historyWindow = null } = {},
+  { historyWindow = null, droppedLive = false } = {},
 ) {
   const built = await buildRequestBody(tileCountTab, { from, size, historyWindow });
   if (!built.ok) {
@@ -587,6 +619,15 @@ export async function fetchEntitiesPage(
           tab: tileCountTab,
         });
         await recordFetchError(tileCountTab, lastFail);
+        // 400 = Relay rejected the request shape. A live capture can be a one-off page
+        // request (search box, filters), so drop it and retry with the built-in template
+        // (HISTORY / UPCOMING) or a fresh capture (IN_TRANSIT). Retrying the same body won't help.
+        if (status === 400 && built.templateMeta?.source === 'live' && !droppedLive) {
+          await dropLiveTemplate(tileCountTab);
+          log(`HTTP 400 with live ${tileCountTab} template — dropped it, retrying with built-in`);
+          requestInFlight = false;
+          return fetchEntitiesPage(tabId, tileCountTab, from, size, { historyWindow, droppedLive: true });
+        }
         if (status === 429 || status >= 500) {
           await hooks.onBackoff(status, httpBackoffMs);
           httpBackoffMs = Math.min(HTTP_BACKOFF_MAX_MS, httpBackoffMs * 2);
