@@ -227,17 +227,42 @@ type TripCtx = {
   tractor: string | null;
 };
 
-async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>> {
-  const { data: trips } = await sb
+const TRIP_COLS = "trip_id, section, status, driver_name_raw, execution_status, tour_state, raw";
+
+async function loadActiveTrips(
+  sb: SupabaseClient,
+  opts?: { withRecentArrivals?: boolean },
+): Promise<Map<string, TripCtx>> {
+  const { data: liveTrips } = await sb
     .from("relay_trips")
-    .select(
-      "trip_id, section, status, driver_name_raw, execution_status, tour_state, raw",
-    )
+    .select(TRIP_COLS)
     .eq("archived", false)
     .in("section", ["UPCOMING", "IN_TRANSIT"]);
+  const trips = [...(liveTrips || [])];
+  // A tour's last check-in often arrives in the same sync that moves it to History,
+  // so also load trips with a check-in first seen recently (arrival sweep only).
+  if (opts?.withRecentArrivals) {
+    const since = new Date(Date.now() - ARRIVAL_LOOKBACK_MS).toISOString();
+    const { data: recent } = await sb
+      .from("relay_stops")
+      .select("trip_id")
+      .gte("actual_arrival_first_seen_at", since)
+      .eq("archived", false)
+      .limit(500);
+    const have = new Set(trips.map((t) => String(t.trip_id)));
+    const extra = [...new Set((recent || []).map((r) => String(r.trip_id)))].filter((id) => !have.has(id));
+    if (extra.length) {
+      const { data: more } = await sb
+        .from("relay_trips")
+        .select(TRIP_COLS)
+        .eq("archived", false)
+        .in("trip_id", extra);
+      trips.push(...(more || []));
+    }
+  }
 
   const map = new Map<string, TripCtx>();
-  const tripIds = (trips || []).map((t) => t.trip_id);
+  const tripIds = trips.map((t) => t.trip_id);
   let stops: Array<Record<string, unknown>> = [];
   const cancelledByTrip = new Map<string, Set<string>>();
   const legsByTrip = new Map<string, Map<string, LegInfo>>();
@@ -276,7 +301,7 @@ async function loadActiveTrips(sb: SupabaseClient): Promise<Map<string, TripCtx>
     }
   }
 
-  for (const trip of trips || []) {
+  for (const trip of trips) {
     const tripStops = orderStops(stops.filter((s) => String(s.trip_id) === trip.trip_id));
     const cancelledLoadIds = new Set<string>([
       ...extractCancelledLoadIdsFromRaw(trip.raw),
@@ -565,7 +590,7 @@ export async function runCronChecks(
       return { paused: true, reason: "sync_stale", results: [{ status: "sync_stale", lastAt: sync.lastAt }] };
     }
 
-    const trips = await loadActiveTrips(sb);
+    const trips = await loadActiveTrips(sb, { withRecentArrivals: !dryRun });
     const now = Date.now();
     const windowMs = (opts?.windowHours ?? 1) * 3600_000;
 
