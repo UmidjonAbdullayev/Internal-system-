@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Internal Sys \u2014 Amazon Relay Sync",
-  "version": "1.9.1",
+  "version": "1.9.2",
   "description": "Payments popup uses lastPayments* status; settlements sync; 30m low-priority fetch.",
   "permissions": [
     "storage",
