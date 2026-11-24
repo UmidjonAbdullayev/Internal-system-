@@ -346,8 +346,41 @@ Deno.serve(async (req: Request) => {
             }
           }
 
+          // Guard: a live tab that suddenly drops several trips that still have stops
+          // left to run is almost always a filtered request (search box / filter on the
+          // Relay page got captured as the tab template), not trips finishing. Keep them.
+          const missingIds = (sectionRows || [])
+            .map((r: { trip_id: string }) => r.trip_id)
+            .filter((id: string) => !inSnapshot.has(id));
+          let keepMissing = new Set<string>();
+          if (LIVE_SECTIONS.has(section) && missingIds.length >= 3) {
+            const { data: openStops } = await sb
+              .from("relay_stops")
+              .select("trip_id, scheduled_arrival, actual_arrival")
+              .in("trip_id", missingIds)
+              .eq("archived", false)
+              .is("actual_arrival", null);
+            const soon = Date.now() - 6 * 3600_000;
+            const stillRunning = new Set(
+              (openStops || [])
+                .filter((s: { scheduled_arrival: string | null }) =>
+                  s.scheduled_arrival && new Date(s.scheduled_arrival).getTime() >= soon)
+                .map((s: { trip_id: string }) => s.trip_id),
+            );
+            if (stillRunning.size >= 3) {
+              keepMissing = stillRunning;
+              const msg =
+                `${section} snapshot dropped ${stillRunning.size} trip(s) that still have stops ahead ` +
+                `(Relay returned ${tripIds.length}). Looks like a filtered/search request — kept them. ` +
+                `Open the ${section === "IN_TRANSIT" ? "In Transit" : "Upcoming"} tab in Relay with no search/filter.`;
+              console.warn(msg);
+              errors.push(msg);
+            }
+          }
+
           for (const row of sectionRows || []) {
             if (inSnapshot.has(row.trip_id)) continue;
+            if (keepMissing.has(row.trip_id)) continue;
             if (LIVE_SECTIONS.has(section)) {
               liveMissing.push(row.trip_id);
               // Normal cycle: mark awaiting — History page1 next cycle reconciles
@@ -397,6 +430,7 @@ Deno.serve(async (req: Request) => {
 
             for (const row of stale || []) {
               if (inSnapshot.has(row.trip_id)) continue;
+              if (keepMissing.has(row.trip_id)) continue;
               // Do not wipe CANCELLED — TONU income needs cancel signal + payout > 0.
               const { data: staleFull } = await sb
                 .from("relay_trips")
@@ -504,7 +538,9 @@ Deno.serve(async (req: Request) => {
             last_successful_sync_at: syncedAt,
             last_attempt_at: now,
             syncing: false,
-            last_error: null,
+            last_error: keepMissing.size
+              ? `Filtered ${section} request suspected: kept ${keepMissing.size} running trip(s)`
+              : null,
           });
         }
       }
