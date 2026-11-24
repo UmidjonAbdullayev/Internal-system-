@@ -156,7 +156,7 @@ export function DriverDetailPage() {
         badge={<Badge status={deriveDriverStatus(driver, loads)} />}
         actions={
           <>
-            <Link to={`/gross-by-driver?driver=${driver.id}`}>
+            <Link to={`/gross-by-driver/${driver.id}`}>
               <Button variant="outline" size="sm">Gross Report</Button>
             </Link>
             <Link to="/payments">

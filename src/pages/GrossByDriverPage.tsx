@@ -1,501 +1,224 @@
-import { useMemo, useState, useEffect } from 'react';
-import { useSearchParams, Link } from 'react-router-dom';
-import { Download, Plus } from 'lucide-react';
-import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-} from 'recharts';
-import { format, parseISO } from 'date-fns';
+import { useMemo, useState } from 'react';
+import { Link, Navigate, useNavigate, useSearchParams } from 'react-router-dom';
+import { ChevronRight, Download } from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
-import { KpiCard } from '@/components/ui/KpiCard';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
+import { Card, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
-import { Badge } from '@/components/ui/Badge';
-import { Select, Input, Field, Textarea } from '@/components/ui/Input';
-import { Modal } from '@/components/ui/Modal';
-import { DateRangeFilter } from '@/components/ui/DateRangeFilter';
+import { Input } from '@/components/ui/Input';
 import { SortHeader, useSort, type SortDir } from '@/components/shared/SortHeader';
+import { PeriodPicker } from '@/components/gross/PeriodPicker';
+import { defaultPeriod, periodRange, type PeriodState } from '@/components/gross/period';
 import {
-  getEligibleLoads,
-  getDriverGross,
-  getLoadFinalGross,
-  getMonthRange,
-  dailyRevenueSeries,
-  computeOrRefreshSettlement,
-} from '@/lib/calculations';
-import {
-  formatCurrency,
-  formatDate,
-  downloadCSV,
-  getDateRangeFromPreset,
-  getWeekRange,
-  getDriverFullName,
-} from '@/lib/utils';
-import type { DatePreset, DateRange, LoadStatus } from '@/types';
+  filterReportLoadsByWeek,
+  getDriverResolver,
+  isEarnedRow,
+  isInProgressRow,
+  sumAmazonPaid,
+} from '@/lib/reportLoadMoney';
+import { downloadCSV, formatCurrency, formatDate, getDriverFullName } from '@/lib/utils';
 
+/**
+ * Fleet list: one row per driver for the period. Money is trip-level (Amazon's tour price —
+ * the parent row), never per-leg amounts. Click a driver → their own page.
+ */
 export function GrossByDriverPage() {
-  const {
-    drivers,
-    loads,
-    driverFees,
-    oneTimeCharges,
-    grossAdjustments,
-    addGrossAdjustment,
-  } = useData();
+  const { drivers, reportLoads, grossAdjustments, oneTimeCharges } = useData();
   const [params] = useSearchParams();
-  const [driverId, setDriverId] = useState(params.get('driver') ?? drivers[0]?.id ?? '');
-  const [preset, setPreset] = useState<DatePreset>('this_week');
-  const todayWeek = getWeekRange(new Date());
-  const [customRange, setCustomRange] = useState<DateRange>({
-    start: todayWeek.start,
-    end: todayWeek.end,
-  });
-  const [dateFrom, setDateFrom] = useState(todayWeek.start);
-  const [dateTo, setDateTo] = useState(todayWeek.end);
-  const [statusFilter, setStatusFilter] = useState('');
-  const [sortKey, setSortKey] = useState('deliveryDate');
+  const navigate = useNavigate();
+  const [period, setPeriod] = useState<PeriodState>(defaultPeriod);
+  const [search, setSearch] = useState('');
+  const [sortKey, setSortKey] = useState('earned');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
-  const [fleetSortKey, setFleetSortKey] = useState('gross');
-  const [fleetSortDir, setFleetSortDir] = useState<SortDir>('desc');
-  const [adjOpen, setAdjOpen] = useState(false);
-  const [adjAmount, setAdjAmount] = useState('');
-  const [adjReason, setAdjReason] = useState('');
+  const range = periodRange(period);
 
-  useEffect(() => {
-    const d = params.get('driver');
-    if (d) setDriverId(d);
-  }, [params]);
+  const resolve = useMemo(() => getDriverResolver(drivers, reportLoads), [drivers, reportLoads]);
 
-  const range = useMemo(() => {
-    if (dateFrom && dateTo) return { start: dateFrom, end: dateTo };
-    return getDateRangeFromPreset(preset, customRange);
-  }, [dateFrom, dateTo, preset, customRange]);
-  const driver = drivers.find((d) => d.id === driverId);
-  const week = getWeekRange(new Date());
-  const month = getMonthRange(new Date());
-
-  const driverLoads = useMemo(() => {
-    let list = getEligibleLoads(loads, driverId, range);
-    if (statusFilter) {
-      list = loads.filter(
-        (l) =>
-          l.driverId === driverId &&
-          l.loadStatus === statusFilter &&
-          l.deliveryDate >= range.start &&
-          l.deliveryDate <= range.end
-      );
+  const { rows, unlinkedEarned, unlinkedTours } = useMemo(() => {
+    const inRange = filterReportLoadsByWeek(reportLoads, range.start, range.end);
+    const byDriver = new Map<string, typeof inRange>();
+    let unlinked = 0;
+    let unlinkedCount = 0;
+    for (const r of inRange) {
+      const d = resolve(r).driver;
+      if (!d) {
+        if (isEarnedRow(r)) {
+          unlinked += r.amazonPaid || 0;
+          unlinkedCount += 1;
+        }
+        continue;
+      }
+      byDriver.set(d.id, [...(byDriver.get(d.id) || []), r]);
     }
-    return list;
-  }, [loads, driverId, range, statusFilter]);
-
-  const sorted = useSort(driverLoads, sortKey, sortDir, {
-    loadId: (l) => l.loadId,
-    deliveryDate: (l) => l.deliveryDate,
-    miles: (l) => l.distanceMiles,
-    gross: (l) => getLoadFinalGross(l),
-  });
-
-  const fleetRows = useMemo(() => {
-    return drivers
-      .filter((d) => d.status !== 'Inactive')
+    const out = drivers
+      .filter((d) => d.status !== 'Inactive' || byDriver.has(d.id))
       .map((d) => {
-        const eligible = getEligibleLoads(loads, d.id, range);
-        const gross = getDriverGross(loads, d.id, range, grossAdjustments);
+        const list = byDriver.get(d.id) || [];
+        const earnedRows = list.filter(isEarnedRow);
+        const adj = grossAdjustments
+          .filter((a) => a.driverId === d.id && a.date >= range.start && a.date <= range.end)
+          .reduce((s, a) => s + a.amount, 0);
+        const earned = Math.round((sumAmazonPaid(earnedRows) + adj) * 100) / 100;
         const charges = oneTimeCharges
           .filter((c) => c.driverId === d.id && c.date >= range.start && c.date <= range.end)
           .reduce((s, c) => s + c.amount, 0);
         return {
           driver: d,
-          loads: eligible.length,
-          gross,
+          name: getDriverFullName(d.firstName, d.lastName),
+          tours: earnedRows.length,
+          earned,
+          inProgress: sumAmazonPaid(list.filter(isInProgressRow)),
+          inProgressTours: list.filter(isInProgressRow).length,
           charges,
-          net: gross - charges,
+          net: Math.round((earned - charges) * 100) / 100,
         };
       });
-  }, [drivers, loads, range, grossAdjustments, oneTimeCharges]);
+    return {
+      rows: out,
+      unlinkedEarned: Math.round(unlinked * 100) / 100,
+      unlinkedTours: unlinkedCount,
+    };
+  }, [reportLoads, drivers, resolve, range.start, range.end, grossAdjustments, oneTimeCharges]);
 
-  const fleetSorted = useSort(fleetRows, fleetSortKey, fleetSortDir, {
-    name: (r) => getDriverFullName(r.driver.firstName, r.driver.lastName),
-    loads: (r) => r.loads,
-    gross: (r) => r.gross,
+  const filtered = rows.filter((r) => !search || r.name.toLowerCase().includes(search.toLowerCase()));
+  const sorted = useSort(filtered, sortKey, sortDir, {
+    name: (r) => r.name,
+    tours: (r) => r.tours,
+    earned: (r) => r.earned,
+    inProgress: (r) => r.inProgress,
     charges: (r) => r.charges,
     net: (r) => r.net,
   });
-
-  const weeklyGross = getDriverGross(loads, driverId, week, grossAdjustments);
-  const monthlyGross = getDriverGross(loads, driverId, month, grossAdjustments);
-  const periodGross = getDriverGross(loads, driverId, range, grossAdjustments);
-  const totalCharges = oneTimeCharges
-    .filter((c) => c.driverId === driverId && c.date >= range.start && c.date <= range.end)
-    .reduce((s, c) => s + c.amount, 0);
-
-  const settlementPreview = computeOrRefreshSettlement(
-    undefined,
-    driverId,
-    week.start,
-    loads,
-    driverFees,
-    oneTimeCharges,
-    grossAdjustments
-  );
-
-  const chartData = dailyRevenueSeries(
-    loads.filter((l) => l.driverId === driverId),
-    range
-  );
-
-  const avgGross = driverLoads.length ? periodGross / driverLoads.length : 0;
-
-  const handleSort = (key: string) => {
-    if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+  const onSort = (k: string) => {
+    if (sortKey === k) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
     else {
-      setSortKey(key);
-      setSortDir('desc');
+      setSortKey(k);
+      setSortDir(k === 'name' ? 'asc' : 'desc');
     }
   };
+  const totals = filtered.reduce(
+    (t, r) => ({
+      tours: t.tours + r.tours,
+      earned: t.earned + r.earned,
+      inProgress: t.inProgress + r.inProgress,
+      charges: t.charges + r.charges,
+      net: t.net + r.net,
+    }),
+    { tours: 0, earned: 0, inProgress: 0, charges: 0, net: 0 },
+  );
 
-  const exportReport = () => {
-    if (!driver) return;
+  // Old links (?driver=ID) go straight to the driver's page.
+  const legacy = params.get('driver');
+  if (legacy) return <Navigate to={`/gross-by-driver/${legacy}`} replace />;
+
+  const exportCsv = () =>
     downloadCSV(
-      `gross-${driver.driverId}.csv`,
-      ['Load ID', 'Delivery', 'Pickup', 'Delivery Loc', 'Trailer', 'Miles', 'Gross', 'Additional', 'Final', 'Payment'],
-      sorted.map((l) => [
-        l.loadId,
-        l.deliveryDate,
-        l.pickupLocation,
-        l.deliveryLocation,
-        l.trailerId,
-        l.distanceMiles,
-        l.rateGross,
-        l.additionalCharges,
-        getLoadFinalGross(l),
-        l.paymentStatus,
-      ])
+      `gross-by-driver-${range.start}_${range.end}.csv`,
+      ['Driver', 'Driver ID', 'Tours done', 'Earned', 'In progress', 'Charges', 'Net'],
+      sorted.map((r) => [r.name, r.driver.driverId, r.tours, r.earned, r.inProgress, r.charges, r.net]),
     );
-  };
-
-  const saveAdjustment = () => {
-    if (!adjAmount || !adjReason) return;
-    addGrossAdjustment({
-      driverId,
-      amount: Number(adjAmount),
-      reason: adjReason,
-      date: range.start,
-    });
-    setAdjOpen(false);
-    setAdjAmount('');
-    setAdjReason('');
-  };
-
-  if (!driver) {
-    return <p className="text-text-secondary">No drivers available.</p>;
-  }
 
   return (
     <div>
       <PageHeader
         title="Gross by Driver"
-        subtitle="Weekly salary from History-synced loads · date-from / date-to filter & sort"
-        badge={
-          <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-semibold text-primary">
-            Priority
-          </span>
-        }
+        subtitle="Amazon tour price per driver · click a driver for their tours"
         actions={
-          <>
-            <Button variant="outline" size="sm" onClick={() => setAdjOpen(true)}>
-              <Plus className="h-4 w-4" /> Gross Adjustment
-            </Button>
-            <Button variant="outline" size="sm" onClick={exportReport}>
-              <Download className="h-4 w-4" /> Export
-            </Button>
-          </>
+          <Button variant="outline" size="sm" onClick={exportCsv}>
+            <Download className="h-4 w-4" /> Export
+          </Button>
         }
       />
 
       <Card className="mb-5 p-4">
-        <div className="flex flex-wrap items-end gap-4">
-          <Field label="Selected Driver" className="w-64">
-            <Select value={driverId} onChange={(e) => setDriverId(e.target.value)}>
-              {drivers
-                .filter((d) => d.status !== 'Inactive')
-                .map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {getDriverFullName(d.firstName, d.lastName)} ({d.driverId})
-                  </option>
-                ))}
-            </Select>
-          </Field>
-          <Field label="Date from" className="w-40">
-            <Input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => {
-                setDateFrom(e.target.value);
-                setPreset('custom');
-              }}
-            />
-          </Field>
-          <Field label="Date to" className="w-40">
-            <Input
-              type="date"
-              value={dateTo}
-              onChange={(e) => {
-                setDateTo(e.target.value);
-                setPreset('custom');
-              }}
-            />
-          </Field>
-          <div className="flex items-center gap-3 pb-1">
-            <Badge status={driver.status} />
-            <span className="text-sm text-text-secondary">{driver.driverId}</span>
-            <Link to={`/drivers/${driver.id}`} className="text-xs text-secondary hover:underline">
-              View Profile →
-            </Link>
-          </div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <PeriodPicker value={period} onChange={setPeriod} />
+          <Input
+            placeholder="Search driver…"
+            className="w-56"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
         </div>
-        <DateRangeFilter
-          preset={preset}
-          onPresetChange={(p) => {
-            setPreset(p);
-            const next = getDateRangeFromPreset(p, customRange);
-            setDateFrom(next.start);
-            setDateTo(next.end);
-          }}
-          customRange={customRange}
-          onCustomRangeChange={(r) => {
-            setCustomRange(r);
-            setDateFrom(r.start);
-            setDateTo(r.end);
-          }}
-          className="mt-4"
-        />
       </Card>
 
-      <Card className="mb-5 overflow-hidden">
+      <Card className="overflow-clip">
         <CardHeader>
-          <CardTitle>Gross by driver ({range.start} → {range.end})</CardTitle>
+          <CardTitle>
+            {formatDate(range.start, 'MMM d')} – {formatDate(range.end, 'MMM d, yyyy')} · {filtered.length} drivers
+          </CardTitle>
         </CardHeader>
         <div className="overflow-x-auto">
-          <table className="w-full text-sm min-w-[700px]">
+          <table className="w-full min-w-[760px] text-sm">
             <thead>
               <tr className="border-b border-border bg-bg/80">
-                <SortHeader
-                  label="Driver"
-                  sortKey="name"
-                  currentKey={fleetSortKey}
-                  direction={fleetSortDir}
-                  onSort={(k) => {
-                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-                    else {
-                      setFleetSortKey(k);
-                      setFleetSortDir(k === 'name' ? 'asc' : 'desc');
-                    }
-                  }}
-                />
-                <SortHeader
-                  label="Loads"
-                  sortKey="loads"
-                  currentKey={fleetSortKey}
-                  direction={fleetSortDir}
-                  onSort={(k) => {
-                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-                    else {
-                      setFleetSortKey(k);
-                      setFleetSortDir('desc');
-                    }
-                  }}
-                  align="right"
-                />
-                <SortHeader
-                  label="Gross"
-                  sortKey="gross"
-                  currentKey={fleetSortKey}
-                  direction={fleetSortDir}
-                  onSort={(k) => {
-                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-                    else {
-                      setFleetSortKey(k);
-                      setFleetSortDir('desc');
-                    }
-                  }}
-                  align="right"
-                />
-                <SortHeader
-                  label="Charges"
-                  sortKey="charges"
-                  currentKey={fleetSortKey}
-                  direction={fleetSortDir}
-                  onSort={(k) => {
-                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-                    else {
-                      setFleetSortKey(k);
-                      setFleetSortDir('desc');
-                    }
-                  }}
-                  align="right"
-                />
-                <SortHeader
-                  label="Net"
-                  sortKey="net"
-                  currentKey={fleetSortKey}
-                  direction={fleetSortDir}
-                  onSort={(k) => {
-                    if (fleetSortKey === k) setFleetSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
-                    else {
-                      setFleetSortKey(k);
-                      setFleetSortDir('desc');
-                    }
-                  }}
-                  align="right"
-                />
+                <SortHeader label="Driver" sortKey="name" currentKey={sortKey} direction={sortDir} onSort={onSort} />
+                <SortHeader label="Tours done" sortKey="tours" currentKey={sortKey} direction={sortDir} onSort={onSort} align="right" />
+                <SortHeader label="Earned" sortKey="earned" currentKey={sortKey} direction={sortDir} onSort={onSort} align="right" />
+                <SortHeader label="In progress" sortKey="inProgress" currentKey={sortKey} direction={sortDir} onSort={onSort} align="right" />
+                <SortHeader label="Charges" sortKey="charges" currentKey={sortKey} direction={sortDir} onSort={onSort} align="right" />
+                <SortHeader label="Net" sortKey="net" currentKey={sortKey} direction={sortDir} onSort={onSort} align="right" />
+                <th className="w-8" />
               </tr>
             </thead>
             <tbody>
-              {fleetSorted.map((r) => (
+              {sorted.map((r) => (
                 <tr
                   key={r.driver.id}
-                  className={`border-b border-border/60 table-row-hover cursor-pointer ${
-                    r.driver.id === driverId ? 'bg-primary/5' : ''
-                  }`}
-                  onClick={() => setDriverId(r.driver.id)}
+                  className="cursor-pointer border-b border-border/60 table-row-hover"
+                  onClick={() => navigate(`/gross-by-driver/${r.driver.id}`)}
                 >
-                  <td className="px-3 py-2.5 font-medium">
-                    {getDriverFullName(r.driver.firstName, r.driver.lastName)}
+                  <td className="px-3 py-2.5">
+                    <Link
+                      to={`/gross-by-driver/${r.driver.id}`}
+                      className="font-medium text-primary hover:underline"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {r.name}
+                    </Link>
+                    <span className="ml-2 text-xs text-text-secondary">{r.driver.driverId}</span>
                   </td>
-                  <td className="px-3 py-2.5 text-right tabular-nums">{r.loads}</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
-                    {formatCurrency(r.gross)}
+                  <td className="px-3 py-2.5 text-right tabular-nums">{r.tours}</td>
+                  <td className="px-3 py-2.5 text-right font-semibold tabular-nums">{formatCurrency(r.earned)}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-text-secondary">
+                    {r.inProgress ? formatCurrency(r.inProgress) : '—'}
+                    {r.inProgressTours ? <span className="ml-1 text-xs">({r.inProgressTours})</span> : null}
                   </td>
                   <td className="px-3 py-2.5 text-right tabular-nums text-danger">
-                    {formatCurrency(r.charges)}
+                    {r.charges ? formatCurrency(r.charges) : '—'}
                   </td>
                   <td className="px-3 py-2.5 text-right tabular-nums">{formatCurrency(r.net)}</td>
+                  <td className="px-2 text-text-secondary"><ChevronRight className="h-4 w-4" /></td>
                 </tr>
               ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6 mb-5">
-        <KpiCard title="Weekly Gross" value={weeklyGross} highlight />
-        <KpiCard title="Monthly Gross" value={monthlyGross} />
-        <KpiCard title="Total Loads" value={driverLoads.length} format="number" accent="info" />
-        <KpiCard title="Avg Gross / Load" value={avgGross} accent="success" />
-        <KpiCard title="Total Charges" value={totalCharges + settlementPreview.totalDeductions} accent="warning" />
-        <KpiCard title="Net Payable" value={settlementPreview.netPayable} accent="primary" />
-      </div>
-
-      <Card className="mb-5">
-        <CardHeader>
-          <CardTitle>Daily Gross — {getDriverFullName(driver.firstName, driver.lastName)}</CardTitle>
-        </CardHeader>
-        <CardContent className="h-64">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
-              <XAxis dataKey="date" tickFormatter={(v) => format(parseISO(v), 'MMM d')} tick={{ fontSize: 11 }} />
-              <YAxis tickFormatter={(v) => `$${(v / 1000).toFixed(1)}k`} tick={{ fontSize: 11 }} />
-              <Tooltip
-                formatter={(v) => formatCurrency(Number(v ?? 0))}
-                labelFormatter={(l) => formatDate(String(l))}
-              />
-              <Bar dataKey="gross" fill="#2878D0" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </CardContent>
-      </Card>
-
-      <Card className="overflow-hidden">
-        <CardHeader>
-          <CardTitle>Load Detail ({sorted.length})</CardTitle>
-          <Select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            className="w-40"
-          >
-            <option value="">Eligible Only</option>
-            {(['Completed', 'Delivered', 'In Transit', 'Dispatched', 'Cancelled'] as LoadStatus[]).map(
-              (s) => (
-                <option key={s} value={s}>{s}</option>
-              )
-            )}
-          </Select>
-        </CardHeader>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm min-w-[900px]">
-            <thead>
-              <tr className="border-b border-border bg-bg/80">
-                <SortHeader label="Load ID" sortKey="loadId" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <SortHeader label="Delivery" sortKey="deliveryDate" currentKey={sortKey} direction={sortDir} onSort={handleSort} />
-                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Route</th>
-                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Trailer</th>
-                <SortHeader label="Miles" sortKey="miles" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Load Gross</th>
-                <th className="px-3 py-2.5 text-right text-xs font-semibold uppercase text-text-secondary">Additional</th>
-                <SortHeader label="Final Gross" sortKey="gross" currentKey={sortKey} direction={sortDir} onSort={handleSort} align="right" />
-                <th className="px-3 py-2.5 text-left text-xs font-semibold uppercase text-text-secondary">Payment</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sorted.map((l) => (
-                <tr key={l.id} className="border-b border-border/60 table-row-hover">
+              {unlinkedTours > 0 && !search && (
+                <tr className="border-b border-border/60 text-text-secondary">
                   <td className="px-3 py-2.5">
-                    <Link to={`/loads`} className="font-medium text-primary hover:underline">
-                      {l.loadId}
-                    </Link>
+                    Not linked to a driver{' '}
+                    <Link to="/gross-board" className="text-xs text-primary hover:underline">see Gross Board</Link>
                   </td>
-                  <td className="px-3 py-2.5 text-xs whitespace-nowrap">{formatDate(l.deliveryDate, 'MMM d, yyyy')}</td>
-                  <td className="px-3 py-2.5 text-xs">
-                    {l.pickupLocation} → {l.deliveryLocation}
-                  </td>
-                  <td className="px-3 py-2.5 text-xs">{l.trailerId || '—'}</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums">{l.distanceMiles}</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums">{formatCurrency(l.rateGross)}</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums text-text-secondary">
-                    {l.additionalCharges ? formatCurrency(l.additionalCharges) : '—'}
-                  </td>
-                  <td className="px-3 py-2.5 text-right tabular-nums font-semibold">
-                    {formatCurrency(getLoadFinalGross(l))}
-                  </td>
-                  <td className="px-3 py-2.5"><Badge status={l.paymentStatus} /></td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">{unlinkedTours}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">{formatCurrency(unlinkedEarned)}</td>
+                  <td colSpan={4} />
                 </tr>
-              ))}
+              )}
             </tbody>
             <tfoot>
               <tr className="bg-primary/5 font-semibold">
-                <td className="px-3 py-3" colSpan={7}>Period Total</td>
+                <td className="px-3 py-3">Total</td>
+                <td className="px-3 py-3 text-right tabular-nums">{totals.tours + (search ? 0 : unlinkedTours)}</td>
                 <td className="px-3 py-3 text-right tabular-nums text-primary">
-                  {formatCurrency(periodGross)}
+                  {formatCurrency(totals.earned + (search ? 0 : unlinkedEarned))}
                 </td>
+                <td className="px-3 py-3 text-right tabular-nums">{formatCurrency(totals.inProgress)}</td>
+                <td className="px-3 py-3 text-right tabular-nums">{formatCurrency(totals.charges)}</td>
+                <td className="px-3 py-3 text-right tabular-nums">{formatCurrency(totals.net)}</td>
                 <td />
               </tr>
             </tfoot>
           </table>
         </div>
       </Card>
-
-      <Modal
-        open={adjOpen}
-        onClose={() => setAdjOpen(false)}
-        title="Add Manual Gross Adjustment"
-        footer={
-          <>
-            <Button variant="outline" onClick={() => setAdjOpen(false)}>Cancel</Button>
-            <Button onClick={saveAdjustment}>Add Adjustment</Button>
-          </>
-        }
-      >
-        <div className="space-y-4">
-          <Field label="Amount (use negative for deduction)">
-            <Input type="number" step="0.01" value={adjAmount} onChange={(e) => setAdjAmount(e.target.value)} />
-          </Field>
-          <Field label="Reason">
-            <Textarea value={adjReason} onChange={(e) => setAdjReason(e.target.value)} placeholder="e.g. Detention pay, claim adjustment..." />
-          </Field>
-        </div>
-      </Modal>
     </div>
   );
 }

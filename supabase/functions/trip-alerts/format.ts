@@ -210,13 +210,12 @@ export type BookedInput = {
 };
 
 export function formatBookedHtml(input: BookedInput): string {
-  const rpm = input.payout && input.miles ? Number(input.payout) / Number(input.miles) : null;
+  // No pay / $ per mile on BOOKED (group is shared with drivers' dispatchers).
   const lines = [
     `🆕 <b>BOOKED</b> · Trip <b>${esc(input.tripId)}</b>${input.workType ? ` · ${esc(input.workType)}` : ""}`,
     ...routeLines(input.stops),
     `${input.legCount} leg${input.legCount === 1 ? "" : "s"} · ${input.stopCount} stops` +
       (input.miles ? ` · ${Math.round(Number(input.miles))} mi` : ""),
-    `💵 <b>${esc(money(input.payout))}</b>${rpm ? ` · $${rpm.toFixed(2)}/mi` : ""}`,
     `👤 ${input.drivers.length ? `<b>${esc(input.drivers.join(", "))}</b>` : "<b>No driver assigned yet</b>"}`,
   ];
   return lines.join("\n");

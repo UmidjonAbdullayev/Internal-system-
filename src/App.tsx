@@ -9,6 +9,7 @@ import { OverviewPage } from '@/pages/OverviewPage';
 import { LoadsPage } from '@/pages/LoadsPage';
 import { GrossBoardPage } from '@/pages/GrossBoardPage';
 import { GrossByDriverPage } from '@/pages/GrossByDriverPage';
+import { GrossByDriverDetailPage } from '@/pages/GrossByDriverDetailPage';
 import { PaymentsPage } from '@/pages/PaymentsPage';
 import { SettlementDetailPage } from '@/pages/SettlementDetailPage';
 import { DriversPage } from '@/pages/DriversPage';
@@ -33,6 +34,7 @@ export default function App() {
                 <Route path="drivers/:id" element={<DriverDetailPage />} />
                 <Route path="gross-board" element={<GrossBoardPage />} />
                 <Route path="gross-by-driver" element={<GrossByDriverPage />} />
+                <Route path="gross-by-driver/:id" element={<GrossByDriverDetailPage />} />
                 <Route path="payments" element={<PaymentsPage />} />
                 <Route path="payments/:id" element={<SettlementDetailPage />} />
                 <Route path="settlements" element={<SettlementsChargesPage />} />
