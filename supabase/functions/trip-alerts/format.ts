@@ -132,13 +132,18 @@ export function formatArrivedHtml(input: ArrivedInput): string {
   return lines.join("\n");
 }
 
+/** Zero-width space / joiners / BOM (Relay pastes these into instructions). */
+const ZERO_WIDTH = new Set([0x200b, 0x200c, 0x200d, 0x2060, 0xfeff]);
+
 /** Zero-width chars / CRs out, collapse blank lines, cap length (Telegram 4096). */
 export function cleanInstructions(parts: unknown, max = 900): string | null {
   const list = Array.isArray(parts) ? parts : parts ? [parts] : [];
   const text = list
     .map((p) => String(p ?? ""))
     .join("\n")
-    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+    .split("")
+    .filter((ch) => !ZERO_WIDTH.has(ch.charCodeAt(0)))
+    .join("")
     .replace(/\r\n?/g, "\n")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
