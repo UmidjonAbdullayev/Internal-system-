@@ -16,6 +16,8 @@ export type AlertConfig = {
   broadcast_title: string | null;
   /** Arrivals checked in before this are never alerted (no flood on switch-on). */
   arrival_alerts_since: string | null;
+  /** BOOKED / CANCELLED / REMINDER only for events after this. */
+  lifecycle_alerts_since: string | null;
 };
 
 /** Shared "Driver Updates" group, when broadcast routing is on and a chat is set. */
@@ -59,6 +61,7 @@ export async function loadConfig(sb: SupabaseClient): Promise<AlertConfig> {
     broadcast_chat_id: data?.broadcast_chat_id ? String(data.broadcast_chat_id) : null,
     broadcast_title: data?.broadcast_title ? String(data.broadcast_title) : null,
     arrival_alerts_since: data?.arrival_alerts_since ? String(data.arrival_alerts_since) : null,
+    lifecycle_alerts_since: data?.lifecycle_alerts_since ? String(data.lifecycle_alerts_since) : null,
   };
 }
 

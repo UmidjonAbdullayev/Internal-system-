@@ -5,7 +5,15 @@ import {
   type OutgoingAlert,
   dispatchAlert,
 } from "./send.ts";
-import { formatArrivedHtml, formatNotAtStopHtml } from "./format.ts";
+import {
+  cleanInstructions,
+  formatArrivedHtml,
+  formatBookedHtml,
+  formatCancelledHtml,
+  formatNotAtStopHtml,
+  formatReminderHtml,
+  type RouteStop,
+} from "./format.ts";
 
 const MS_MIN = 60_000;
 const LATE_GRACE_MS = 15 * MS_MIN;
@@ -13,6 +21,10 @@ const MAX_STOP_AGE_MS = 6 * 60 * MS_MIN;
 const SYNC_FRESH_MS = 5 * MS_MIN;
 /** Cron arrival sweep looks back this far (covers sync pauses / late YMS posts). */
 const ARRIVAL_LOOKBACK_MS = 3 * 60 * MS_MIN;
+/** "Pickup / drop in 30 min" reminder window. */
+const REMINDER_LEAD_MS = 30 * MS_MIN;
+/** BOOKED / CANCELLED look back this far (catches up after short sync gaps). */
+const LIFECYCLE_LOOKBACK_MS = 6 * 60 * MS_MIN;
 const ALLOWED = new Set(["arrived", "not_at_stop"]);
 
 export type StatusEvent = {
@@ -214,6 +226,8 @@ type LegInfo = {
   driver: string | null;
   tractor: string | null;
   trailer: string | null;
+  status: string | null;
+  payout: number | null;
 };
 
 type TripCtx = {
@@ -227,7 +241,8 @@ type TripCtx = {
   tractor: string | null;
 };
 
-const TRIP_COLS = "trip_id, section, status, driver_name_raw, execution_status, tour_state, raw";
+const TRIP_COLS =
+  "trip_id, section, status, driver_name_raw, execution_status, tour_state, raw, payout, total_miles, work_type, created_at";
 
 async function loadActiveTrips(
   sb: SupabaseClient,
@@ -261,6 +276,19 @@ async function loadActiveTrips(
     }
   }
 
+  return buildTripContexts(sb, trips);
+}
+
+async function loadTripsByIds(sb: SupabaseClient, ids: string[]): Promise<Map<string, TripCtx>> {
+  if (!ids.length) return new Map();
+  const { data } = await sb.from("relay_trips").select(TRIP_COLS).in("trip_id", ids);
+  return buildTripContexts(sb, data || []);
+}
+
+async function buildTripContexts(
+  sb: SupabaseClient,
+  trips: Array<Record<string, any>>,
+): Promise<Map<string, TripCtx>> {
   const map = new Map<string, TripCtx>();
   const tripIds = trips.map((t) => t.trip_id);
   let stops: Array<Record<string, unknown>> = [];
@@ -278,7 +306,7 @@ async function loadActiveTrips(
 
     const { data: legRows } = await sb
       .from("relay_legs")
-      .select("trip_id, load_id, execution_status, driver_name_raw, tractor_id, trailer_id")
+      .select("trip_id, load_id, execution_status, driver_name_raw, tractor_id, trailer_id, payout")
       .in("trip_id", tripIds)
       .eq("archived", false);
     for (const leg of legRows || []) {
@@ -290,6 +318,8 @@ async function loadActiveTrips(
           driver: leg.driver_name_raw ? String(leg.driver_name_raw) : null,
           tractor: leg.tractor_id ? String(leg.tractor_id) : null,
           trailer: leg.trailer_id ? String(leg.trailer_id) : null,
+          status: leg.execution_status ? String(leg.execution_status) : null,
+          payout: leg.payout != null && Number.isFinite(Number(leg.payout)) ? Number(leg.payout) : null,
         });
       }
       if (!isCancelledStatus(leg.execution_status)) continue;
@@ -357,6 +387,35 @@ function stopPosition(ctx: TripCtx, stop: Record<string, unknown>): { pos: numbe
   return { pos: idx >= 0 ? idx + 1 : Number(stop.seq ?? 1), count: Math.max(1, eligible.length) };
 }
 
+/** Relay pickup / delivery instructions for a stop (from the trip's raw Relay payload). */
+function stopInstructions(ctx: TripCtx, stop: Record<string, unknown>): string | null {
+  const loads = (ctx.trip.raw as Record<string, unknown> | null)?.loads;
+  if (!Array.isArray(loads)) return null;
+  const loadId = String(stop.load_id || "").trim().toUpperCase();
+  const seq = Number(stop.seq ?? NaN);
+  for (const load of loads as Array<Record<string, any>>) {
+    const id = String(load?.versionedLoadId?.id || "").trim().toUpperCase();
+    if (!id || id !== loadId) continue;
+    for (const rs of (load.stops || []) as Array<Record<string, any>>) {
+      if (Number(rs?.stopSequenceNumber) !== seq) continue;
+      const isDrop = /drop|deliver/i.test(String(stop.stop_type || rs?.stopType || ""));
+      return cleanInstructions(isDrop ? rs?.deliveryInstructions : rs?.pickupInstructions);
+    }
+  }
+  return null;
+}
+
+function routeOf(stops: Array<Record<string, unknown>>): RouteStop[] {
+  return stops.map((s) => ({
+    facility: String(s.facility_code || s.stop_type || "Stop"),
+    city: s.city ? String(s.city) : null,
+    state: s.state ? String(s.state) : null,
+    stopType: s.stop_type ? String(s.stop_type) : null,
+    scheduledAt: s.scheduled_arrival ? String(s.scheduled_arrival) : null,
+    timeZone: String(s.time_zone || "America/Los_Angeles"),
+  }));
+}
+
 function buildArrivedAlert(
   ctx: TripCtx,
   stop: Record<string, unknown>,
@@ -399,6 +458,7 @@ function buildArrivedAlert(
     driver: driverName,
     reportedAfterMinutes: opts.reportedAfterMinutes ?? null,
     syncGap: opts.syncGap ?? null,
+    instructions: opts.test ? null : stopInstructions(ctx, stop),
     test: opts.test,
   });
   return {
@@ -635,6 +695,55 @@ export async function runCronChecks(
         }
       }
 
+      // REMINDER: pickup / drop-off due within 30 min and no check-in yet (live trips).
+      if (!dryRun && isEnabled(config) && (section === "IN_TRANSIT" || section === "UPCOMING")) {
+        const since = config.lifecycle_alerts_since ? new Date(config.lifecycle_alerts_since).getTime() : NaN;
+        if (!Number.isNaN(since)) {
+          const eligible = alertableStops(ctx);
+          for (const stop of eligible) {
+            if (stop.actual_arrival || stop.actual_departure) continue;
+            const planned = stop.scheduled_arrival ? new Date(String(stop.scheduled_arrival)).getTime() : NaN;
+            if (Number.isNaN(planned) || planned <= now || planned - now > REMINDER_LEAD_MS) continue;
+            if (planned - REMINDER_LEAD_MS < since) continue; // window opened before alerts were on
+            if (!stopIsNext(stop, eligible)) continue; // a later stop already checked in
+            const people = stopPeople(ctx, stop);
+            const { pos, count } = stopPosition(ctx, stop);
+            const tz = String(stop.time_zone || "America/Los_Angeles");
+            const html = formatReminderHtml({
+              driver: people.driver,
+              facility: String(stop.facility_code || stop.stop_type || "Stop"),
+              city: stop.city ? String(stop.city) : null,
+              state: stop.state ? String(stop.state) : null,
+              tripId: String(stop.trip_id),
+              loadId: String(stop.load_id || stop.trip_id),
+              stopSeq: pos,
+              stopCount: count,
+              stopType: stop.stop_type ? String(stop.stop_type) : null,
+              plannedAt: String(stop.scheduled_arrival),
+              minutesLeft: Math.max(1, Math.round((planned - now) / MS_MIN)),
+              timeZone: tz,
+              eta: stop.eta ? String(stop.eta) : null,
+              tractor: people.tractor,
+              trailer: people.trailer,
+            });
+            const out = await dispatchAlert(sb, botToken, config, settings, {
+              tripId: String(stop.trip_id),
+              stopId: String(stop.stop_id),
+              alertType: "reminder",
+              html,
+              meta: { driver: people.driver, facility: stop.facility_code, planned: stop.scheduled_arrival },
+              reason: "cron_reminder_30m",
+              syncBasis: sync.lastAt || "cron",
+              crmDriverIds: ctx.crmDriverIds,
+              relayDriverIds: ctx.relayDriverIds,
+            });
+            if (out.status !== "deduped") {
+              results.push({ ...out, alertType: "reminder", tripId: stop.trip_id, stopId: stop.stop_id });
+            }
+          }
+        }
+      }
+
       // ARRIVED sweep (live): trips sync through relay-snapshot, which sends no arrival
       // events, so new check-ins are found here. alerts_sent dedupes (one per stop/chat).
       // Only check-ins after arrival_alerts_since and within the look-back window.
@@ -687,10 +796,120 @@ export async function runCronChecks(
       }
     }
 
+    if (!dryRun && isEnabled(config)) {
+      results.push(...(await runLifecycleAlerts(sb, botToken, config, settings, trips, sync.lastAt)));
+    }
+
     return { results };
   } finally {
     if (holdLock) await sb.rpc("release_trip_alerts_lock");
   }
+}
+
+/** BOOKED (new live trip) and CANCELLED (whole trip or one leg) — once each, via alerts_sent. */
+async function runLifecycleAlerts(
+  sb: SupabaseClient,
+  botToken: string,
+  config: AlertConfig,
+  settings: Map<string, AlertSetting>,
+  liveTrips: Map<string, TripCtx>,
+  syncBasis: string | null,
+): Promise<unknown[]> {
+  const results: unknown[] = [];
+  const since = config.lifecycle_alerts_since ? new Date(config.lifecycle_alerts_since).getTime() : NaN;
+  if (Number.isNaN(since)) return results;
+  const cutoffIso = new Date(Math.max(since, Date.now() - LIFECYCLE_LOOKBACK_MS)).toISOString();
+
+  // BOOKED: trips first seen (created) recently that are on Upcoming / In Transit.
+  for (const ctx of liveTrips.values()) {
+    const created = ctx.trip.created_at ? String(ctx.trip.created_at) : null;
+    if (!created || created < cutoffIso) continue;
+    const section = String(ctx.trip.section || "");
+    if (section !== "UPCOMING" && section !== "IN_TRANSIT") continue;
+    if (isCancelledTrip(ctx.trip)) continue;
+    const active = alertableStops(ctx);
+    if (!active.length) continue;
+    const legIds = new Set(active.map((s) => String(s.load_id || "")));
+    const drivers = [
+      ...new Set(
+        [...legIds]
+          .map((id) => ctx.legs.get(id)?.driver)
+          .concat(ctx.trip.driver_name_raw ? [String(ctx.trip.driver_name_raw)] : [])
+          .filter((d): d is string => Boolean(d && String(d).trim())),
+      ),
+    ];
+    const html = formatBookedHtml({
+      tripId: String(ctx.trip.trip_id),
+      stops: routeOf(active),
+      stopCount: active.length,
+      legCount: legIds.size,
+      miles: ctx.trip.total_miles != null ? Number(ctx.trip.total_miles) : null,
+      payout: ctx.trip.payout != null ? Number(ctx.trip.payout) : null,
+      drivers,
+      workType: ctx.trip.work_type ? String(ctx.trip.work_type) : null,
+    });
+    const out = await dispatchAlert(sb, botToken, config, settings, {
+      tripId: String(ctx.trip.trip_id),
+      stopId: "trip",
+      alertType: "trip_booked",
+      html,
+      meta: { driver: drivers[0] || null, payout: ctx.trip.payout ?? null },
+      reason: "cron_booked",
+      syncBasis: syncBasis || "cron",
+      crmDriverIds: ctx.crmDriverIds,
+      relayDriverIds: ctx.relayDriverIds,
+    });
+    if (out.status !== "deduped") results.push({ ...out, alertType: "trip_booked", tripId: ctx.trip.trip_id });
+  }
+
+  // CANCELLED: legs whose status changed to CANCELLED recently (DB trigger stamps the time).
+  const { data: cancelledLegs } = await sb
+    .from("relay_legs")
+    .select("trip_id, load_id")
+    .gte("cancelled_first_seen_at", cutoffIso)
+    .eq("archived", false)
+    .limit(200);
+  const byTrip = new Map<string, string[]>();
+  for (const l of cancelledLegs || []) {
+    const t = String(l.trip_id);
+    byTrip.set(t, [...(byTrip.get(t) || []), String(l.load_id).toUpperCase()]);
+  }
+  if (!byTrip.size) return results;
+  const ctxs = await loadTripsByIds(sb, [...byTrip.keys()]);
+  for (const [tripId, loadIds] of byTrip) {
+    const ctx = ctxs.get(tripId);
+    if (!ctx) continue;
+    const allLegs = [...ctx.legs.entries()];
+    const stillActive = allLegs.filter(([, l]) => !isCancelledStatus(l.status));
+    const wholeTrip = allLegs.length > 0 && stillActive.length === 0;
+    const targets: Array<string | null> = wholeTrip ? [null] : loadIds;
+    for (const loadId of targets) {
+      const stops = ctx.stops.filter((s) => !loadId || String(s.load_id || "").toUpperCase() === loadId);
+      const leg = loadId ? ctx.legs.get(loadId) : null;
+      const driver = leg?.driver || (ctx.trip.driver_name_raw ? String(ctx.trip.driver_name_raw) : null);
+      const html = formatCancelledHtml({
+        tripId,
+        loadId,
+        stops: routeOf(stops),
+        driver,
+        payout: loadId ? leg?.payout ?? null : ctx.trip.payout != null ? Number(ctx.trip.payout) : null,
+        remainingLegs: loadId ? stillActive.length : 0,
+      });
+      const out = await dispatchAlert(sb, botToken, config, settings, {
+        tripId,
+        stopId: loadId ? `leg:${loadId}` : "trip",
+        alertType: "cancelled",
+        html,
+        meta: { driver, load_id: loadId },
+        reason: wholeTrip ? "cron_trip_cancelled" : "cron_leg_cancelled",
+        syncBasis: syncBasis || "cron",
+        crmDriverIds: ctx.crmDriverIds,
+        relayDriverIds: ctx.relayDriverIds,
+      });
+      if (out.status !== "deduped") results.push({ ...out, alertType: "cancelled", tripId, loadId });
+    }
+  }
+  return results;
 }
 
 function isEnabled(config: AlertConfig): boolean {
