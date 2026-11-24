@@ -5,6 +5,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import { format, parseISO } from 'date-fns';
+import { STAGE_CLASS, STAGE_LABEL } from '@/components/gross/stage';
 import { useData } from '@/context/DataContext';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { KpiCard } from '@/components/ui/KpiCard';
@@ -40,25 +41,11 @@ import {
   reportLoadsForDriver,
   rowStage,
   type ReportLoadRow,
-  type RowStage,
 } from '@/lib/reportLoadMoney';
 import type { Driver, DateRange } from '@/types';
 
 type ViewMode = 'daily' | 'weekly' | 'monthly' | 'custom';
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-
-const STAGE_LABEL: Record<RowStage, string> = {
-  invoiced: 'Invoiced',
-  awaiting_invoice: 'Done · awaiting invoice',
-  in_progress: 'In progress',
-  cancelled: 'Cancelled',
-};
-const STAGE_CLASS: Record<RowStage, string> = {
-  invoiced: 'bg-success-bg text-success',
-  awaiting_invoice: 'bg-info-bg text-info',
-  in_progress: 'bg-warning-bg text-warning',
-  cancelled: 'bg-bg text-text-secondary',
-};
 
 export function GrossBoardPage() {
   const { drivers, loads, reportLoads, grossAdjustments, dataReady, dataError, refreshData } =
@@ -494,7 +481,7 @@ export function GrossBoardPage() {
                     <td className="px-3 py-2.5">
                       {r.driver ? (
                         <Link
-                          to={`/gross-by-driver?driver=${r.driver.id}`}
+                          to={`/gross-by-driver/${r.driver.id}`}
                           className="font-medium text-primary hover:underline"
                           title={
                             r.linkedVia === 'learned'
@@ -593,7 +580,7 @@ export function GrossBoardPage() {
                 >
                   <td className="px-3 py-2.5">
                     <Link
-                      to={`/gross-by-driver?driver=${r.driver.id}`}
+                      to={`/gross-by-driver/${r.driver.id}`}
                       className="font-medium text-primary hover:underline"
                       onClick={(e) => e.stopPropagation()}
                     >
@@ -737,7 +724,7 @@ export function GrossBoardPage() {
               </div>
             </div>
             <Link
-              to={`/gross-by-driver?driver=${selectedDriver.id}`}
+              to={`/gross-by-driver/${selectedDriver.id}`}
               className="block text-center text-sm font-medium text-secondary hover:underline"
             >
               Open full Gross by Driver report →

@@ -413,9 +413,9 @@ async function sendOneChat(
     replyTo = await notAtStopMessageId(sb, alert.tripId, alert.stopId || "", chatId);
   }
 
+  // No "Open in CRM" button (removed on request) — plain message only.
   const sent = await sendTelegram(botToken, chatId, alert.html, {
     replyTo,
-    replyMarkup: openCrmKeyboard(crmUrl(config, alert.tripId)),
     force: alert.force,
     config,
   });
