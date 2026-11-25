@@ -6,4 +6,4 @@
 export const SERVICE_PAUSED = true;
 
 export const SERVICE_PAUSED_MESSAGE =
-  'AI budget exceeded — the CRM is paused for now. Relay sync and Telegram alerts are off until it is restored.';
+  'Database budget exceeded — the CRM is paused for now. Relay sync and Telegram alerts are off until it is restored.';
