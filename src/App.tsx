@@ -5,6 +5,7 @@ import { DataProvider } from '@/context/DataContext';
 import { queryClient } from '@/lib/queryClient';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { AppLayout } from '@/components/layout/AppLayout';
+import { ServicePausedBanner } from '@/components/layout/ServicePausedBanner';
 import { OverviewPage } from '@/pages/OverviewPage';
 import { LoadsPage } from '@/pages/LoadsPage';
 import { GrossBoardPage } from '@/pages/GrossBoardPage';
@@ -45,6 +46,7 @@ export default function App() {
               </Route>
             </Routes>
           </BrowserRouter>
+          <ServicePausedBanner />
           <Toaster position="top-right" richColors closeButton />
         </DataProvider>
       </QueryClientProvider>

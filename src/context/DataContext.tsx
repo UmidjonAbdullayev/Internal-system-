@@ -72,6 +72,7 @@ import {
 } from '@/lib/crmFetch';
 import type { RelayLeg, RelayStop } from '@/types';
 import { toast } from 'sonner';
+import { SERVICE_PAUSED } from '@/lib/serviceStatus';
 
 interface CompanySettings {
   companyName: string;
@@ -638,6 +639,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const money = Date.now() - lastMoneyAtRef.current >= MONEY_REFRESH_MS;
       void hydrate({ soft: true, money });
     };
+    // Project paused (quota): load once, no polling against a database that is off.
+    if (SERVICE_PAUSED) {
+      return () => {
+        cancelled = true;
+      };
+    }
     const timer = window.setInterval(tick, LIVE_REFRESH_MS);
     const onVisible = () => {
       if (!document.hidden) tick();
